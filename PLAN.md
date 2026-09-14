@@ -256,10 +256,28 @@ Steps 1–5 are the same regardless of output; only step 6 is target-specific, b
 
 Each phase produces something checkable before the next begins. No visual work happens before Phase 2 — everything before that is proven from the terminal. **Desktop (Phases 0–4) is the near-term focus.** Framebuffer and TUI are kept in mind but deliberately deferred, framebuffer before TUI: a modern terminal is the last visualization target, not the next one.
 
+Each phase below carries its work **in order**, and in most cases the order is just convenience. Three places it isn't, because getting them late means redoing work rather than merely delaying it:
+
+- **Phase 0's arm decision gates everything.** Phases 1–6 all assume a DOM exists; which one it is changes what they are built on.
+- **Phase 2 opens with a spike**, not with building. The entire Pango rejection rests on litehtml being genuinely font-engine agnostic — an assumption worth a day to confirm and a month to discover.
+- **Phase 2's measurement callback is what makes Phase 6 cheap.** Break against a callback rather than against pixels and the TUI reuses the breaker; hard-code pixels and Phase 6 rewrites it.
+
+Two threads run through every phase rather than living in one: the **corpus** (`corpus/check.py` green before a phase is called done) and the **telemetry log**, which accumulates from Phase 0 and is what Phase 4 spends.
+
 ### Phase 0 — Headless proof of concept, run as an A/B
 *No UI · no rendering*
 
 **Goal:** Size the DOM↔JS problem — the largest unscoped item in the plan — with evidence rather than estimate, and answer [the structural question](#the-structural-question-does-this-stay-a-c-project).
+
+**Work, in order.** Two orderings matter and the rest is taste: *resource limits and telemetry come before any real page JS runs*, or the first week is spent debugging hangs and guessing at gaps; and *the arms come last*, after everything they share is stable, or the A/B measures the harness instead of the arms.
+
+*0.a — Harness.* Build system; libcurl fetch into a buffer; a CLI taking a URL or local path and printing the parsed DOM, no JS involved (rung `00-static` passes here with no engine at all). Embed QuickJS and run an inline script with `console`. Add the scheduler: `poll()` + `curl_multi` + microtask drain + timer queue. Then the resource limits — interrupt handler, memory cap, script count. Then telemetry, wired as the **default behaviour of every unimplemented member**: log and return a benign value rather than throw, so the binding surface is *discovered* rather than designed.
+
+*0.b — Page environment* (shared by every arm; the list below is the specification). Script loading and lifecycle first, since nothing else is observable without them; then the settle policy; then the browser globals; then the geometry fiction; then the minimal style resolver and its Lexbor-cascade spike. Run `corpus/check.py` continuously from here on — rungs `01` through `08b` come green roughly in their numbered order, which is what they were numbered for.
+
+*0.c — The arms,* built against that frozen harness: Arm A, then Arm B, then Arm B′ (B′ is a build-configuration change to B, not a third implementation).
+
+*0.d — Decide.* Collect the five comparison criteria, pick an arm, and write the decision and its reasoning into [Considered and rejected](#considered-and-rejected) — including the structural question, answered out loud.
 
 **Built once, shared by every arm:**
 - libcurl fetch, and the scheduler (`poll()` + `curl_multi` + microtask drain + timer queue).
@@ -295,44 +313,96 @@ NetSurf's libdom and `dukky` (both MIT) are prior art for exactly these question
 ### Phase 1 — Extraction breadth
 *Still headless*
 
-- **Goal:** Stop assuming every page is an article.
-- **Scope:** The classify/dispatch stage (4a/4b) with confidence scoring, plus the extractors behind it — structured text dump, table extraction, a basic search-results heuristic, video-metadata extraction (embed markup, OpenGraph/oEmbed tags), form extraction, and media-reference classification. All read the post-JS DOM directly; none runs downstream of Readability. Step 4c (base-URL resolution, sanitization, scheme allowlist) lands here too.
-- **Done when:** reasonable output exists for at least one article, one docs page, one table-heavy page, one search-results page, one video-embedding page, one form, and one image-heavy page with a plausible decorative/content split — all from the corpus, so the results are re-runnable.
+**Goal:** Stop assuming every page is an article.
+
+**Work, in order:**
+1. **Step 4c first** — base-URL resolution after redirects honouring `<base href>`, sanitization, and the URI scheme allowlist. Everything downstream renders URLs, so a wrong one here is a bug in every later phase. Rung `08-messy` already asserts the resolution half.
+2. **The dispatch skeleton** — page-shape classifier and confidence scoring, with Readability as the *only* registered extractor. Prove selection works while there is only one thing to select.
+3. **The extractors, one at a time**, each landing with its own corpus page: structured text dump (the fallback that must never fail), table, search-results, form, video metadata, media-reference classification.
+4. **Turn on the `extract`-stage assertions** in `corpus/manifest.json` — they exist and are reported as pending today. This is the phase that earns them.
+5. **Golden outputs** per extractor, so extraction quality regressions are visible rather than argued about.
+6. **Fill `corpus/local/bundles/`** with saved real pages — breadth, recorded and never gated, per the two-kinds-of-fixture split.
+
+**Done when:** reasonable output exists for at least one article, one docs page, one table-heavy page, one search-results page, one video-embedding page, one form, and one image-heavy page with a plausible decorative/content split — all from the corpus, so the results are re-runnable.
 
 ### Phase 2 — Reader rendering
 *First visual output*
 
-- **Goal:** Turn extracted content into the actual "beautiful, clear" output — this is where the project stops being a pipe and starts being a page.
-- **Scope:** The v1 run shaper (HarfBuzz + FreeType + libunibreak, Latin/Cyrillic/Greek) behind litehtml's `document_container`, plus the font matcher; a small set of built-in themes naming our bundled faces; media-reference placeholders, video cards, form-control styling; viewer mode's paint side.
-- **Start with a spike:** implement `create_font`/`text_width`/`draw_text` over FreeType in a throwaway container and confirm litehtml is genuinely font-engine agnostic before building on the assumption.
-- **Done when:** output from Phase 1's test pages renders consistently and is genuinely pleasant to read.
+**Goal:** Turn extracted content into the actual "beautiful, clear" output — this is where the project stops being a pipe and starts being a page.
+
+**Work, in order:**
+1. **The spike, before anything else.** Implement `create_font`/`text_width`/`draw_text` over FreeType in a throwaway litehtml container and confirm litehtml is genuinely font-engine agnostic. The whole Pango rejection rests on this being true; find out in a day rather than a month.
+2. **Bundle the faces** and write the font matcher — walk a configured directory, read family and style from FreeType name tables, match on request. Unglamorous, and it is the piece fontconfig was doing.
+3. **Run shaper v1** — itemize into runs of uniform style, shape each with HarfBuzz, compute break opportunities with libunibreak, greedy-break against a **measurement callback**. The callback is not over-engineering: it is what Phase 6 reuses to break in cells instead of pixels.
+4. **Cairo paint backend** behind the paint interface. One backend now, but the interface exists from the start so Phase 5 adds rather than refactors.
+5. **The reader template and stylesheet, with exactly one theme.** Get one genuinely pleasant to read before there is a set to be inconsistent across.
+6. **Then breadth:** the remaining themes, media-reference placeholders, video cards, form-control styling.
+7. **Viewer mode's paint side** — fit-to-width, next/previous, save.
+
+**Done when:** output from Phase 1's test pages renders consistently and is genuinely pleasant to read.
 
 ### Phase 3 — App shell
 *Daily-usable*
 
-- **Goal:** Make it usable without a terminal.
-- **Scope:** Minimal GTK desktop shell (Cinnamon/X11): address bar, back/forward over extraction history, a reading list, a theme picker; native GTK form widgets composited over the template, with GET-search and simple-POST submission; external hand-off via `xdg-open`/`xdg-email` (or a configurable command), scheme-validated.
-- **Done when:** a URL can be typed in and read, start to finish, with no terminal involved.
+**Goal:** Make it usable without a terminal.
+
+**Work, in order:**
+1. **A GTK window hosting the Cairo surface**, rendering one fixed page. Proves the shell before it has anything to drive.
+2. **Address bar** wired to the pipeline — the first end-to-end URL-to-page path.
+3. **History** over extraction results, back and forward. Note the [realm-lifetime constraint](#deferred-fork-live-realm-re-dispatch) here: history entries must not assume the realm died.
+4. **Native GTK form widgets** composited over the painted template, placed from litehtml's box geometry. This is the fiddly one — hit-testing and placement, not the widgets themselves.
+5. **Form submission** — GET search and simple POST, the response re-entering the pipeline as a new history entry.
+6. **External hand-off**, scheme-validated, via `xdg-open`/`xdg-email` or a configured command.
+7. **Reading list and theme picker** — the last things, because they are the easiest to get right and the easiest to defer.
+
+**Done when:** a URL can be typed in and read, start to finish, with no terminal involved.
 
 ### Phase 4 — Hardening
 *Open-ended, later*
 
-- **Goal:** Widen coverage based on evidence, not guesswork.
-- **Scope:** Extend bindings against the telemetry log accumulated since Phase 0, not the full spec. Widen form round-tripping to whatever the log demands. Grow the shaper on the same basis — bidi, per-character fallback, hyphenation. Add HTTP caching and conditional requests, which nothing before this point has and which every link click currently pays for. Revisit [live-realm re-dispatch](#deferred-fork-live-realm-re-dispatch) with real usage data. Tune against both budgets; package for distribution.
+**Goal:** Widen coverage based on evidence, not guesswork. This phase has no order — it is a set of standing queues, worked by whatever the logs rank highest.
+
+**The queues:**
+- **Binding surface** — triage the telemetry log accumulated since Phase 0 and extend against its top hits, never against the spec.
+- **Form round-tripping** — multi-step flows, per-step CSRF, `multipart/form-data`, redirect chains, as and when the log demands them.
+- **The shaper** — bidi (SheenBidi), per-character fallback via `.notdef` run splitting, hyphenation. Same rule: a corpus page has to ask first.
+- **HTTP caching and conditional requests** — nothing before this point has any, and every link click pays full price.
+- **[Live-realm re-dispatch](#deferred-fork-live-realm-re-dispatch)** — revisit with real usage data. It is plausibly worth more than Phase 3's form work.
+- **Sandboxing** — decide seccomp or a separate process for the JS realm, rather than leaving it recorded-and-deferred forever.
+- **Budgets and packaging** — tune against both, then package for distribution.
 
 ### Phase 5 — Framebuffer
 *Deferred until desktop is finished*
 
-- **Goal:** Same core, a different paint backend — no new pipeline, extraction, interaction, or theme work.
-- **Scope:** Our own ARGB32 blitter to `/dev/fb0`. The mmap'd surface is 32-bit host-order XRGB8888, the same format we composite in, so no conversion — but the surface stride and the fb's `line_length` can differ, so blit row-by-row rather than one flat `memcpy`. NetSurf's fb frontend is **read-only reference** (GPL-2.0), not lifted code. `libinput` reading `/dev/input/event*` for keyboard and pointer, since there's no compositor handing out events — raw `evdev` is the fallback; either way this needs the running user in the `input` group or root, and that setup story gets decided here. Text entry for forms needs its own answer, GTK being unavailable. This phase is where the size budget gets tested for real.
-- **Done when:** the same URL, read and interacted with, is navigable by keyboard alone and by mouse alone on the framebuffer, matching the desktop experience — within budget.
+**Goal:** Same core, a different paint backend — no new pipeline, extraction, interaction, or theme work.
+
+**Work, in order:**
+1. **The second paint backend** — an ARGB32 blitter to the mmap'd `/dev/fb0`. The surface is 32-bit host-order XRGB8888, the same format we composite in, so no conversion — but the surface stride and the fb's `line_length` can differ, so blit **row by row**, never one flat `memcpy`.
+2. **Surface lifecycle** — fb probing, mode information, teardown on exit and on VT switch.
+3. **`libinput`** for keyboard and pointer both, reading `/dev/input/event*`, since no compositor is handing out events. Raw `evdev` is the fallback if `libinput` is too heavy for a minimal build.
+4. **Decide the permission story** — `input` group, a udev rule, or root. It has been an open question since the first draft; this is where it closes.
+5. **Text entry without GTK.** The genuinely new work of this phase, and the bill for the Phase 3 decision to composite native widgets.
+6. **Viewer mode** as a full-screen state swap, with zoom as a scale transform.
+7. **Measure the size budget for real** and strip whatever quietly pulled GLib back in. This phase is where "small and portable" stops being an assertion.
+
+NetSurf's fb frontend is **read-only reference** (GPL-2.0) throughout, never lifted code.
+
+**Done when:** the same URL, read and interacted with, is navigable by keyboard alone and by mouse alone on the framebuffer, matching the desktop experience — within budget.
 
 ### Phase 6 — TUI
 *The last visualization target*
 
-- **Goal:** Same core again, text-first — most of the reading experience needs no raster path at all.
-- **Scope:** **Text-only first** — articles, forms, and tables as styled terminal text, reusing the Phase 2 line breaker with a cell-measuring callback instead of a pixel one. Keyboard via raw-mode stdin, mouse via terminal mouse-reporting (SGR). Images come after: our own kitty/sixel encoder plus a `$TERM` capability probe (~300 lines, and no foreign input model), with `[image: alt text]` everywhere else. Unicode block-art is not planned — it would not meet the Phase 2 bar and pretending otherwise just costs work.
-- **Done when:** the same URL is navigable the same way as Phases 3 and 5, in a terminal.
+**Goal:** Same core again, text-first — most of the reading experience needs no raster path at all.
+
+**Work, in order:**
+1. **Terminal text renderer** — reuse the Phase 2 line breaker with a cell-measuring callback instead of a pixel one. If step 3 of Phase 2 was done properly, this is small.
+2. **Input** — raw-mode stdin for keyboard, SGR mouse reporting for pointer.
+3. **The reading view**: articles, tables, and forms as styled terminal text, including in-terminal text entry.
+4. **Capability probe** — `$TERM` plus a terminal query, deciding what the image path can be.
+5. **Images**: our own kitty/sixel encoder where the protocol exists, `[image: alt text]` everywhere else. Unicode block-art is not planned — it would not meet the Phase 2 bar.
+6. **Viewer mode** by re-encoding at a different crop and cell size.
+
+**Done when:** the same URL is navigable the same way as Phases 3 and 5, in a terminal.
 
 ## Licensing position
 
