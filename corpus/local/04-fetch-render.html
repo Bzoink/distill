@@ -1,0 +1,44 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>04 — Client rendering over the network bridge</title>
+
+<article id="content">
+  <p id="status">LOADING</p>
+</article>
+<div id="xhr">XHR-NEVER-RAN</div>
+
+<script>
+  async function render() {
+    const res = await fetch('04-article.json');
+    if (!res.ok) throw new Error('HTTP ' + res.status);
+    const data = await res.json();
+
+    const root = document.getElementById('content');
+    root.innerHTML = '';
+
+    const h = document.createElement('h1');
+    h.textContent = data.title;
+    root.appendChild(h);
+
+    for (const text of data.paragraphs) {
+      const p = document.createElement('p');
+      p.textContent = text;
+      root.appendChild(p);
+    }
+  }
+
+  render().catch(function (e) {
+    document.getElementById('status').textContent = 'FETCH-FAIL: ' + e.message;
+  });
+
+  // The older path, still very much in the wild.
+  var x = new XMLHttpRequest();
+  x.open('GET', '04-article.json', true);
+  x.onreadystatechange = function () {
+    if (x.readyState === 4) {
+      document.getElementById('xhr').textContent =
+        (x.status === 200 && JSON.parse(x.responseText).title) ? 'XHR-OK' : 'XHR-FAIL';
+    }
+  };
+  x.send();
+</script>

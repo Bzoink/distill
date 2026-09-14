@@ -1,0 +1,8 @@
+{
+  "title": "Fetched, not served",
+  "byline": "Phase 0 corpus",
+  "paragraphs": [
+    "FETCH-BODY-OK — this text existed only as JSON until a script asked for it.",
+    "This is the shape most of the modern web takes: an empty shell, then a request, then content."
+  ]
+}

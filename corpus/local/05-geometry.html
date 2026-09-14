@@ -1,0 +1,62 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>05 — The layout fiction</title>
+<style>
+  #genuinely-hidden { display: none; }
+  .spacer { height: 4000px; }
+</style>
+
+<article id="content">
+  <h1>Content behind a measurement</h1>
+  <p>Nothing here is unusual. It is the ordinary lazy-loading pattern, which is
+  exactly why a reader with no layout engine has to answer it.</p>
+  <div class="spacer"></div>
+  <p id="lazy">LAZY-NEVER-LOADED</p>
+  <p id="measured">MEASURE-NEVER-RAN</p>
+  <p id="style-probe">STYLE-NEVER-RAN</p>
+</article>
+
+<div id="genuinely-hidden">HIDDEN-LEAKED if this is ever revealed.</div>
+
+<script>
+  // 1. IntersectionObserver gating — the single most common reason a page
+  //    below the fold stays empty. Reporting everything visible loads it all.
+  var io = new IntersectionObserver(function (entries) {
+    entries.forEach(function (e) {
+      if (e.isIntersecting) {
+        document.getElementById('lazy').textContent = 'LAZY-OK';
+        io.unobserve(e.target);
+      }
+    });
+  });
+  io.observe(document.getElementById('lazy'));
+
+  // 2. Geometry must be plausible and non-zero, not 0 and not absent.
+  var el = document.getElementById('measured');
+  var r = el.getBoundingClientRect();
+  var okRect = r && typeof r.width === 'number' && r.width > 0 && typeof r.top === 'number';
+  var okOffset = el.offsetHeight > 0 && document.body.offsetWidth > 0;
+  var okViewport = window.innerWidth > 0 && window.innerHeight > 0 && screen.width > 0;
+  el.textContent = (okRect && okOffset && okViewport)
+    ? 'MEASURE-OK'
+    : 'MEASURE-FAIL rect=' + okRect + ' offset=' + okOffset + ' viewport=' + okViewport;
+
+  // 3. The negative case. The geometry fiction says "everything is on screen";
+  //    it must NOT say "everything is displayed". display:none still resolves.
+  var hidden = document.getElementById('genuinely-hidden');
+  var display = window.getComputedStyle(hidden).display;
+  document.getElementById('style-probe').textContent =
+    (display === 'none') ? 'HIDDEN-RESPECTED' : 'HIDDEN-LEAKED (display=' + display + ')';
+
+  // 4. Scrolling is accepted and recorded, never thrown.
+  try {
+    window.scrollTo(0, 2000);
+    document.getElementById('content').appendChild(
+      Object.assign(document.createElement('p'), { id: 'scroll', textContent: 'SCROLL-OK' })
+    );
+  } catch (e) {
+    document.getElementById('content').appendChild(
+      Object.assign(document.createElement('p'), { id: 'scroll', textContent: 'SCROLL-THREW' })
+    );
+  }
+</script>

@@ -1,0 +1,44 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>03 — Settle policy: what must be waited for</title>
+
+<article id="content">
+  <h1>When is the page done?</h1>
+  <p>Half of this test is what must be waited for. The other half is what must not.</p>
+  <p id="settle">SETTLE-NEVER-SET</p>
+  <p id="toolate">&nbsp;</p>
+</article>
+
+<script>
+  var seen = [];
+  function note(tok) {
+    seen.push(tok);
+    document.getElementById('settle').textContent = seen.join(',');
+  }
+
+  // --- must be waited for ---------------------------------------------
+  setTimeout(function () { note('early-50ms'); }, 50);
+  setTimeout(function () { note('late-400ms'); }, 400);
+
+  Promise.resolve()
+    .then(function () { return null; })
+    .then(function () { note('microtask'); });
+
+  fetch('/slow?ms=800')
+    .then(function (r) { return r.json(); })
+    .then(function (d) { note('slow-' + d.ok); });
+
+  // --- must NOT be waited for -----------------------------------------
+
+  // A promise that never settles.
+  new Promise(function () {}).then(function () { note('NEVER-IMPOSSIBLE'); });
+
+  // A timer far beyond the settle window. Waiting for this is the bug.
+  setTimeout(function () {
+    document.getElementById('toolate').textContent = 'TOOLATE-LEAKED';
+  }, 30000);
+
+  // A self-rescheduling timer, the shape a polling widget actually has.
+  // It must never keep the page from settling.
+  (function poll() { setTimeout(poll, 250); })();
+</script>

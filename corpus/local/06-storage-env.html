@@ -1,0 +1,69 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>06 — Storage and environment gating</title>
+
+<article id="content">
+  <h1>The gates NetSurf never got past</h1>
+  <p>The Why section blames localStorage and the network APIs for the modern web
+  being unreadable. This is that claim, made testable.</p>
+  <p id="gate">GATE-NEVER-RAN</p>
+  <p id="env">ENV-NEVER-RAN</p>
+</article>
+
+<script>
+  var results = [];
+
+  // localStorage: the first-visit pattern. A throwing or missing localStorage
+  // takes the whole script down with it, which is why NetSurf shows nothing.
+  try {
+    var seen = localStorage.getItem('distill-seen');
+    localStorage.setItem('distill-seen', '1');
+    results.push(seen === null ? 'ls-first-visit' : 'ls-return-visit');
+  } catch (e) { results.push('ls-THREW'); }
+
+  try {
+    sessionStorage.setItem('distill-session', 'x');
+    results.push(sessionStorage.getItem('distill-session') === 'x' ? 'ss-ok' : 'ss-bad');
+  } catch (e) { results.push('ss-THREW'); }
+
+  try {
+    document.cookie = 'distill=1; path=/';
+    results.push(document.cookie.indexOf('distill=1') !== -1 ? 'cookie-ok' : 'cookie-bad');
+  } catch (e) { results.push('cookie-THREW'); }
+
+  document.getElementById('gate').textContent =
+    (results.join(',').indexOf('THREW') === -1) ? 'GATE-OK (' + results.join(',') + ')'
+                                                : 'GATE-FAIL (' + results.join(',') + ')';
+
+  // Environment. A page that sniffs the UA and finds nothing often serves a
+  // stripped page or bails entirely, so this is a content-fidelity setting.
+  var env = [];
+  env.push(/Mozilla/.test(navigator.userAgent) ? 'ua-ok' : 'ua-bad:' + navigator.userAgent);
+  env.push(typeof navigator.language === 'string' ? 'lang-ok' : 'lang-bad');
+  env.push(location.protocol && location.host ? 'loc-ok' : 'loc-bad');
+  env.push(typeof performance.now() === 'number' ? 'perf-ok' : 'perf-bad');
+
+  try {
+    var buf = new Uint8Array(4);
+    crypto.getRandomValues(buf);
+    env.push('crypto-ok');
+  } catch (e) { env.push('crypto-THREW'); }
+
+  try {
+    env.push(typeof matchMedia('(prefers-color-scheme: dark)').matches === 'boolean'
+      ? 'mm-ok' : 'mm-bad');
+  } catch (e) { env.push('mm-THREW'); }
+
+  try {
+    history.pushState({ n: 1 }, '', '?routed=1');
+    env.push(location.search.indexOf('routed=1') !== -1 ? 'push-ok' : 'push-bad');
+  } catch (e) { env.push('push-THREW'); }
+
+  requestAnimationFrame(function () {
+    env.push('raf-ok');
+    document.getElementById('env').textContent =
+      (env.join(',').indexOf('bad') === -1 && env.join(',').indexOf('THREW') === -1)
+        ? 'ENV-OK (' + env.join(',') + ')'
+        : 'ENV-FAIL (' + env.join(',') + ')';
+  });
+</script>

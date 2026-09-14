@@ -1,0 +1,35 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>01 — Synchronous DOM construction</title>
+
+<article id="content"></article>
+
+<script>
+  var root = document.getElementById('content');
+
+  var h = document.createElement('h1');
+  h.textContent = 'Built at parse time';
+  root.appendChild(h);
+
+  var p = document.createElement('p');
+  p.textContent = 'SYNC-BODY-OK — this paragraph exists only because a script ran.';
+  p.classList.add('lede', 'first');
+  p.dataset.role = 'lede';
+  root.appendChild(p);
+
+  // innerHTML fragment parse + splice: the binding must parse a fragment and
+  // graft it in, not merely set a text value.
+  var frag = document.createElement('div');
+  frag.innerHTML = '<p id="spliced">SPLICE-OK <em>with nested markup</em> intact.</p>';
+  root.appendChild(frag.firstElementChild);
+
+  // Attribute and class round-trips the extractor depends on.
+  var ok = (p.classList.contains('lede') && p.dataset.role === 'lede'
+            && root.querySelector('#spliced') !== null
+            && root.querySelectorAll('p').length === 2);
+
+  var probe = document.createElement('p');
+  probe.id = 'probe';
+  probe.textContent = ok ? 'DOM-API-OK' : 'DOM-API-FAIL';
+  root.appendChild(probe);
+</script>

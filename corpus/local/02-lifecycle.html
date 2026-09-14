@@ -1,0 +1,45 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>02 — Lifecycle and script order</title>
+
+<script>
+  // Deterministic chain. Async scripts and readystatechange are recorded
+  // separately, because their interleaving is not guaranteed by spec.
+  window.ORDER = [];
+  window.READY = [];
+  window.mark = function (tok) { window.ORDER.push(tok); };
+  window.mark('head');
+
+  document.addEventListener('readystatechange', function () {
+    window.READY.push(document.readyState);
+  });
+
+  document.addEventListener('DOMContentLoaded', function () {
+    window.mark('dcl');
+  });
+
+  window.addEventListener('load', function () {
+    window.mark('load');
+    document.getElementById('order').textContent = window.ORDER.join(',');
+    document.getElementById('ready').textContent =
+      (window.READY.indexOf('interactive') !== -1 &&
+       window.READY.indexOf('complete') !== -1) ? 'READY-OK' : 'READY-FAIL:' + window.READY.join(',');
+  });
+</script>
+
+<script defer src="02-a.js"></script>
+<script defer src="02-b.js"></script>
+<script async src="02-async.js"></script>
+
+<article id="content">
+  <h1>Order is the whole test</h1>
+  <p>Every API below can work individually and still produce nothing, because
+  client-rendered pages hang their content off a specific sequence.</p>
+  <p id="order">ORDER-NEVER-SET</p>
+  <p id="ready">READY-NEVER-SET</p>
+  <p id="async">ASYNC-NEVER-RAN</p>
+</article>
+
+<script>
+  window.mark('body');
+</script>

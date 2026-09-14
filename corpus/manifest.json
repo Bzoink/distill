@@ -1,0 +1,425 @@
+{
+  "note": "The Phase 0 assertion contract. 'dom'-stage assertions are checked against the post-JS DOM at settle time; 'extract'-stage assertions are checked against extractor output and belong to Phase 1. Local pages are gates; live pages never are. Where 'browser_expect' is present, a reference browser deliberately disagrees with us -- run check.py --baseline to validate fixtures against the browser, and without it to test the engine.",
+  "settle_cap_ms": 5000,
+  "pages": [
+    {
+      "id": "00-static",
+      "path": "00-static.html",
+      "gate": true,
+      "plan_section": "Minimal computed style",
+      "exercises": [
+        "fetch",
+        "parse",
+        "style-resolver"
+      ],
+      "why": "Control. No scripts at all, so a failure here is never a binding bug.",
+      "assertions": [
+        {
+          "stage": "dom",
+          "selector": "#content",
+          "expect": "STATIC-BODY-OK"
+        },
+        {
+          "stage": "extract",
+          "expect_absent": [
+            "NAVLEAK",
+            "LEGALLEAK",
+            "FOOTLEAK"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "01-sync-dom",
+      "path": "01-sync-dom.html",
+      "gate": true,
+      "plan_section": "DOM ↔ JS",
+      "exercises": [
+        "createElement",
+        "textContent",
+        "classList",
+        "dataset",
+        "innerHTML",
+        "querySelector"
+      ],
+      "why": "The binding floor. Arm A's mechanically-derived checklist has to clear this.",
+      "assertions": [
+        {
+          "stage": "dom",
+          "selector": "#content",
+          "expect": "SYNC-BODY-OK"
+        },
+        {
+          "stage": "dom",
+          "selector": "#spliced",
+          "expect": "SPLICE-OK"
+        },
+        {
+          "stage": "dom",
+          "selector": "#probe",
+          "expect": "DOM-API-OK"
+        }
+      ]
+    },
+    {
+      "id": "02-lifecycle",
+      "path": "02-lifecycle.html",
+      "gate": true,
+      "plan_section": "Browser globals and document lifecycle",
+      "exercises": [
+        "script-order",
+        "defer",
+        "async",
+        "DOMContentLoaded",
+        "load",
+        "readystatechange"
+      ],
+      "why": "Every API here can work individually and still yield nothing, because content hangs off the sequence.",
+      "assertions": [
+        {
+          "stage": "dom",
+          "selector": "#order",
+          "expect": "head,body,defer-a,defer-b,dcl,load"
+        },
+        {
+          "stage": "dom",
+          "selector": "#ready",
+          "expect": "READY-OK"
+        },
+        {
+          "stage": "dom",
+          "selector": "#async",
+          "expect": "ASYNC-OK"
+        }
+      ]
+    },
+    {
+      "id": "03-settle",
+      "path": "03-settle.html",
+      "gate": true,
+      "plan_section": "Settle policy",
+      "exercises": [
+        "timers",
+        "microtasks",
+        "in-flight-requests",
+        "self-rescheduling-timer"
+      ],
+      "why": "Half of the settle policy: what must be waited for. The cap is 03b.",
+      "assertions": [
+        {
+          "stage": "dom",
+          "selector": "#settle",
+          "expect": "early-50ms"
+        },
+        {
+          "stage": "dom",
+          "selector": "#settle",
+          "expect": "late-400ms"
+        },
+        {
+          "stage": "dom",
+          "selector": "#settle",
+          "expect": "microtask"
+        },
+        {
+          "stage": "dom",
+          "selector": "#settle",
+          "expect": "slow-ok"
+        },
+        {
+          "stage": "dom",
+          "selector": "#toolate",
+          "expect_absent": [
+            "TOOLATE-LEAKED"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "03b-hang",
+      "path": "03b-hang.html",
+      "gate": true,
+      "plan_section": "Settle policy",
+      "exercises": [
+        "hung-request",
+        "never-resolving-promise",
+        "settle-cap"
+      ],
+      "why": "The other half: what must NOT be waited for. A real browser waits forever here, so the reference run is expected to time out. That divergence is the fixture's whole thesis.",
+      "browser_expect_timeout": true,
+      "assertions": [
+        {
+          "stage": "dom",
+          "selector": "#body",
+          "expect": "HANG-BODY-OK"
+        },
+        {
+          "stage": "dom",
+          "selector": "#hang",
+          "expect_absent": [
+            "HANG-RESOLVED-IMPOSSIBLE",
+            "NEVER-RESOLVED-IMPOSSIBLE"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "04-fetch-render",
+      "path": "04-fetch-render.html",
+      "gate": true,
+      "plan_section": "Network ↔ JS bridge",
+      "exercises": [
+        "fetch",
+        "async-await",
+        "json",
+        "XMLHttpRequest"
+      ],
+      "why": "The shape most of the modern web takes: empty shell, request, content.",
+      "assertions": [
+        {
+          "stage": "dom",
+          "selector": "#content",
+          "expect": "FETCH-BODY-OK"
+        },
+        {
+          "stage": "dom",
+          "selector": "#xhr",
+          "expect": "XHR-OK"
+        }
+      ]
+    },
+    {
+      "id": "05-geometry",
+      "path": "05-geometry.html",
+      "gate": true,
+      "plan_section": "What we tell the page about layout",
+      "exercises": [
+        "IntersectionObserver",
+        "getBoundingClientRect",
+        "offsetHeight",
+        "getComputedStyle",
+        "scrollTo"
+      ],
+      "why": "Proves the fiction loads lazy content eagerly, and that it does not also reveal display:none.",
+      "assertions": [
+        {
+          "stage": "dom",
+          "selector": "#lazy",
+          "expect": "LAZY-OK",
+          "browser_expect": "LAZY-NEVER-LOADED",
+          "divergence": "A real browser never scrolls, so IntersectionObserver never fires. Our fiction reports everything intersecting, which is precisely how lazy content gets loaded eagerly. The engine must beat the browser here."
+        },
+        {
+          "stage": "dom",
+          "selector": "#measured",
+          "expect": "MEASURE-OK"
+        },
+        {
+          "stage": "dom",
+          "selector": "#style-probe",
+          "expect": "HIDDEN-RESPECTED"
+        },
+        {
+          "stage": "dom",
+          "selector": "#scroll",
+          "expect": "SCROLL-OK"
+        },
+        {
+          "stage": "extract",
+          "expect_absent": [
+            "HIDDEN-LEAKED"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "06-storage-env",
+      "path": "06-storage-env.html",
+      "gate": true,
+      "plan_section": "Browser globals and document lifecycle",
+      "exercises": [
+        "localStorage",
+        "sessionStorage",
+        "cookie",
+        "navigator",
+        "matchMedia",
+        "history",
+        "crypto",
+        "raf"
+      ],
+      "why": "The Why section blames exactly these gaps for the web being unreadable. This makes that claim testable.",
+      "assertions": [
+        {
+          "stage": "dom",
+          "selector": "#gate",
+          "expect": "GATE-OK"
+        },
+        {
+          "stage": "dom",
+          "selector": "#env",
+          "expect": "ENV-OK"
+        }
+      ]
+    },
+    {
+      "id": "07-churn",
+      "path": "07-churn.html",
+      "gate": true,
+      "plan_section": "Arm A: node lifetime, node identity, wrapper cache",
+      "exercises": [
+        "dom-churn",
+        "node-identity",
+        "detached-nodes",
+        "MutationObserver",
+        "innerHTML-teardown"
+      ],
+      "why": "Where a raw-pointer binding over arena-allocated nodes crashes. Better here than on a live site.",
+      "assertions": [
+        {
+          "stage": "dom",
+          "selector": "#survivor",
+          "expect": "CHURN-BODY-OK"
+        },
+        {
+          "stage": "dom",
+          "selector": "#churn",
+          "expect": "CHURN-OK"
+        },
+        {
+          "stage": "dom",
+          "selector": "#identity",
+          "expect": "IDENTITY-OK"
+        },
+        {
+          "stage": "dom",
+          "selector": "#detached",
+          "expect": "DETACHED-OK"
+        },
+        {
+          "stage": "dom",
+          "selector": "#observer",
+          "expect": "OBSERVER-OK"
+        }
+      ]
+    },
+    {
+      "id": "08-messy",
+      "path": "08-messy.html",
+      "gate": true,
+      "plan_section": "Step 4c, encoding detection, sanitization, style resolver",
+      "exercises": [
+        "undeclared-encoding",
+        "base-href",
+        "url-resolution",
+        "dynamic-import",
+        "hostile-schemes",
+        "form-extraction"
+      ],
+      "why": "Fills the gap between a 3 KB practice page and a 272 KB newspaper, while still naming its own cause on failure.",
+      "assertions": [
+        {
+          "stage": "dom",
+          "selector": "#encoding",
+          "expect": "ENCODING-OK"
+        },
+        {
+          "stage": "dom",
+          "selector": "#encoding",
+          "expect": "å",
+          "browser_expect": "Ã¥",
+          "divergence": "Chrome falls back to windows-1252 for an undeclared page and produces mojibake; only a BOM saves it. Encoding detection is what Lexbor buys us, and mojibake is never the useful outcome for a reader."
+        },
+        {
+          "stage": "dom",
+          "selector": "#resolved",
+          "expect": "RESOLVE-OK"
+        },
+        {
+          "stage": "dom",
+          "selector": "#imported",
+          "expect": "IMPORT-OK"
+        },
+        {
+          "stage": "extract",
+          "expect_absent": [
+            "NAVLEAK",
+            "PROMOLEAK",
+            "SUBLEAK",
+            "javascript:",
+            "XSS-LEAKED"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "08b-charset-lie",
+      "path": "08b-charset-lie.html",
+      "gate": false,
+      "plan_section": "Step 4c, encoding detection",
+      "exercises": [
+        "declared-encoding-contradicts-bytes"
+      ],
+      "why": "Open decision, recorded rather than settled. See open_decisions.",
+      "assertions": [
+        {
+          "stage": "dom",
+          "selector": "#encoding",
+          "expect": "LIE-BODY-OK"
+        }
+      ]
+    }
+  ],
+  "live": [
+    {
+      "id": "live-1-danluu",
+      "url": "https://danluu.com/diseconomies-scale/",
+      "gate": false,
+      "rung": 1,
+      "raw_html_p_tags": 1,
+      "why": "Static HTML, one script. Reality check on fetch/parse/extract with zero JS involved."
+    },
+    {
+      "id": "live-2-wikipedia",
+      "url": "https://en.wikipedia.org/wiki/Extensible_Markup_Language",
+      "gate": false,
+      "rung": 2,
+      "raw_html_p_tags": 72,
+      "why": "463 KB, server-rendered, JS only enhances. Content is present without JS, so any loss is an extraction bug, not a binding one."
+    },
+    {
+      "id": "live-3-quotes-js",
+      "url": "https://quotes.toscrape.com/js/",
+      "gate": false,
+      "rung": 3,
+      "raw_html_p_tags": 3,
+      "why": "Zero rendered .quote divs in raw HTML; data sits in a var data = [...] array. The cleanest true positive for 'JS must run'."
+    },
+    {
+      "id": "live-4-quotes-scroll",
+      "url": "https://quotes.toscrape.com/scroll",
+      "gate": false,
+      "rung": 4,
+      "raw_html_p_tags": 3,
+      "why": "Same content delivered by AJAX after load. Isolates the network bridge and the settle policy from rung 3's pure client-side rendering."
+    },
+    {
+      "id": "live-5-dn",
+      "url": "https://www.dn.se/ekonomi/lyten-lovar-revansch-men-kunderna-saknas/",
+      "gate": false,
+      "diagnostic": true,
+      "rung": 5,
+      "raw_html_p_tags": 3,
+      "why": "Consent (Didomi) + paywall (218 markers) + ~272 KB + no article body in the HTML. Its three failure causes are distinguishable, and recording WHICH ONE fired is the result. Expect the URL to rot; re-pin rather than debug."
+    }
+  ],
+  "divergences": "Three fixtures require us to behave differently from a conformant browser, each on purpose: 03b (a browser never settles, we cap), 05 (a browser leaves below-fold lazy content unloaded, our fiction loads it), and 08 (a browser falls back to windows-1252 on an undeclared UTF-8 page, we detect). These are the corpus stating the plan's design choices as testable facts.",
+  "open_decisions": [
+    {
+      "id": "declared-encoding-contradicts-bytes",
+      "fixture": "08b-charset-lie.html",
+      "question": "A page explicitly declares us-ascii (-> windows-1252 per the Encoding Standard) but serves UTF-8. Follow the declaration (spec-correct, illegible) or trust the bytes (legible, non-conformant)?",
+      "browser_behaviour": "mojibake; Chrome is right to do so",
+      "status": "undecided -- deliberately not a gate"
+    }
+  ]
+}

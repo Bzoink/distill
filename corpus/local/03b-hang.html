@@ -1,0 +1,28 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>03b — Settle policy: the cap</title>
+
+<article id="content">
+  <h1>The half a browser gets wrong</h1>
+  <p>A real browser has no settle policy, so it waits here forever. That is the
+  whole point of the fixture: our cap is the thing under test, and the reference
+  browser is expected to time out rather than pass.</p>
+  <p id="body">HANG-BODY-OK — this text is present before anything hangs.</p>
+  <p id="hang">HANG-PENDING</p>
+</article>
+
+<script>
+  // Never completes. The settle cap must fire and extraction must proceed
+  // with whatever the DOM holds at that moment.
+  fetch('/hang').then(function () {
+    document.getElementById('hang').textContent = 'HANG-RESOLVED-IMPOSSIBLE';
+  });
+
+  // Never settles.
+  new Promise(function () {}).then(function () {
+    document.getElementById('hang').textContent = 'NEVER-RESOLVED-IMPOSSIBLE';
+  });
+
+  // A polling widget: must never by itself keep the page from settling.
+  (function poll() { setTimeout(poll, 250); })();
+</script>

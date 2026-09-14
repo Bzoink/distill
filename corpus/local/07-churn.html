@@ -1,0 +1,82 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>07 — DOM churn, node identity, detached nodes</title>
+
+<article id="content">
+  <h1>Where a raw-pointer binding dies</h1>
+  <p>Lexbor nodes are arena-allocated and this page mutates the tree the way a
+  framework does. A binding that hands JavaScript a raw node pointer crashes
+  here — which is the point of crashing here rather than on a live site.</p>
+  <div id="stage"></div>
+  <p id="churn">CHURN-NEVER-RAN</p>
+  <p id="identity">IDENTITY-NEVER-RAN</p>
+  <p id="detached">DETACHED-NEVER-RAN</p>
+  <p id="observer">OBSERVER-NEVER-RAN</p>
+</article>
+
+<script>
+  var stage = document.getElementById('stage');
+  var ROUNDS = 200, PER_ROUND = 50;
+
+  // A MutationObserver watching the whole storm. Every add and remove below
+  // has to survive being reported.
+  var mutations = 0;
+  var mo = new MutationObserver(function (records) { mutations += records.length; });
+  mo.observe(stage, { childList: true, subtree: true, attributes: true });
+
+  // A node that gets detached early and read much later. Its backing storage
+  // must outlive its removal from the tree.
+  var detached = document.createElement('p');
+  detached.textContent = 'DETACHED-ALIVE';
+  detached.setAttribute('data-keep', 'yes');
+  stage.appendChild(detached);
+  stage.removeChild(detached);
+
+  // The churn itself: build, mutate, tear down, rebuild.
+  for (var round = 0; round < ROUNDS; round++) {
+    var frag = document.createDocumentFragment();
+    for (var i = 0; i < PER_ROUND; i++) {
+      var node = document.createElement('span');
+      node.textContent = 'r' + round + 'n' + i;
+      node.setAttribute('data-round', String(round));
+      node.classList.add('cell', 'r' + (round % 7));
+      frag.appendChild(node);
+    }
+    stage.appendChild(frag);
+
+    // Attribute churn on live nodes.
+    var live = stage.querySelectorAll('span');
+    for (var j = 0; j < live.length; j += 10) {
+      live[j].dataset.touched = String(round);
+    }
+
+    // innerHTML teardown: throws away every wrapper the engine handed out.
+    if (round % 2 === 1) stage.innerHTML = '';
+  }
+
+  // Final, stable content after the storm.
+  stage.innerHTML = '<p id="survivor">CHURN-BODY-OK after ' + ROUNDS + ' rounds.</p>';
+
+  document.getElementById('churn').textContent =
+    (stage.querySelector('#survivor') ? 'CHURN-OK' : 'CHURN-FAIL');
+
+  // Node identity: the same underlying node must yield the same JS object,
+  // or === comparisons in page scripts silently stop working.
+  var a = document.getElementById('survivor');
+  var b = document.getElementById('survivor');
+  var c = stage.firstElementChild;
+  var d = document.querySelectorAll('#survivor')[0];
+  document.getElementById('identity').textContent =
+    (a === b && b === c && c === d) ? 'IDENTITY-OK'
+      : 'IDENTITY-FAIL a===b:' + (a === b) + ' b===c:' + (b === c) + ' c===d:' + (c === d);
+
+  // The detached node, read long after removal and after heavy allocation.
+  document.getElementById('detached').textContent =
+    (detached.textContent === 'DETACHED-ALIVE' && detached.getAttribute('data-keep') === 'yes'
+      && detached.parentNode === null) ? 'DETACHED-OK' : 'DETACHED-FAIL';
+
+  setTimeout(function () {
+    document.getElementById('observer').textContent =
+      mutations > 0 ? 'OBSERVER-OK (' + mutations + ' records)' : 'OBSERVER-FAIL';
+  }, 100);
+</script>

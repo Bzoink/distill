@@ -1,0 +1,73 @@
+<!doctype html>
+<!-- No charset declaration at all, and the bytes are UTF-8. This is the
+     common real-world case, and the one where detection is unambiguously
+     the right answer: Chrome falls back to windows-1252 and produces
+     mojibake. We are deliberately better than the browser here.
+     The harder case -- an explicit declaration that contradicts the bytes --
+     is 08b-charset-lie.html, and is an open decision, not a gate. -->
+<base href="/deep/section/">
+<title>08 — Real-world grot</title>
+<style>
+  #promo { display: none; }
+  .subscribe { visibility: hidden; }
+</style>
+
+<nav aria-hidden="true">
+  <p>NAVLEAK if this reaches the extractor.</p>
+</nav>
+
+<article id="content">
+  <h1>Skärgården i september</h1>
+  <p id="encoding">Vågorna slår mot bryggan, träden är gula, och räven går över ängen.
+  ENCODING-OK om å, ä och ö överlevde.</p>
+
+  <p>Every URL below is relative and must resolve against the base href, not the
+  document path — otherwise every link, image and form action in the reader is broken.</p>
+
+  <ul>
+    <li><a id="rel" href="../other/page.html">Relative link</a></li>
+    <li><a id="root" href="/absolute/path.html">Root-relative link</a></li>
+    <li><a id="js" href="javascript:alert('XSS-LEAKED')">Hostile scheme</a></li>
+    <li><a id="mail" href="mailto:red@example.org?subject=Hej&amp;body=x">Mail link</a></li>
+    <li><a id="weird" href="data:text/html,<script>alert(1)</script>">Data URL</a></li>
+  </ul>
+
+  <img id="img" src="images/photo.jpg" alt="A jetty in September light">
+
+  <form id="search" method="get" action="find">
+    <label for="q">Search</label>
+    <input type="text" id="q" name="q" value="">
+    <input type="hidden" name="token" value="CSRF-PASSTHROUGH">
+    <button type="submit">Go</button>
+  </form>
+
+  <p id="imported">IMPORT-NEVER-RAN</p>
+</article>
+
+<div id="promo"><p>PROMOLEAK if this reaches the extractor.</p></div>
+<div class="subscribe"><p>SUBLEAK if this reaches the extractor.</p></div>
+
+<script>
+  // Dynamic import: the module graph a router pulls in after first paint.
+  import('/08-late.js')
+    .then(function (m) { document.getElementById('imported').textContent = m.marker; })
+    .catch(function (e) { document.getElementById('imported').textContent = 'IMPORT-FAIL: ' + e.message; });
+</script>
+
+<p id="resolved">RESOLVE-NEVER-RAN</p>
+<script>
+  // URL resolution against <base href>, not the document path. Running this in
+  // a browser defines the expected answer; running it in our engine tests ours.
+  var parts = [];
+  parts.push(document.getElementById('rel').href.endsWith('/deep/other/page.html')
+    ? 'rel-ok' : 'rel-bad:' + document.getElementById('rel').href);
+  parts.push(document.getElementById('root').href.endsWith('/absolute/path.html')
+    ? 'root-ok' : 'root-bad:' + document.getElementById('root').href);
+  parts.push(document.getElementById('img').src.endsWith('/deep/section/images/photo.jpg')
+    ? 'img-ok' : 'img-bad:' + document.getElementById('img').src);
+  parts.push(document.getElementById('search').action.endsWith('/deep/section/find')
+    ? 'action-ok' : 'action-bad:' + document.getElementById('search').action);
+  document.getElementById('resolved').textContent =
+    parts.join(',').indexOf('bad') === -1 ? 'RESOLVE-OK (' + parts.join(',') + ')'
+                                          : 'RESOLVE-FAIL (' + parts.join(',') + ')';
+</script>

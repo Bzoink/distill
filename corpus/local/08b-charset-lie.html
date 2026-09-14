@@ -1,0 +1,16 @@
+<!doctype html>
+<!-- An explicit, valid declaration that contradicts the bytes: this file is
+     UTF-8. Per the Encoding Standard "us-ascii" maps to windows-1252, so a
+     conformant browser produces mojibake here and is RIGHT to do so.
+
+     Open decision, deliberately not a gate: should a reader follow the
+     declaration (spec-correct, illegible) or trust the bytes (legible,
+     non-conformant)? Absent a decision, mojibake is the conformant answer.
+     See manifest.json -> open_decisions. -->
+<meta charset="us-ascii">
+<title>08b — Declared encoding contradicts the bytes</title>
+
+<article id="content">
+  <h1>Skärgården i september</h1>
+  <p id="encoding">Vågorna slår mot bryggan. LIE-BODY-OK.</p>
+</article>
