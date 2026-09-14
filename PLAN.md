@@ -1,0 +1,397 @@
+# Distill
+
+*A small, C-rooted stack that runs a page's real JavaScript against a real DOM, pulls out what actually matters, and renders it back — clearly, consistently, on our own terms.*
+
+**Status:** Concept — Phase 0 not started
+**Drafted:** 2026-09-14 · **Revised:** 2026-09-14 (second review pass)
+**Origin:** NetSurf JS/rendering gap analysis (see `../netsurf`)
+**Rendered version:** https://claude.ai/code/artifact/fcbd8e5f-f6dc-4abd-a2a4-e7282070cf4a *(predates this revision)*
+
+---
+
+## Why
+
+NetSurf (and small browsers like it) can no longer read most of today's web. Its JavaScript engine, Duktape, tops out around ES5.1 syntax and has no `Promise`, no `fetch`/`XMLHttpRequest`, and no working `localStorage` — so any site that loads its own content dynamically, which is most of the web now, fails partway through and shows nothing.
+
+Patching that engine in place turned out to be the wrong shape of fix: the syntax gap and the missing network APIs both point toward replacing the engine, and once you're doing that, chasing pixel-perfect layout for arbitrary sites is the wrong goal to chase at all. What we actually want is narrower and more achievable: get the real content out of a page, and present it well ourselves.
+
+"Present it well" has to cover more than articles, though. A newspaper, a blog, a docs site, a search engine, a forum thread all need reading — but a search engine and a forum also need the user to act: submit a query, post a reply, follow a `mailto:` link. Those are still native HTML constructs (`<form>`, `<a href="mailto:...">`), not bespoke site UI, so extracting and re-rendering them fits the same model as extracting an article body — see [Interaction](#interaction) below.
+
+## What this deliberately isn't
+
+Scope cuts made up front, so effort doesn't quietly drift toward rebuilding a general-purpose browser.
+
+1. **Not a layout engine for other people's CSS.** No flexbox/grid solver for arbitrary sites — that's the single hardest, most open-ended part of any browser, and we don't need it if we render our own template instead of theirs. This holds for interactive elements too: a native `<select>` or `<input>` gets extracted and re-rendered as *our* control, same as an article's headings and paragraphs; a bespoke JS-driven control (a custom dropdown, a date picker built from `div`s) is source-site UI, not a native form control, and is out of scope the same way its CSS is. Note the one honest consequence of this cut, spelled out under [What we tell the page about layout](#what-we-tell-the-page-about-layout): with no layout solver, the geometry APIs can't tell the truth, so we give them a deliberate, consistent fiction instead.
+2. **Not a media engine.** No WebGL, no video/audio pipeline, no WebAssembly, no in-app playback. Text, structure, and images are the target. A page that embeds video (YouTube/Vimeo iframe, `<video>` tag, OpenGraph/oEmbed video metadata) is still content worth surfacing, though: we extract what metadata is available — title, thumbnail, duration, source URL — and present it as a card with a hand-off action to an external player, rather than trying to decode or play it ourselves.
+3. **Not a bot-challenge solver.** Cloudflare-style JS challenges fingerprint the whole browser and are an adversarial problem, not a capability gap. Sites gated this way are out of scope, not a bug to fix.
+4. **Not full spec coverage.** We implement the DOM/JS surface real pages actually exercise, driven by what Phase 0 telemetry hits — not the complete WHATWG/W3C surface NetSurf's own gap list runs to 1,500+ items long. The same discipline governs typography: we shape the scripts our corpus actually contains, not the Unicode repertoire.
+
+## Considered and rejected
+
+Decisions already made, recorded so they stop being re-litigated. Where the reasoning was wrong the first time, the corrected reasoning is recorded too — recording a bad reason is how a settled decision comes back.
+
+**A full browser engine (WebKitGTK/CEF) with Readability injected — rejected.** It would delete steps 1–3 of the pipeline wholesale, for roughly an order of magnitude less code, and on a desktop-only project it would be the obviously correct call. It is rejected because the small C stack *is* the project: the NetSurf lineage, modest target hardware, and the framebuffer target (Phase 5) all presuppose it. Embedding WebKit contradicts the premise rather than serving it. This is a settled constraint, not an open trade-off — which is precisely what justifies the bespoke work in the DOM↔JS layer below. Nothing else in this plan would justify it.
+
+**Bespoke C bindings as a foregone conclusion — deferred, not adopted.** The binding layer is the largest unscoped item here, and there is a real alternative (a JS-side DOM running inside the engine) that could delete most of it. Phase 0 runs both as an A/B before either is committed to. Recorded here so the alternative isn't quietly forgotten once C work starts. See also the [structural question](#the-structural-question-does-this-stay-a-c-project) that A/B actually decides.
+
+**libuv — cut.** We don't need a general event loop. We need a microtask drain, a timer queue, and socket polling for `curl_multi` — that's `poll()` and a few hundred lines. libuv costs roughly a megabyte and imposes pthreads for work we don't do. (An earlier draft claimed quickjs-ng's runtime depends on libuv; that's the `qjs` CLI's os/timer module, not the engine core. The engine has no such dependency.)
+
+**Pango — rejected, and with it GLib, GObject and fontconfig.** Every capability Pango was chosen for is provided by something Pango itself delegates to: shaping to HarfBuzz, rasterization and metrics to FreeType, hyphenation to libhyphen. Pango's own contribution is itemization, line breaking, bidi integration, and font selection — of which font selection is fontconfig (droppable, since we ship our own fonts) and **line breaking is something we want to own anyway**, because the TUI target wraps in terminal cells, not pixels. So Pango's price — GLib, GObject, GModule, ~3.5 MB, and a runtime philosophy — buys integration we'd replace by Phase 6 regardless. Details and the replacement stack: [Typography](#typography--themes).
+
+**WebSocket in the network bridge — cut.** `fetch` and `XMLHttpRequest` stay. WebSocket returns only if Phase 0/1 telemetry shows a target page actually needs it.
+
+**notcurses — not adopted; decided in Phase 6.** It's heavy for what we'd use it for (capability detection and escape output), and it brings an input model that would compete with ours. A kitty/sixel encoder plus a `$TERM` capability probe is a few hundred lines. Since the TUI is text-only first, this decision isn't needed until images arrive.
+
+**NetSurf source reuse — cut, for a narrower reason than first recorded.** The earlier draft said "no NetSurf code," which over-generalises: NetSurf's *browser* (including the framebuffer frontend) is GPL-2.0 and stays out, but several NetSurf *libraries* — notably **libdom and libcss — are MIT** and separate from the browser core. The decision still stands: libdom is stale and its API awkward, and Lexbor's parser is better. But libdom is the one C DOM explicitly designed to be bound to a JS engine, and NetSurf's `dukky` glue is directly relevant prior art for Arm A — **read both before writing bindings from scratch**, especially for how they handle node lifetime. Image decoding uses libpng/libjpeg/libwebp linked directly; the fb frontend is read-only reference. See [Licensing](#licensing-position).
+
+### Budget
+
+The hard constraint above makes footprint a *design input*, not something to measure later. Provisional targets, set now so Phase 0 and Phase 5 have something concrete to fail against — adjust them once real numbers exist, but don't delete them:
+
+**Runtime**
+- **≤ 150 MB peak RSS** for a loaded, extracted, rendered article page.
+- **≤ 3 s** from fetch start to painted output for a typical article on broadband, including script execution.
+- **≤ 5 s** hard script-execution ceiling per page, enforced (see [Settle policy](#settle-policy)).
+
+**Size and dependencies** — the half of the stack the first draft never budgeted, and the half where "small and portable" actually gets tested:
+- **≤ 8 MB** total shared-library footprint on the framebuffer target, excluding bundled font data.
+- **Hard rule: no GLib, GObject, Pango, or fontconfig linked on any target.** fontconfig may be `dlopen`ed on desktop as an optional convenience, never linked.
+- Every new dependency is named in the [Reuse ledger](#reuse-ledger) with its transitive tree understood, not just its own size.
+
+These are also tiebreakers in the Phase 0 A/B: an arm that can't meet them isn't the arm.
+
+## The stack
+
+Every layer is an existing, small project — C, except litehtml (C++) — other than the rows marked bespoke, which are the actual work.
+
+| Layer | Component | Status | Role |
+|---|---|---|---|
+| Network & TLS | libcurl | reused as-is | HTTP/HTTPS, redirects, cookies — no change needed |
+| HTML parse & DOM | Lexbor | adopted as-is | Modern, actively-maintained HTML5 parser, DOM, CSS selectors, encoding detection, in pure C. **Its role depends on the Phase 0 outcome** — see the structural question below |
+| JavaScript engine | QuickJS (quickjs-ng) | adopted as-is | Real ES2020 — `Promise`, `async`/`await`, classes, modules — replaces Duktape. quickjs-ng over upstream for active maintenance, newer ES coverage, and a shorter fix backlog. *(Verify rather than assume: check its actual `Intl` coverage, and don't record internal string representation as a tiebreaker without confirming it — both engines index by UTF-16 code unit, as the spec requires.)* |
+| DOM ↔ JS | custom | **new, bespoke** | A DOM and a Window surface for QuickJS. Two candidate shapes — see Phase 0 |
+| Network ↔ JS bridge | custom over libcurl | **new, bespoke** | `fetch`/`XMLHttpRequest`, resolving real Promises from curl callbacks |
+| Scheduler | custom, `poll()` + `curl_multi` | **new, small** | Microtask drain, timer queue, socket readiness. A few hundred lines; see the libuv rejection above |
+| Style resolution | custom over Lexbor CSS | **new, minimal** | `display`/`visibility` only — see below |
+| Content extraction | Readability.js | runs unmodified | Mozilla's Reader View heuristic — one extractor among several, not the extraction stage itself |
+| Box layout | litehtml | adopted as-is | Lays out *our own* reader template/theme HTML+CSS — never a source site's. The only credible embeddable HTML/CSS engine in this weight class; libstdc++ is its price and worth paying, since the alternative puts our actual deliverable on the critical path beside the DOM↔JS layer |
+| Text shaping & breaking | HarfBuzz + FreeType + libunibreak, behind our own run shaper | **new, scoped small** | See [Typography](#typography--themes) |
+| Paint | backend interface | **new, small** | Cairo on desktop; direct ARGB32 blitter on framebuffer; no raster path at all on TUI |
+
+### The structural question: does this stay a C project?
+
+The Phase 0 A/B is usually described as choosing a binding shape. It isn't only that. If the JS-side-DOM arm wins, Lexbor has no remaining job — **litehtml parses HTML itself** (`document::createFromString`), so it can consume the serialized extraction output directly, and the C-side parser disappears from the stack. What's left is QuickJS + a JS DOM + litehtml + libcurl, with the only C written being the bridge, the shaper, and the shell.
+
+That may well be the right answer for "small and easy." But it is a different project from the one the tagline describes, and it should be chosen deliberately rather than arrived at in month four. Phase 0 therefore measures a **third, no-Lexbor baseline** explicitly, so the question asked is "does Lexbor earn its place," not merely "which binding shape wins."
+
+One thing that leaves with Lexbor, and is easy to forget: **character-encoding detection.** Real pages routinely declare the wrong charset or none at all. Whoever replaces Lexbor inherits that job.
+
+### What we tell the page about layout
+
+Cutting the layout solver has one consequence the rest of the plan has to absorb: the DOM APIs that report geometry — `getBoundingClientRect`, `offsetWidth`/`offsetHeight`, `IntersectionObserver`, `scrollTo`, `getComputedStyle` — have nothing truthful to report. They are common in framework code and real sites gate content on them, so "not implemented" isn't an option.
+
+So we implement a **deliberate, consistent fiction** rather than an error boundary:
+
+- A fixed viewport (1280×1024), reported consistently by `innerWidth`/`innerHeight`/`screen`.
+- Every element reports a plausible non-zero rect and is on-screen.
+- `IntersectionObserver` fires *intersecting* for every observed target, immediately.
+- `scroll*` calls are accepted and recorded, never a no-op that throws.
+
+The payoff is more than crash-avoidance: "everything is visible" makes lazy-loaded images and infinite-scroll content load *eagerly*, which is exactly what an extractor wants. And it makes the real boundary narrow enough to write down: **JS that writes content works; JS that branches on measured geometry gets a plausible constant.** Pages that genuinely depend on measurement will misbehave in ways that look like content bugs, so Phase 0 telemetry flags geometry-API calls specifically, keeping that failure mode visible rather than mysterious.
+
+### Browser globals and document lifecycle
+
+The "Why" section names Duktape's missing `localStorage` and network APIs as the reason the web has become unreadable — so the replacement's answer to those specific gaps has to be enumerated, not left as "a DOM and a Window surface." All of this is Phase 0 shared work, common to both arms.
+
+**Lifecycle and script loading — the part that decides whether a page produces content at all:**
+- `readystatechange`, `DOMContentLoaded`, `load`. Most client-rendered content is gated on these firing.
+- External `<script src>` fetched and executed **in document order**; `async`/`defer` honoured; inline modules; dynamic `import()`.
+
+Getting these wrong looks identical to a missing DOM method, which is why they can't wait for Phase 1.
+
+**Storage and identity:** `localStorage`, `sessionStorage`, `document.cookie` — cheap stubs with high unblocking value.
+
+**Environment:** `navigator` (including the **User-Agent string**, which materially changes what HTML servers send — it's a content-fidelity setting, not a detail), `screen`, `location`, `history.pushState`/`replaceState`, `matchMedia`.
+
+**Timing and misc:** `requestAnimationFrame`, `performance.now`, `crypto.getRandomValues`.
+
+**Built-ins to verify rather than assume** — real pages hit these and engine coverage varies: `URL`/`URLSearchParams`, `TextEncoder`/`TextDecoder`, `Blob`, `FormData`, `AbortController`, and `Intl` (date/number formatting is common, and coverage differs between upstream QuickJS and quickjs-ng).
+
+### Settle policy
+
+"When is the page done?" has to be answered before the corpus means anything. Without a definition, both A/B arms produce run-to-run variance that looks like signal, and the 3 s budget and 5 s ceiling have nothing to measure against.
+
+**Settled = no in-flight requests AND no timer due within 500 ms AND the microtask queue drained — hard-capped at 5 s total.** Reaching the cap is recorded as a distinct outcome, not silently treated as success.
+
+### Minimal computed style
+
+Readability's `isProbablyVisible` consults `display`, `visibility`, the `hidden` attribute, and `aria-hidden`; page scripts call `getComputedStyle`. With no style resolution at all, a hidden nav menu is indistinguishable from article text, and extraction quality degrades in a way that looks like a Readability bug but isn't.
+
+Scope is deliberately tiny: resolve **`display`, `visibility`, and `hidden`/`aria-hidden` only**. This is under Phase 0's floor, not Phase 1 work — extraction can't be judged without it.
+
+One caveat to settle early: resolving those from *author stylesheets* needs specificity and `@media` handling, and Lexbor's CSS module is a parser and selector engine whose cascade support may be thinner than this assumes. **Spike it in Phase 0** before it becomes load-bearing. The fallback if the cascade isn't there: inline `style=` plus `hidden`/`aria-hidden` plus a small class-name heuristic catches most of the value, with full cascade as a refinement.
+
+## Pipeline
+
+Every page takes the same steps, regardless of what kind of site it came from.
+
+```
+1.  Fetch      libcurl retrieves the page and its sub-resources
+       ↓
+2.  Parse      A real DOM tree is built
+       ↓
+3.  Execute    QuickJS runs the page's own scripts against it,
+               until the settle policy says the page is done
+       ↓
+4a. Classify   Score the post-JS DOM for page shape
+               (article / docs / table / search results / form / gallery)
+       ↓
+4b. Dispatch   Run the matching extractor against that same DOM
+       ↓
+4c. Resolve    Rewrite relative URLs; sanitize before templating
+       ↓
+5.  Template   Content is placed into our reader HTML/CSS
+       ↓
+6.  Paint      litehtml lays out our template/theme, the paint backend draws it
+       ↓
+    (a form submit or link click starts the loop over at step 1,
+     against a new URL/request — see Interaction, below)
+```
+
+The split at step 4 matters and isn't cosmetic. **Readability is one extractor, not the extraction stage** — and it *mutates and prunes* the tree, stripping `<form>` elements and discarding tables it scores as layout. So every extractor runs against the same post-JS DOM, in parallel, and none of them runs downstream of Readability. Anything that needs form or table markup must read the tree before Readability touches it.
+
+**Step 4c is small, unglamorous, and breaks everything if forgotten:**
+- **Base-URL resolution.** Extracted `href`/`src`/`action` values are usually relative and must be resolved against the *final* URL after redirects, honouring `<base href>`. Otherwise every link, image, and form action is broken.
+- **Sanitization.** Step 5 injects attacker-controlled HTML into our own template. Our reader page runs no JS, so the exposure is narrower than a browser's — but an allowlist pass is still needed, and two cases are genuinely dangerous: `javascript:` URLs surviving into rendered links, and **any URI reaching the OS handler**. Validate the scheme against an allowlist (`http`, `https`, `mailto`, `tel`) *before* anything is passed to `xdg-open`/`xdg-email`; that hand-off is the sharpest edge in the whole pipeline.
+
+**One design constraint on step 3, for an option we're not exercising yet:** don't build the pipeline so that the QuickJS realm *must* be destroyed at step 4. See [the deferred fork](#deferred-fork-live-realm-re-dispatch) under Interaction.
+
+## Interaction
+
+Reading is the common case, but a page isn't done being useful once it's rendered — a search box needs a query submitted, a forum thread needs a reply posted, a `mailto:` link needs to reach a mail client. Two native constructs cover this, extracted the same way an article body is:
+
+- **Forms.** A `<form>`'s fields, labels, method, action, enctype, and hidden inputs are extracted as data (step 4) and re-rendered as functional controls in our own styling (step 5) — hidden fields and existing values pass through untouched, since some carry CSRF tokens or session state the server checks. If the page's own script intercepts the submit event instead of a plain HTML submit, that's already covered — QuickJS + the `fetch`/XHR bridge run it like any other page script.
+  - **Desktop uses native GTK widgets**, composited over the painted template rather than drawn into it. litehtml has no widget model — it lays out and paints boxes — so drawing our own text input means building caret, selection, clipboard, key repeat and IME handling from scratch. That's a mini-project with no payoff on a target that already ships GTK. The cost of this choice is honest: the desktop paint path is template-plus-overlay rather than one clean surface, and Phases 5 and 6 will each need their own answer for text entry.
+  - **v1 round-trips GET search and simple `x-www-form-urlencoded` POST only**, constructed via libcurl and fed back into step 1. Multi-step flows, per-step CSRF, `multipart/form-data`, and redirect chains are an unbounded tail — they move to Phase 4, driven by evidence rather than anticipated in full.
+- **Links.** A same-origin or `http(s)` link re-enters the pipeline at step 1, becoming a new history entry. A `mailto:` or `tel:` link isn't a page to render at all — it hands off to the OS's registered handler, after scheme validation (step 4c), the same mechanism as the video-player hand-off.
+
+This is why interactivity doesn't reopen scope cut #1: it only requires recognizing native form/link markup, never a source site's own interactive widgets.
+
+### Deferred fork: live-realm re-dispatch
+
+The model above treats every interaction as a **full reload** through step 1. For a document that's correct and cheap. For a single-page app it's close to pathological — a click re-runs the entire boot sequence and discards the state the page just built.
+
+The alternative: keep the QuickJS realm and DOM **alive** after extraction, dispatch a real `click` into the page's own handlers, let the settle policy run again, and re-extract. Tabs, accordions, "load more", JS-submitted forms, and in-app navigation all come along for free, faster than a reload.
+
+This is **not being built now** — it complicates realm lifetime, memory (the RSS budget assumes a realm that dies), and teardown policy, and it bends the clean six-step pipeline. But it is plausibly worth more than Phase 3's form round-tripping, so it's recorded as a real fork rather than defaulted away. The only cost of keeping the door open is the one design constraint noted in the pipeline: **don't require the realm to die at step 4.**
+
+## Typography & themes
+
+The reader template (steps 5–6) is where the project stops being a pipe and becomes a page worth reading — text quality there isn't a nice-to-have, it's the deliverable.
+
+- **Themes, not the source's CSS.** A small, fixed set of themes we design and ship — typeface pairing, color palette, line measure, spacing — is the only thing a user picks from; nothing derived from the page being read, per scope cut #1. Light/dark is one axis of a theme, not a separate toggle bolted on top of it.
+- **We ship the fonts.** With fontconfig gone, the framebuffer target needs actual font files anyway — so bundle three or four SIL-OFL faces (a serif, a sans, a mono, and one with broad script coverage) and have the themes name them. That costs a couple of megabytes of data and buys something better than it costs: typography identical on every target and every machine, rather than inherited from whatever the host distro happens to have installed. That is closer to "on our own terms" than fontconfig ever was.
+
+### The text stack
+
+litehtml does box layout; everything about *glyphs* is ours. This is deliberate and it is contained, because **litehtml already abstracts the font engine**: `document_container` hands back an opaque font handle from `create_font` and asks only for `text_width` and `draw_text`. Pango was an implementation detail of the container litehtml ships, never a requirement of litehtml. Plug our own engine in behind the same handle and nothing above the container changes.
+
+| Concern | Component |
+|---|---|
+| Shaping — kerning, ligatures, complex scripts | **HarfBuzz**, direct |
+| Glyph raster and metrics | **FreeType**, direct |
+| Break opportunities (UAX #14) | **libunibreak** + our own greedy breaker |
+| Font selection & fallback | our own font list + small matcher over FreeType name tables |
+| Bidi | **SheenBidi** — *deferred, see scope* |
+| Hyphenation | **libhyphen** + pattern files — *deferred to Phase 2, only if wanted* |
+
+**Scope the shaper the way we scoped the CSS.** The full article — itemization, bidi ordering, per-character fallback, correct interaction between breaking and reordering — is a real 1–2k-line subsystem, and building it before Phase 2 would put typography on the critical path beside the DOM↔JS layer, which is exactly the mistake litehtml exists to avoid.
+
+So v1 is small because its scope is small: **Latin, Cyrillic and Greek; one face per run; greedy line breaking over libunibreak opportunities; no bidi; no per-character fallback.** A few hundred lines. We render *our* template in *our* bundled fonts, so this covers the corpus.
+
+Then grow it on evidence, like everything else here: add SheenBidi when a corpus page needs RTL; add `.notdef`-driven run splitting and re-shaping when a page needs a script the primary face lacks. The telemetry that tracks unimplemented DOM calls tracks unshaped scripts the same way.
+
+The breaker earns its place twice: the TUI wraps in **cells**, not pixels, so a breaker with a swappable measurement callback is reused directly in Phase 6. A Pango-shaped pipeline would have been rewritten there.
+
+### Paint backend
+
+Paint sits behind one interface, and the implementations behind it are decided now rather than in Phase 5:
+
+- **Desktop:** Cairo, already resident under GTK.
+- **Framebuffer:** our own ARGB32 blitter straight to the mmap'd surface — roughly 300 lines, and it keeps Cairo and pixman out of the minimal build entirely.
+- **TUI:** no raster path at all for the common case — layout only, emitted as escapes.
+
+Note what this doesn't solve: **libstdc++ stays as long as litehtml does.** If some future target can't take C++, litehtml is the blocker, not the paint layer.
+
+## Media presentation
+
+Images and video embeds are both **media references**: an inline placeholder (icon + description/alt text) in the reading flow, not automatic rendering — text is king, and showing a media reference is always a deliberate action, never a side effect of scrolling past it.
+
+Classification happens during Extract (step 4b), reusing Readability's own image scoring rather than new heuristics:
+- **Decorative** (empty `alt=""`, icon/spacer-sized, CSS `background-image`) — dropped entirely, never a placeholder.
+- **In-flow content images** — kept inline at their original position, as a placeholder.
+- **No clear anchor** (gallery/carousel markup, sidebar images Readability judged content-relevant but couldn't place in the paragraph flow) — collected into an end-of-content list instead of guessing where to attach them.
+
+Nothing is fetched until a placeholder is activated — no bandwidth or decode cost for content the user never looks at. Activating an image opens **viewer mode**; activating a video reference hands off externally, after scheme validation.
+
+**Viewer mode** is a mode, not a separate window — the same screen/surface swaps to a full-view state with its own input handling, which is what makes it work on framebuffer (no window manager to open a second window in) and TUI (one terminal canvas), not just desktop.
+
+**v1 is deliberately minimal:** fit-to-width display, next/previous across the ordered media-reference list that backs the end-of-content gallery, **save** (writes the original fetched bytes to disk, unmodified — a copy of the source file, not our rendering of it), "open externally", and **exit** (Esc/q) back to the reading view at the same scroll position.
+
+Per-target zoom semantics arrive with each target, not now. Decoding uses libpng/libjpeg/libwebp directly.
+
+## Render targets
+
+Steps 1–5 are the same regardless of output; only step 6 is target-specific, behind the paint interface above.
+
+| Target | Mechanism | Phase |
+|---|---|---|
+| **Desktop** (Cinnamon/X11) | Cairo into a GTK window; native GTK widgets composite over it for form entry | 3 |
+| **Framebuffer** | Own ARGB32 blitter to the mmap'd surface | 5 |
+| **TUI** | Styled terminal text; no raster path for the common case | 6 |
+
+**Input** follows the same split, and every target must work by keyboard alone or by mouse alone — nothing assumes both are present. Desktop gets both from GTK. The other two are specified in their own phases.
+
+## Build phases
+
+Each phase produces something checkable before the next begins. No visual work happens before Phase 2 — everything before that is proven from the terminal. **Desktop (Phases 0–4) is the near-term focus.** Framebuffer and TUI are kept in mind but deliberately deferred, framebuffer before TUI: a modern terminal is the last visualization target, not the next one.
+
+### Phase 0 — Headless proof of concept, run as an A/B
+*No UI · no rendering*
+
+**Goal:** Size the DOM↔JS problem — the largest unscoped item in the plan — with evidence rather than estimate, and answer [the structural question](#the-structural-question-does-this-stay-a-c-project).
+
+**Built once, shared by every arm:**
+- libcurl fetch, and the scheduler (`poll()` + `curl_multi` + microtask drain + timer queue).
+- **The browser-globals and lifecycle surface** enumerated above — storage stubs, `navigator`/UA, `location`/`history`, and especially `DOMContentLoaded`/`load`/`readystatechange` plus in-order script loading with `async`/`defer`. This is shared work precisely because getting it wrong is indistinguishable from a binding bug.
+- **The settle policy**, implemented and enforced, with cap-reached recorded as its own outcome.
+- **The corpus.** Saved SPA bundles served from localhost as the regression suite, plus a handful of friendly live client-rendered sites as a reality check. This split is not fussiness: curl's TLS/HTTP2 fingerprint plus a missing browser API surface gets flagged on exactly the JS-heavy sites we're targeting, *without any JS challenge ever running* — so live-only testing conflates binding bugs with bot fingerprinting. The local corpus is also the only route to golden-output regression testing, since live sites redesign under you and a regression becomes indistinguishable from a redesign.
+- **Call telemetry, from day one.** Log every unimplemented DOM/JS call real pages hit, with geometry-API calls flagged separately. This is Phase 4's mechanism pulled forward, and it's the only thing that keeps the binding surface evidence-driven instead of open-ended. It's also the primary A/B measurement.
+- **Resource limits, from day one.** A QuickJS interrupt handler enforcing the script ceiling, the memory cap, and a maximum script count. We execute untrusted JS in-process; without these, one page hangs the whole app and Phase 0 gets spent debugging hangs that aren't binding bugs.
+- The minimal style resolver, plus the Lexbor-cascade spike noted above.
+
+**Acceptance asserts on the DOM, not on Readability.** This is the criterion the first draft got wrong: with Readability as the bar, a docs page failing tells you nothing about DOM fidelity, because "the page's JS didn't run" and "Readability doesn't like this page's shape" produce the same red. The second of those is Phase 1's problem, not Phase 0's.
+
+So: **every corpus page carries a CSS selector plus an expected substring that exists only after the page's own script has run.** Pass = that assertion holds at settle time. Readability output is a secondary signal, recorded but not the bar.
+
+**Arm A — bespoke C bindings over Lexbor.** Best fidelity and memory; also the jsdom problem, which is person-years of work if approached openly. So the binding checklist is derived *mechanically* — from Readability.js's own source, whose DOM surface is finite and enumerable, plus one framework runtime. "Wide enough for a real SPA" is not a specification and won't be used as one.
+
+Three things to decide **before** Arm A is written, because they are the hardest part of any jsdom-style binding and retrofitting them means rewriting it:
+- **Node lifetime.** Lexbor nodes are arena-allocated and page scripts mutate the tree constantly, so a naive "one JS wrapper holding a raw `lexbor_dom_node_t *`" binding dangles. The symptom is a crash that only appears under heavy DOM churn — i.e. on exactly the SPAs in the corpus. Use opaque integer handles into a side table with tombstoning on removal, not raw pointers.
+- **Node identity.** The same C node must yield the same JS object across calls, or `===` comparisons in page scripts silently break.
+- **Wrapper cache strength.** Strong or weak, decided deliberately — it's the difference between leaking every node a page ever touched and collecting one a script still holds.
+
+NetSurf's libdom and `dukky` (both MIT) are prior art for exactly these questions and worth reading first.
+
+**Arm B — a JS-side DOM inside QuickJS** (linkedom or domino), with only `fetch`, timers, `console` and `URL` bridged from C. Page scripts and Readability both run against the JS DOM; the result serializes to HTML. Costs speed and memory; may delete the binding layer outright.
+
+**Arm B′ — the no-Lexbor baseline.** Arm B with litehtml parsing the serialized output directly and Lexbor absent from the build entirely. This is the arm that actually answers the structural question; without it, Lexbor's place is assumed rather than earned. Encoding detection is the known gap to account for here.
+
+**Comparison criteria**, so the decision is mechanical rather than argued: DOM-assertion pass rate across the corpus; unimplemented-call volume from telemetry; peak RSS and fetch→extract wall-clock against the budget; total shared-library footprint against the size budget; and the rough size of the remaining bespoke surface.
+
+**Done when:** one arm passes the corpus assertions, meets both budgets, and has been chosen on recorded evidence — with the structural question answered explicitly rather than implied. Keep the losing arms' notes.
+
+### Phase 1 — Extraction breadth
+*Still headless*
+
+- **Goal:** Stop assuming every page is an article.
+- **Scope:** The classify/dispatch stage (4a/4b) with confidence scoring, plus the extractors behind it — structured text dump, table extraction, a basic search-results heuristic, video-metadata extraction (embed markup, OpenGraph/oEmbed tags), form extraction, and media-reference classification. All read the post-JS DOM directly; none runs downstream of Readability. Step 4c (base-URL resolution, sanitization, scheme allowlist) lands here too.
+- **Done when:** reasonable output exists for at least one article, one docs page, one table-heavy page, one search-results page, one video-embedding page, one form, and one image-heavy page with a plausible decorative/content split — all from the corpus, so the results are re-runnable.
+
+### Phase 2 — Reader rendering
+*First visual output*
+
+- **Goal:** Turn extracted content into the actual "beautiful, clear" output — this is where the project stops being a pipe and starts being a page.
+- **Scope:** The v1 run shaper (HarfBuzz + FreeType + libunibreak, Latin/Cyrillic/Greek) behind litehtml's `document_container`, plus the font matcher; a small set of built-in themes naming our bundled faces; media-reference placeholders, video cards, form-control styling; viewer mode's paint side.
+- **Start with a spike:** implement `create_font`/`text_width`/`draw_text` over FreeType in a throwaway container and confirm litehtml is genuinely font-engine agnostic before building on the assumption.
+- **Done when:** output from Phase 1's test pages renders consistently and is genuinely pleasant to read.
+
+### Phase 3 — App shell
+*Daily-usable*
+
+- **Goal:** Make it usable without a terminal.
+- **Scope:** Minimal GTK desktop shell (Cinnamon/X11): address bar, back/forward over extraction history, a reading list, a theme picker; native GTK form widgets composited over the template, with GET-search and simple-POST submission; external hand-off via `xdg-open`/`xdg-email` (or a configurable command), scheme-validated.
+- **Done when:** a URL can be typed in and read, start to finish, with no terminal involved.
+
+### Phase 4 — Hardening
+*Open-ended, later*
+
+- **Goal:** Widen coverage based on evidence, not guesswork.
+- **Scope:** Extend bindings against the telemetry log accumulated since Phase 0, not the full spec. Widen form round-tripping to whatever the log demands. Grow the shaper on the same basis — bidi, per-character fallback, hyphenation. Add HTTP caching and conditional requests, which nothing before this point has and which every link click currently pays for. Revisit [live-realm re-dispatch](#deferred-fork-live-realm-re-dispatch) with real usage data. Tune against both budgets; package for distribution.
+
+### Phase 5 — Framebuffer
+*Deferred until desktop is finished*
+
+- **Goal:** Same core, a different paint backend — no new pipeline, extraction, interaction, or theme work.
+- **Scope:** Our own ARGB32 blitter to `/dev/fb0`. The mmap'd surface is 32-bit host-order XRGB8888, the same format we composite in, so no conversion — but the surface stride and the fb's `line_length` can differ, so blit row-by-row rather than one flat `memcpy`. NetSurf's fb frontend is **read-only reference** (GPL-2.0), not lifted code. `libinput` reading `/dev/input/event*` for keyboard and pointer, since there's no compositor handing out events — raw `evdev` is the fallback; either way this needs the running user in the `input` group or root, and that setup story gets decided here. Text entry for forms needs its own answer, GTK being unavailable. This phase is where the size budget gets tested for real.
+- **Done when:** the same URL, read and interacted with, is navigable by keyboard alone and by mouse alone on the framebuffer, matching the desktop experience — within budget.
+
+### Phase 6 — TUI
+*The last visualization target*
+
+- **Goal:** Same core again, text-first — most of the reading experience needs no raster path at all.
+- **Scope:** **Text-only first** — articles, forms, and tables as styled terminal text, reusing the Phase 2 line breaker with a cell-measuring callback instead of a pixel one. Keyboard via raw-mode stdin, mouse via terminal mouse-reporting (SGR). Images come after: our own kitty/sixel encoder plus a `$TERM` capability probe (~300 lines, and no foreign input model), with `[image: alt text]` everywhere else. Unicode block-art is not planned — it would not meet the Phase 2 bar and pretending otherwise just costs work.
+- **Done when:** the same URL is navigable the same way as Phases 3 and 5, in a terminal.
+
+## Licensing position
+
+Everything linked is permissive and compatible: Lexbor and Readability.js (Apache-2.0), QuickJS (MIT), litehtml (BSD-3-Clause), libcurl (curl license), HarfBuzz (MIT), FreeType (FTL or GPLv2 — **take FTL**), libunibreak (zlib), SheenBidi (MIT), libpng/libjpeg/libwebp (each permissive), bundled fonts (SIL OFL).
+
+**The GPL-2.0 line is NetSurf's browser, not NetSurf's libraries.** The framebuffer frontend is part of the browser and stays out — read it, don't lift it. But libdom and libcss are MIT and separate, and `dukky` (NetSurf's Duktape↔DOM glue) is directly relevant prior art for Arm A; reading them carries no licensing consequence at all. NetSurf remains the project's origin and a design reference.
+
+FreeType's dual license needs the FTL election recorded explicitly, since the alternative is GPLv2 and would contaminate everything else here.
+
+## Open risks
+
+- **[unknown effort]** The DOM↔JS layer is still the largest item. It is no longer unmeasured: Phase 0's A/B, DOM-level assertions, and telemetry size it before Phase 1 or 2 is committed to.
+- **[structural]** If Arm B or B′ wins, this stops being a C-rooted stack in any meaningful sense. That's a legitimate outcome, but it changes what the project *is* — it needs to be chosen out loud, not absorbed silently.
+- **[unproven]** The layout fiction is a working hypothesis. Pages that branch on measured geometry will misbehave in ways that look like content bugs; telemetry flags geometry calls so the failure mode stays visible, but we don't know how common it is.
+- **[unproven]** Lexbor's CSS cascade may not be deep enough for the `display`/`visibility` resolver. Spiked in Phase 0; the inline-style fallback is the contingency, and the failure mode — nav and footers leaking into output — is already known.
+- **[unproven]** Readability.js is tuned for article-shaped content; its behavior on docs, tables, and search results is a genuine open question — Phase 1 tests it directly.
+- **[scope creep risk]** The run shaper is scoped small on the bet that our own template in our own fonts needs no bidi and no per-character fallback. If the corpus disagrees early, that's a real Phase 2 overrun, and the honest fallback is to narrow the theme's script coverage rather than grow the shaper mid-phase.
+- **[unproven]** Form round-tripping assumes hidden fields pass through untouched and libcurl's cookie jar carries session state across submit → refetch. v1's GET/simple-POST scope contains this; it doesn't answer it.
+- **[security, deferred]** We execute untrusted site JS in-process. The interrupt handler and memory cap bound runaway scripts, not exploitation — QuickJS has no JIT and is memory-safe-ish, but it has had CVEs. seccomp, or a separate process for the JS realm, is the answer if this ever faces hostile input deliberately. Recorded now so "later" is a decision rather than an oversight.
+- **[accepted cost]** Native GTK widgets composited over the painted template means the desktop paint path isn't one clean surface, and text entry is unsolved for Phases 5 and 6. Taken knowingly over building a text input from scratch.
+- **[deferred]** Bot-challenge and login-gated pages have no plan and aren't meant to.
+- **[unset]** Lazy image fetch means the first activation of a placeholder has real network latency before viewer mode shows anything — needs a loading state, not assumed to be instant.
+
+## Reuse ledger
+
+What this project is actually building, once the borrowed parts are set aside.
+
+**Taken as-is**
+- libcurl — networking & TLS
+- Lexbor — HTML parsing, DOM, selectors, CSS, encoding detection *(role pending the Phase 0 outcome)*
+- QuickJS (quickjs-ng) — the JS engine itself
+- Readability.js — runs unmodified, as one extractor
+- litehtml — box layout for our own template
+- HarfBuzz, FreeType, libunibreak — shaping, rasterization, break opportunities
+- SheenBidi, libhyphen — deferred until the corpus demands them
+- Cairo — desktop paint backend only
+- libpng / libjpeg / libwebp — image decoding, linked directly
+- SIL OFL font faces — bundled, three or four
+- linkedom or domino — only if Phase 0 Arm B/B′ wins
+
+**Built new**
+- The DOM ↔ JS layer (shape decided by the Phase 0 A/B)
+- `fetch`/XHR ↔ libcurl bridge
+- The scheduler: microtask drain, timer queue, `curl_multi` polling
+- Browser globals, document lifecycle, and script loading semantics
+- The settle policy
+- The layout fiction (geometry-API surface) and the minimal style resolver
+- Page-shape classification, extractor dispatch, and confidence scoring, plus the extractors behind it
+- Base-URL resolution, sanitization, and the URI scheme allowlist
+- Video metadata extraction + external-player hand-off (no playback)
+- Form extraction, native re-render, and the submit → refetch → re-pipeline loop
+- Media-reference classification and lazy fetch on activation
+- The run shaper (scoped small) and the font matcher
+- The paint backend interface, and the framebuffer ARGB32 blitter
+- Viewer mode across all three render targets
+- The test corpus, DOM-assertion harness, golden outputs, and call telemetry
+- The reader stylesheet & template
+- The desktop app shell (address bar, history, reading list)
+- The framebuffer shell (Phase 5), and the TUI shell plus kitty/sixel encoder (Phase 6)
+
+---
+
+*Working plan. The component choices still open — Lexbor's role above all — are resolved by the Phase 0 A/B rather than argued in advance. The choices in [Considered and rejected](#considered-and-rejected) are not open; where one was made for a wrong reason, the corrected reason is recorded beside it.*
