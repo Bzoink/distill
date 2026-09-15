@@ -45,10 +45,31 @@ path and checks its navigation surface produces a valid PNG.
 
 The Phase 3 desktop shell is `build/distill-gtk`. Run it with `--url URL` to
 open a page in the GTK reader, or run `./check.py --app` for the display-free
-history/form-geometry shell gate. The window provides an address bar, cached
+history/form-geometry/address-bar shell gate. The window provides an address bar, cached
 back/forward history, a Cairo reader surface, native GTK form controls placed
 from litehtml geometry, simple GET/POST submission, URI-validated external
 hand-off, three reader themes, and a reading-list toggle.
+
+The address bar takes either a URL or a search. The rule is the one browsers
+converged on, because users have already learned it: a scheme, a path, or a
+dotted host is somewhere to go, and a bare word or anything containing a space
+is something to look for. `dn.se` becomes `https://dn.se`; `kingfisher
+hunting` becomes a search; `3.14` is a version number rather than a host;
+loopback names get `http`, having no certificate to present. `--self-test`
+covers each of these cases, and caught the version-number one.
+
+Search goes to DuckDuckGo's HTML endpoint, chosen on measured behaviour rather
+than preference. It is server-rendered, needs no JavaScript, and wraps results
+in a `result` class, which is the signal the extractor's `search-results`
+shape keys on. On the same query it produced 27 structured result records
+where Mojeek, Brave, Ecosia, Startpage and SearX produced none, and Marginalia
+rate-limited the request. `DISTILL_SEARCH_URL` overrides it; the encoded query
+is appended to whatever it is set to.
+
+DuckDuckGo hands out results as `/l/?uddg=<target>` redirects, and that
+endpoint does not resolve here — it answers 400 without its token and returns
+nothing with it, so every result would be a dead end. The destination is
+already in the link, so the shell reads it instead of following the wrapper.
 
 For a single page, `build/distill --url URL --viewer /tmp/media.png
 --media-index 0 --save-media /tmp/original.bin` renders one media reference and

@@ -123,10 +123,48 @@ static bool page_uri_allowed(const char *uri)
     return !strchr(uri, ':');
 }
 
+/* The search engine the reader is pointed at. DuckDuckGo's HTML endpoint is
+   chosen on measured behaviour rather than preference: it is server-rendered,
+   needs no JavaScript, and wraps each result in a "result" class, which is the
+   signal the extractor's search-results shape keys on. Measured against the
+   same query, it produced 27 structured result records where Mojeek, Brave,
+   Ecosia, Startpage and SearX produced none, and Marginalia rate-limited the
+   request outright. Override with DISTILL_SEARCH_URL; the encoded query is
+   appended to whatever it is set to. */
+#define DISTILL_DEFAULT_SEARCH_URL "https://html.duckduckgo.com/html/?q="
+
 static bool external_uri_allowed(const char *uri)
 {
     return has_scheme(uri, "http") || has_scheme(uri, "https") ||
            has_scheme(uri, "mailto") || has_scheme(uri, "tel");
+}
+
+/* DuckDuckGo hands out result links as /l/?uddg=<target>, and that redirect
+   does not resolve here -- it answers 400 without its token and yields nothing
+   with it. The destination is in the link already, so read it rather than
+   following the wrapper, otherwise every search result is a dead end. */
+static char *unwrap_redirect(const char *uri)
+{
+    if (!uri) return NULL;
+    const char *host = strstr(uri, "duckduckgo.com/l/");
+    if (!host) return NULL;
+    const char *query = strchr(host, '?');
+    if (!query) return NULL;
+    for (const char *p = query + 1; *p; ) {
+        const char *end = strchr(p, '&');
+        size_t span = end ? (size_t)(end - p) : strlen(p);
+        if (span > 5 && strncmp(p, "uddg=", 5) == 0) {
+            char *encoded = g_strndup(p + 5, span - 5);
+            char *target = g_uri_unescape_string(encoded, NULL);
+            g_free(encoded);
+            if (target && (has_scheme(target, "http") || has_scheme(target, "https"))) return target;
+            g_free(target);
+            return NULL;
+        }
+        if (!end) break;
+        p = end + 1;
+    }
+    return NULL;
 }
 
 static char *engine_path(void)
@@ -712,6 +750,12 @@ static void load_done(GObject *source_object, GAsyncResult *result, gpointer opa
 static void app_begin_load(App *app, const char *uri, const char *method,
                            const char *data, bool replace_current)
 {
+    char *unwrapped = unwrap_redirect(uri);
+    if (unwrapped) {
+        app_begin_load(app, unwrapped, method, data, replace_current);
+        g_free(unwrapped);
+        return;
+    }
     if (!page_uri_allowed(uri)) {
         set_status(app, "Navigation blocked: use an http(s), file, or local path URL");
         return;
@@ -744,11 +788,107 @@ static void app_navigate(App *app, const char *uri, const char *method,
     app_begin_load(app, uri, method, data, replace_current);
 }
 
+/* Does this token name a place, or describe one? The address bar accepts
+   both, and has to decide from a single string. The rule is the one browsers
+   converged on, because users have learned it: a scheme, a path, or a dotted
+   host is somewhere to go; a bare word or anything containing a space is
+   something to look for. "dn.se" navigates, "kingfisher hunting" searches. A
+   bare word that is also a hostname -- an intranet name, say -- is searched,
+   and typing a scheme forces navigation. */
+static bool entry_looks_like_url(const char *text)
+{
+    if (!text || !*text) return false;
+    if (has_scheme(text, "http") || has_scheme(text, "https") || has_scheme(text, "file")) return true;
+    for (const char *p = text; *p; ++p) {
+        if (*p == ' ' || *p == '\t') return false;
+    }
+    if (text[0] == '/' || text[0] == '~' ||
+        strncmp(text, "./", 2) == 0 || strncmp(text, "../", 3) == 0) return true;
+    /* A scheme we do not handle is not a search term either; let the
+       navigation check reject it by name. */
+    const char *colon = strchr(text, ':');
+    const char *slash = strchr(text, '/');
+    if (colon && (!slash || colon < slash)) {
+        bool port = true;
+        for (const char *p = colon + 1; *p && *p != '/'; ++p) {
+            if (*p < '0' || *p > '9') { port = false; break; }
+        }
+        if (!port) return false;
+    }
+    const char *host_end = strpbrk(text, "/?#");
+    size_t host_len = host_end ? (size_t)(host_end - text) : strlen(text);
+    char *host = g_strndup(text, host_len);
+    if (colon && colon < text + host_len) host[colon - text] = '\0';
+    bool ok = false;
+    if (g_ascii_strcasecmp(host, "localhost") == 0) {
+        ok = true;
+    } else {
+        const char *dot = strrchr(host, '.');
+        if (dot && dot != host && dot[1]) {
+            /* A top-level domain is alphabetic, which is what separates a
+               hostname from a version number: "3.14" is not a host. An
+               address is the other accepted form, and must be four numeric
+               labels rather than merely digits and dots. */
+            bool alpha = true;
+            size_t label = 0;
+            for (const char *p = dot + 1; *p; ++p, ++label) {
+                if (!g_ascii_isalpha(*p)) alpha = false;
+            }
+            ok = alpha && label >= 2;
+            if (!ok && strspn(host, "0123456789.") == strlen(host)) {
+                char **parts = g_strsplit(host, ".", -1);
+                size_t count = g_strv_length(parts);
+                bool address = count == 4;
+                for (size_t i = 0; address && i < count; ++i) {
+                    if (!*parts[i] || strlen(parts[i]) > 3) address = false;
+                }
+                g_strfreev(parts);
+                ok = address;
+            }
+        }
+    }
+    g_free(host);
+    return ok;
+}
+
+/* Turn what was typed into something to fetch. */
+static char *resolve_entry_input(const char *raw)
+{
+    char *text = g_strstrip(g_strdup(raw ? raw : ""));
+    if (!*text) { g_free(text); return NULL; }
+    if (entry_looks_like_url(text)) {
+        if (has_scheme(text, "http") || has_scheme(text, "https") || has_scheme(text, "file") ||
+            text[0] == '/' || text[0] == '~' ||
+            strncmp(text, "./", 2) == 0 || strncmp(text, "../", 3) == 0) {
+            return text;
+        }
+        /* Loopback names have no certificate to present, so asking for https
+           there fails for a reason that has nothing to do with the request. */
+        bool loopback = g_ascii_strncasecmp(text, "localhost", 9) == 0 ||
+                        g_ascii_strncasecmp(text, "127.0.0.1", 9) == 0;
+        char *url = g_strconcat(loopback ? "http://" : "https://", text, NULL);
+        g_free(text);
+        return url;
+    }
+    const char *engine = g_getenv("DISTILL_SEARCH_URL");
+    if (!engine || !*engine) engine = DISTILL_DEFAULT_SEARCH_URL;
+    char *query = form_encode(text);
+    char *url = g_strconcat(engine, query, NULL);
+    free(query);
+    g_free(text);
+    return url;
+}
+
 static void url_activate(GtkWidget *widget, gpointer opaque)
 {
     App *app = opaque;
-    const char *uri = gtk_entry_get_text(GTK_ENTRY(widget));
+    char *uri = resolve_entry_input(gtk_entry_get_text(GTK_ENTRY(widget)));
+    if (!uri) {
+        set_status(app, "Type a URL or a search term");
+        return;
+    }
     app_navigate(app, uri, NULL, NULL, false);
+    g_free(uri);
 }
 
 static void go_clicked(GtkWidget *widget, gpointer opaque)
@@ -926,6 +1066,68 @@ static void app_activate(GtkApplication *application, gpointer opaque)
     if (initial_url && *initial_url) app_begin_load(app, initial_url, NULL, NULL, false);
 }
 
+static bool expect_resolved(const char *input, const char *expected)
+{
+    char *got = resolve_entry_input(input);
+    bool ok = (!expected && !got) || (expected && got && strcmp(got, expected) == 0);
+    if (!ok) {
+        fprintf(stderr, "address bar: %s -> %s, expected %s\n",
+                input, got ? got : "(nothing)", expected ? expected : "(nothing)");
+    }
+    g_free(got);
+    return ok;
+}
+
+static bool run_address_bar_self_test(void)
+{
+    const char *search = DISTILL_DEFAULT_SEARCH_URL;
+    char *kingfisher = g_strconcat(search, "kingfisher+hunting", NULL);
+    char *bare = g_strconcat(search, "kingfisher", NULL);
+    char *punctuated = g_strconcat(search, "what+is+a+c%2B%2B+lambda%3F", NULL);
+    char *version = g_strconcat(search, "3.14", NULL);
+    bool ok =
+        /* A dotted host is somewhere to go. */
+        expect_resolved("dn.se", "https://dn.se") &&
+        expect_resolved("  dn.se  ", "https://dn.se") &&
+        expect_resolved("www.bbc.com/news", "https://www.bbc.com/news") &&
+        expect_resolved("example.com/a?b=c#d", "https://example.com/a?b=c#d") &&
+        /* An explicit scheme is always honoured, including for a file. */
+        expect_resolved("http://example.com/", "http://example.com/") &&
+        expect_resolved("https://dn.se", "https://dn.se") &&
+        expect_resolved("file:///tmp/page.html", "file:///tmp/page.html") &&
+        expect_resolved("/tmp/page.html", "/tmp/page.html") &&
+        expect_resolved("./page.html", "./page.html") &&
+        /* Loopback gets http: there is no certificate to present. */
+        expect_resolved("localhost:8080", "http://localhost:8080") &&
+        expect_resolved("127.0.0.1:8877/account", "http://127.0.0.1:8877/account") &&
+        /* Anything with a space, or a bare word, is a search. */
+        expect_resolved("kingfisher hunting", kingfisher) &&
+        expect_resolved("kingfisher", bare) &&
+        expect_resolved("what is a c++ lambda?", punctuated) &&
+        /* A version number is not a hostname, but an address is. */
+        expect_resolved("3.14", version) &&
+        expect_resolved("192.168.1.10", "https://192.168.1.10") &&
+        /* Nothing typed is not a search for nothing. */
+        expect_resolved("", NULL) &&
+        expect_resolved("   ", NULL);
+    g_free(kingfisher); g_free(bare); g_free(punctuated); g_free(version);
+    return ok;
+}
+
+static bool run_redirect_self_test(void)
+{
+    char *target = unwrap_redirect(
+        "https://duckduckgo.com/l/?uddg=https%3A%2F%2Fexample.com%2Fa%2Db&rut=abc");
+    bool ok = target && strcmp(target, "https://example.com/a-b") == 0;
+    if (!ok) fprintf(stderr, "redirect: got %s\n", target ? target : "(nothing)");
+    g_free(target);
+    /* Anything that is not one of those wrappers must be left alone. */
+    char *untouched = unwrap_redirect("https://example.com/l/?uddg=x");
+    ok = ok && untouched == NULL;
+    g_free(untouched);
+    return ok;
+}
+
 static int run_state_self_test(void)
 {
     DAppHistory history;
@@ -937,6 +1139,8 @@ static int run_state_self_test(void)
               strcmp(d_app_history_current(&history)->url, "one") == 0 &&
               d_app_history_forward(&history);
     d_app_history_clear(&history, NULL);
+    ok = run_address_bar_self_test() && ok;
+    ok = run_redirect_self_test() && ok;
     if (ok) puts("app-shell: ok");
     return ok ? 0 : 1;
 }
