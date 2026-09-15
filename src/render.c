@@ -447,6 +447,53 @@ void d_render_fill(DRenderContext *context, DRenderRect rect, DRenderColor color
     cairo_restore(context->cairo);
 }
 
+/* Cairo reads the caller's buffer directly rather than taking a copy, so the
+   surface is finished before this returns and the caller's pixels are free to
+   go. Scaling happens on the pattern rather than by resampling the source,
+   which keeps the decoder ignorant of how large the image will be shown. */
+void d_render_draw_image(DRenderContext *context, DRenderRect rect,
+                         const uint32_t *pixels, int width, int height)
+{
+    if (!context || !pixels || width <= 0 || height <= 0) return;
+    if (rect.width <= 0 || rect.height <= 0) return;
+    int stride = cairo_format_stride_for_width(CAIRO_FORMAT_ARGB32, width);
+    if (stride < 0) return;
+    cairo_surface_t *image = NULL;
+    unsigned char *packed = NULL;
+    if (stride == width * 4) {
+        image = cairo_image_surface_create_for_data((unsigned char *)pixels,
+                                                    CAIRO_FORMAT_ARGB32,
+                                                    width, height, stride);
+    } else {
+        /* Cairo rows are padded to its own alignment, which a tightly packed
+           decode does not match at every width. */
+        packed = malloc((size_t)stride * (size_t)height);
+        if (!packed) return;
+        for (int y = 0; y < height; ++y)
+            memcpy(packed + (size_t)y * (size_t)stride, pixels + (size_t)y * (size_t)width,
+                   (size_t)width * 4);
+        image = cairo_image_surface_create_for_data(packed, CAIRO_FORMAT_ARGB32,
+                                                    width, height, stride);
+    }
+    if (!image || cairo_surface_status(image) != CAIRO_STATUS_SUCCESS) {
+        if (image) cairo_surface_destroy(image);
+        free(packed);
+        return;
+    }
+    cairo_save(context->cairo);
+    cairo_rectangle(context->cairo, rect.x, rect.y, rect.width, rect.height);
+    cairo_clip(context->cairo);
+    cairo_translate(context->cairo, rect.x, rect.y);
+    cairo_scale(context->cairo, (double)rect.width / width, (double)rect.height / height);
+    cairo_set_source_surface(context->cairo, image, 0, 0);
+    cairo_pattern_set_filter(cairo_get_source(context->cairo), CAIRO_FILTER_GOOD);
+    cairo_paint(context->cairo);
+    cairo_restore(context->cairo);
+    cairo_surface_finish(image);
+    cairo_surface_destroy(image);
+    free(packed);
+}
+
 void d_render_stroke(DRenderContext *context, DRenderRect rect, int width,
                      DRenderColor color)
 {

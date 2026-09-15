@@ -132,6 +132,10 @@ exists to test.
 | `28-link-index` | A front page: document title, links on blocks, render sized to content | Phase 1 extraction breadth |
 | `29-main-content` | A permalink into a stream: the requested item is found, deduplicated, and read in document order | Phase 1 extraction breadth |
 
+Assertion stages are `dom` (the post-JS DOM), `extract` (the extraction JSON,
+with `path`) and `template` (the reader HTML, as plain substrings). A page that
+carries `template` assertions costs one extra engine run, and only that page.
+
 `00` is the control: it has no scripts, so a failure there is never a binding
 bug. `07` is where a raw-pointer binding over Lexbor's arena-allocated nodes
 crashes — better here than on a live site. `08` deliberately resembles the top of
@@ -234,6 +238,39 @@ first version:
 Without a selector there is a second route — an `og:title` that matches the
 heading of one `<article>` among several. It is a fallback, and the same
 proportion guard applies to it.
+
+## Media references and viewer mode
+
+`corpus/local/images/` holds real image files, not names. Three formats with
+three decoders behind them -- JPEG, PNG with an alpha channel, and an SVG that
+deliberately has no decoder at all -- because until they existed `15-gallery`
+referenced files that were not there and every assertion about media was an
+assertion about a URL string.
+
+The reader does not fetch images. A placeholder is an activation target
+carrying `distill-media:<the image's own URL>`, and only activating one costs
+a request. That is the plan's rule and it is also what keeps the renderer free
+of a network: the shell has no HTTP client, so the engine fetches on its behalf
+with `--fetch-media`, which runs no scripts and does no extraction.
+
+Two things the fixture gates that nothing else could:
+
+- **`--viewer` now passes `--save-media`.** Without it the viewer renders a
+  placeholder and the gate proves only that a dark rectangle can be drawn.
+  With it the run covers the whole path -- fetch, sniff the format from the
+  bytes, decode, paint -- and the saved file is checked to be an image.
+- **A `template` assertion stage.** The reader HTML had no assertions at all:
+  extraction cannot see it and the render stage only checks that a PNG came
+  out with a plausible size. Whether a placeholder is something a reader can
+  activate, and whether a URL is printed in a form that fits the column, exist
+  only in that file.
+
+The decoder and the drawing of it are covered by `ctest`, not here, and
+deliberately at pixel level. The image path's first bug was an offset:
+litehtml hands `draw_background` a resolved document position, and adding it
+to the origin box drew every image at twice its own offset. That looks like a
+partly clipped image rather than a wrong coordinate, and a smoke test that
+asked only "did anything get drawn" passed the whole time.
 
 ## Sessions
 

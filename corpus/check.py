@@ -251,6 +251,13 @@ def render_page(engine, url, output_path, cap_ms, timeout_s, viewer=False, expec
     """
     cmd = [engine, "--url", url, "--viewer" if viewer else "--render", output_path,
            "--script-cap-ms", str(cap_ms)]
+    saved = None
+    if viewer:
+        # Without --save-media the viewer shows a placeholder and the gate
+        # proves only that a dark rectangle can be drawn. With it, the run
+        # covers the whole media path: fetch, sniff, decode, paint.
+        saved = output_path + ".media"
+        cmd += ["--save-media", saved]
     if fit_height:
         # 0 asks the renderer to be as tall as the content instead of cropping.
         cmd += ["--height", "0"]
@@ -270,9 +277,47 @@ def render_page(engine, url, output_path, cap_ms, timeout_s, viewer=False, expec
         height = int.from_bytes(header[20:24], "big")
         if width <= 0 or height <= 0:
             return None, "renderer wrote an empty PNG"
+        if saved:
+            with open(saved, "rb") as fh:
+                magic = fh.read(12)
+            known = (magic.startswith(b"\x89PNG\r\n\x1a\n")
+                     or magic[:3] == b"\xff\xd8\xff"
+                     or (magic[:4] == b"RIFF" and magic[8:12] == b"WEBP"))
+            if not known:
+                return None, "the viewer saved something that is not an image"
+            os.unlink(saved)
         return (width, height), None
     except OSError as exc:
         return None, f"renderer output unavailable: {exc}"
+
+
+def dump_template(engine, url, cap_ms, timeout_s):
+    """The reader HTML the shell lays out.
+
+    Extraction assertions cannot see this stage, and neither can the render
+    stage, which only checks that a PNG came out with a plausible size. What
+    the reader actually offers a reader -- whether a placeholder is something
+    you can activate, whether a URL is printed in a form that fits -- lives
+    only here.
+    """
+    with tempfile.NamedTemporaryFile(suffix=".html", delete=False) as fh:
+        path = fh.name
+    cmd = [engine, "--url", url, "--template", path, "--script-cap-ms", str(cap_ms)]
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout_s)
+        if r.returncode != 0:
+            return None, f"template exit {r.returncode}: {r.stderr.strip()[:200]}"
+        with open(path, encoding="utf-8") as fh:
+            return fh.read(), None
+    except subprocess.TimeoutExpired:
+        return None, f"template timed out after {timeout_s}s"
+    except OSError as exc:
+        return None, f"template unavailable: {exc}"
+    finally:
+        try:
+            os.unlink(path)
+        except OSError:
+            pass
 
 
 def dump_arm_b(engine, url, cap_ms, timeout_s):
@@ -321,11 +366,36 @@ def extraction_text(extraction, path=None):
     return json.dumps(value, ensure_ascii=False, sort_keys=True), True
 
 
-def check_page(page, html=None, baseline=False, extraction=None):
-    """(results, n_failed) for DOM or extraction assertions."""
+def check_substrings(a, text, label):
+    """Shared expect / expect_absent checking over one blob of text."""
+    results, failed = [], 0
+    if "expect" in a:
+        want = a["expect"]
+        ok = want in text
+        results.append(("pass" if ok else "fail", f'{label} \u2283 "{want}"',
+                        "" if ok else f"got {len(text)} chars"))
+        failed += 0 if ok else 1
+    for bad in a.get("expect_absent", []):
+        ok = bad not in text
+        results.append(("pass" if ok else "fail", f'{label} \u2285 "{bad}"',
+                        "" if ok else "present"))
+        failed += 0 if ok else 1
+    return results, failed
+
+
+def check_page(page, html=None, baseline=False, extraction=None, template=None):
+    """(results, n_failed) for DOM, extraction or reader-template assertions."""
     results, failed = [], 0
     for a in page["assertions"]:
         stage = a.get("stage")
+        if stage == "template":
+            if template is None:
+                results.append(("pending", "template-stage, use --extract", ""))
+                continue
+            more, bad = check_substrings(a, template, "template")
+            results.extend(more)
+            failed += bad
+            continue
         if stage == "extract":
             if extraction is None:
                 results.append(("pending", "extract-stage, use --extract", ""))
@@ -352,7 +422,7 @@ def check_page(page, html=None, baseline=False, extraction=None):
         if stage != "dom":
             results.append(("pending", "unknown assertion stage", ""))
             continue
-        if extraction is not None:
+        if extraction is not None or template is not None:
             continue
 
         sel = a.get("selector")
@@ -508,6 +578,7 @@ def main():
         for page in pages:
             url = f"http://127.0.0.1:{port}/{page['path']}"
             t0 = time.time()
+            template = None
             session_path = None
             session_error = None
             if page.get("session"):
@@ -536,6 +607,14 @@ def main():
                 extraction, err = dump_extract(engine, url, manifest.get("settle_cap_ms", 5000),
                                                args.timeout, page.get("expect_exit", 0))
                 html = None
+                # The reader template is produced in the same pass, so a page
+                # that asserts on it costs one extra engine run and only when
+                # it asks for one.
+                if any(a.get("stage") == "template" for a in page["assertions"]):
+                    template, template_error = dump_template(
+                        engine, url, manifest.get("settle_cap_ms", 5000), args.timeout)
+                    if template_error and not err:
+                        err = template_error
             elif args.baseline:
                 html, err = dump_dom(browser, url, args.budget, args.timeout)
                 extraction = None
@@ -586,7 +665,8 @@ def main():
                           encoding="utf-8") as fh:
                     fh.write(json.dumps(extraction, ensure_ascii=False, indent=2) if args.extract else html)
 
-            results, failed = check_page(page, html, baseline=args.baseline, extraction=extraction)
+            results, failed = check_page(page, html, baseline=args.baseline,
+                                         extraction=extraction, template=template)
             if args.extract:
                 golden_results, golden_failed = check_golden(page, extraction)
                 results.extend(golden_results)

@@ -81,6 +81,12 @@ void d_render_draw_text(DRenderContext *context, const char *text, DRenderFont *
                         DRenderColor color, DRenderRect position);
 
 void d_render_fill(DRenderContext *context, DRenderRect rect, DRenderColor color);
+
+/* Draw decoded pixels scaled into rect. The pixels are 0xAARRGGBB with the
+   colour channels already multiplied by alpha, which is what d_image_decode
+   produces; the caller keeps ownership and may free them on return. */
+void d_render_draw_image(DRenderContext *context, DRenderRect rect,
+                         const uint32_t *pixels, int width, int height);
 void d_render_stroke(DRenderContext *context, DRenderRect rect, int width,
                      DRenderColor color);
 void d_render_draw_marker(DRenderContext *context, DRenderRect rect,

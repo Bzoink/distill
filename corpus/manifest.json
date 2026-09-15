@@ -468,6 +468,25 @@
         {"stage": "extract", "path": "shape.kind", "expect": "image-heavy"},
         {"stage": "extract", "path": "media", "expect": "content"},
         {"stage": "extract", "path": "media", "expect": "decorative"}
+,
+        {
+          "stage": "template",
+          "expect": "distill-media:http://127.0.0.1"
+        },
+        {
+          "stage": "template",
+          "expect": "class=\"media-open\""
+        },
+        {
+          "stage": "template",
+          "expect": "images/harbour.jpg"
+        },
+        {
+          "stage": "template",
+          "expect_absent": [
+            "media-url\">http"
+          ]
+        }
       ]
     },
     {

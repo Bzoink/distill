@@ -1,6 +1,11 @@
 #define _POSIX_C_SOURCE 200809L
 
 #include "app_state.h"
+#include "image.h"
+
+/* For the self-test's PNG writer only; zlib arrives transitively through the
+   toolkit otherwise, which is not something to depend on. */
+#include <zlib.h>
 #include "cutil.h"
 #include "render.h"
 
@@ -30,8 +35,17 @@ enum {
     PAGE_HEIGHT = 1400,
     RENDER_OVERSCAN = 200,
     MAX_FORM_BOXES = 512,
-    MAX_LINK_BOXES = 2048
+    MAX_LINK_BOXES = 2048,
+    /* Long enough to keep a host and a file name, short enough to fit the
+       column: litehtml breaks neither on overflow-wrap nor on word-break, so
+       a URL that does not fit simply runs off the edge of the page. */
+    DISPLAY_URL_BUDGET = 58
 };
+
+/* Two internal destinations. They are not URLs to fetch, they are things for
+   the shell to do, so they never reach the navigation path. */
+#define MEDIA_SCHEME "distill-media:"
+#define CLOSE_URI "distill-close:"
 
 typedef struct App App;
 
@@ -85,6 +99,13 @@ struct App {
     size_t link_count;
     DAppHistory history;
     GPtrArray *reading_list;
+    /* The images this page offers, in document order, captured while the page
+       document exists -- viewer mode replaces that document, so the list has
+       to outlive it for Previous and Next to mean anything. */
+    GPtrArray *page_media;
+    bool viewer_active;
+    int viewer_index;
+    char *viewer_file;
     guint load_serial;
     unsigned int references;
     bool closing;
@@ -483,6 +504,8 @@ static bool point_in_box(double x, double y, int box_x, int box_y, int width, in
     return x >= box_x && y >= box_y && x <= box_x + width && y <= box_y + height;
 }
 
+static void build_document(App *app, const char *template);
+static void collect_page_media(App *app);
 static void app_navigate(App *app, const char *uri, const char *method,
                          const char *data, bool replace_current);
 static void open_link(App *app, const char *uri);
@@ -547,6 +570,230 @@ static void set_link_cursor(GtkWidget *widget, bool link)
     g_object_unref(cursor);
 }
 
+/* Activating a placeholder is the only thing that fetches an image, so the
+   first one a reader opens costs a request. The shell has no network of its
+   own -- libcurl is linked into the engine and nowhere else -- so the request
+   is one short-lived engine run that does nothing but fetch and validate. */
+static char *fetch_media_file(const char *url, char **error_message)
+{
+    char *path = temporary_path("distill-media-XXXXXX");
+    if (!path) {
+        if (error_message) *error_message = g_strdup("unable to create a temporary file");
+        return NULL;
+    }
+    char *engine = engine_path();
+    GPtrArray *arguments = g_ptr_array_new_with_free_func(g_free);
+    add_arg(arguments, engine ? engine : "distill");
+    add_arg(arguments, "--url");
+    add_arg(arguments, url);
+    add_arg(arguments, "--fetch-media");
+    add_arg(arguments, path);
+    g_ptr_array_add(arguments, NULL);
+    char *stderr_text = NULL;
+    GError *error = NULL;
+    gint wait_status = 0;
+    gboolean spawned = g_spawn_sync(NULL, (char **)arguments->pdata, NULL,
+                                    G_SPAWN_SEARCH_PATH, NULL, NULL, NULL,
+                                    &stderr_text, &wait_status, &error);
+    bool ok = spawned && g_spawn_check_wait_status(wait_status, &error);
+    g_ptr_array_free(arguments, TRUE);
+    g_free(engine);
+    if (!ok) {
+        if (error_message) {
+            /* The engine's own last line says whether this was a bad status,
+               a refused scheme, or something that simply was not an image. */
+            char *detail = stderr_text ? g_strstrip(g_strdup(stderr_text)) : NULL;
+            char *last = detail ? strrchr(detail, '\n') : NULL;
+            *error_message = g_strdup(last ? last + 1 : (detail && *detail ? detail : "the image could not be fetched"));
+            g_free(detail);
+        }
+        if (error) g_error_free(error);
+        g_free(stderr_text);
+        unlink(path);
+        g_free(path);
+        return NULL;
+    }
+    if (error) g_error_free(error);
+    g_free(stderr_text);
+    return path;
+}
+
+/* A URL as something to read. The same reason as in the reader template:
+   litehtml has no overflow-wrap, so a long URL runs off the edge. */
+static char *display_url(const char *url)
+{
+    const char *text = url ? url : "";
+    if (g_str_has_prefix(text, "https://")) text += 8;
+    else if (g_str_has_prefix(text, "http://")) text += 7;
+    size_t length = strlen(text);
+    if (length <= DISPLAY_URL_BUDGET) return g_strdup(text);
+    size_t host = strcspn(text, "/");
+    if (host > DISPLAY_URL_BUDGET / 2) host = DISPLAY_URL_BUDGET / 2;
+    size_t tail = DISPLAY_URL_BUDGET - host - 1;
+    return g_strdup_printf("%.*s\xe2\x80\xa6%s", (int)host, text, text + length - tail);
+}
+
+static char *escape_markup(const char *text)
+{
+    return g_markup_escape_text(text ? text : "", -1);
+}
+
+/* Viewer mode's page. The image is sized here rather than left to a
+   max-width rule, because the shell has already decoded the file and knows
+   the shape of it: fit to the column, never enlarge past natural size. */
+static char *viewer_html(App *app, const char *url, const char *file,
+                         const char *failure)
+{
+    int count = app->page_media ? (int)app->page_media->len : 0;
+    GString *out = g_string_new(
+        "<!doctype html><html><head><meta charset=\"utf-8\"><style>"
+        "html,body{margin:0;padding:0;background:#17191b;color:#f5f1e8;}"
+        "body{font-family:sans-serif;font-size:16px;}"
+        "body{padding:26px 0;}"
+        /* Full-bleed stage, margins for everything else: the renderer fits an
+           image to the surface width, so an inset stage would clip that much
+           off the right of a wide one, and a horizontal padding rule shifts
+           sibling blocks in this litehtml build. */
+        ".top{font-size:.82em;color:#aaa79f;margin:0 30px 18px;}"
+        ".stage{background:#24272a;margin:0 0 16px;}"
+        ".stage img{display:block;}"
+        ".failed{padding:48px 20px;text-align:center;color:#e6b8ab;}"
+        ".url{color:#aaa79f;font-size:.82em;margin:0 30px 18px;}"
+        "a{color:#78b9cf;text-decoration:none;}"
+        ".nav{margin:0 30px;}.nav a{margin-right:18px;}"
+        /* <main> is not a block element in litehtml's master stylesheet, so
+           the viewer puts its content straight in the body rather than
+           wrapping it in one and laying out around an inline box. */
+        "</style></head><body>");
+
+    g_string_append_printf(out, "<p class=\"top\">Image %d of %d</p>",
+                           app->viewer_index + 1, count > 0 ? count : 1);
+
+    g_string_append(out, "<div class=\"stage\">");
+    DImage image = {0};
+    if (file && d_image_load_file(file, &image)) {
+        /* Decoded here only to find out whether it can be decoded at all, so
+           that a failure is reported with its reason instead of as an empty
+           frame. The size is left to the renderer, which fits an image to the
+           surface; an explicit CSS size on an <img> reserves the box but is
+           not painted by this litehtml build. */
+        d_image_free(&image);
+        char *escaped = escape_markup(file);
+        g_string_append_printf(out, "<img src=\"%s\">", escaped);
+        g_free(escaped);
+    } else {
+        /* Saying why beats an empty frame: "no decoder for gif images" and
+           "404" are different problems and a reader can act on the difference. */
+        const char *reason = failure && *failure ? failure
+                                                 : (file ? d_image_last_error() : "the image could not be fetched");
+        char *escaped = escape_markup(*reason ? reason : "the image could not be shown");
+        g_string_append_printf(out, "<div class=\"failed\">%s</div>", escaped);
+        g_free(escaped);
+    }
+    g_string_append(out, "</div>");
+
+    char *shown = display_url(url);
+    char *escaped_url = escape_markup(shown);
+    g_string_append_printf(out, "<p class=\"url\">%s</p>", escaped_url);
+    g_free(shown);
+    g_free(escaped_url);
+
+    g_string_append(out, "<p class=\"nav\">");
+    if (app->viewer_index > 0) {
+        char *previous = escape_markup(g_ptr_array_index(app->page_media, app->viewer_index - 1));
+        g_string_append_printf(out, "<a href=\"%s%s\">Previous</a>", MEDIA_SCHEME, previous);
+        g_free(previous);
+    }
+    if (count > 0 && app->viewer_index + 1 < count) {
+        char *next = escape_markup(g_ptr_array_index(app->page_media, app->viewer_index + 1));
+        g_string_append_printf(out, "<a href=\"%s%s\">Next</a>", MEDIA_SCHEME, next);
+        g_free(next);
+    }
+    g_string_append_printf(out, "<a href=\"%s\">Close</a>", CLOSE_URI);
+    g_string_append(out, "</p><p class=\"top\">Escape closes, arrow keys move.</p>"
+                         "</body></html>");
+    return g_string_free(out, FALSE);
+}
+
+static void leave_viewer(App *app)
+{
+    if (!app->viewer_active) return;
+    app->viewer_active = false;
+    if (app->viewer_file) { unlink(app->viewer_file); g_free(app->viewer_file); app->viewer_file = NULL; }
+    const DAppPage *page = d_app_history_current(&app->history);
+    if (!page) return;
+    char *template = d_read_file(page->template_path, NULL);
+    build_document(app, template ? template : "");
+    free(template);
+    collect_page_media(app);
+    set_status(app, "Closed the image");
+}
+
+static void enter_viewer(App *app, const char *url)
+{
+    if (!url || !*url) return;
+    int index = 0;
+    if (app->page_media) {
+        for (guint i = 0; i < app->page_media->len; ++i)
+            if (strcmp(g_ptr_array_index(app->page_media, i), url) == 0) { index = (int)i; break; }
+    }
+    set_status(app, "Fetching the image\xe2\x80\xa6");
+    /* The fetch is synchronous and the first one has real network latency, so
+       the status line says what is happening before the window stops
+       repainting rather than after. */
+    while (gtk_events_pending()) gtk_main_iteration();
+
+    char *failure = NULL;
+    char *file = fetch_media_file(url, &failure);
+    if (app->viewer_file) { unlink(app->viewer_file); g_free(app->viewer_file); }
+    app->viewer_file = file;
+    app->viewer_index = index;
+    app->viewer_active = true;
+    char *html = viewer_html(app, url, file, failure);
+    build_document(app, html);
+    g_free(html);
+    gtk_entry_set_text(GTK_ENTRY(app->url_entry), url);
+    if (file) set_status(app, "Escape closes the image");
+    else set_status(app, failure ? failure : "The image could not be shown");
+    g_free(failure);
+}
+
+/* Viewer mode must be usable by keyboard alone: that is a requirement of
+   every target, and on the framebuffer and TUI ones there is no pointer at
+   all. Escape leaves, the arrows step through the page's images. */
+static void step_viewer(App *app, int delta)
+{
+    if (!app->viewer_active || !app->page_media || !app->page_media->len) return;
+    int next = app->viewer_index + delta;
+    if (next < 0 || next >= (int)app->page_media->len) return;
+    enter_viewer(app, g_ptr_array_index(app->page_media, next));
+}
+
+static gboolean window_key_press(GtkWidget *widget, GdkEventKey *event, gpointer opaque)
+{
+    (void)widget;
+    App *app = opaque;
+    /* The address bar is a text field; its keys are its own. */
+    if (gtk_widget_has_focus(app->url_entry)) return FALSE;
+    if (!app->viewer_active) return FALSE;
+    switch (event->keyval) {
+        case GDK_KEY_Escape:
+        case GDK_KEY_BackSpace:
+            leave_viewer(app);
+            return TRUE;
+        case GDK_KEY_Left:
+        case GDK_KEY_p:
+            step_viewer(app, -1);
+            return TRUE;
+        case GDK_KEY_Right:
+        case GDK_KEY_n:
+            step_viewer(app, 1);
+            return TRUE;
+        default:
+            return FALSE;
+    }
+}
+
 static void open_external(App *app, const char *uri)
 {
     if (!external_uri_allowed(uri)) {
@@ -568,6 +815,11 @@ static void open_external(App *app, const char *uri)
 static void open_link(App *app, const char *uri)
 {
     if (!uri || !*uri) return;
+    if (strncmp(uri, MEDIA_SCHEME, strlen(MEDIA_SCHEME)) == 0) {
+        enter_viewer(app, uri + strlen(MEDIA_SCHEME));
+        return;
+    }
+    if (strcmp(uri, CLOSE_URI) == 0) { leave_viewer(app); return; }
     if (has_scheme(uri, "mailto") || has_scheme(uri, "tel")) {
         open_external(app, uri);
     } else if (page_uri_allowed(uri)) {
@@ -741,7 +993,11 @@ static void form_submit(App *app, const FormControl *submit_control)
     dbuf_free(&data);
 }
 
-static void load_surface(App *app, const DAppPage *page)
+/* Lay out one document and take everything the shell needs from it. Both a
+   reader page and viewer mode go through here: viewer mode is a state this
+   surface enters, not a second window, which is what lets it work the same
+   way on a framebuffer with no window manager to open one in. */
+static void build_document(App *app, const char *template)
 {
     if (app->document) distill_litehtml_document_destroy(app->document);
     app->document = NULL;
@@ -750,8 +1006,7 @@ static void load_surface(App *app, const DAppPage *page)
     clear_controls(app);
     int page_height = PAGE_HEIGHT;
 
-    char *template = d_read_file(page->template_path, NULL);
-    if (template) {
+    {
         const char *font_dir = *DISTILL_FONT_DIR ? DISTILL_FONT_DIR : getenv("DISTILL_FONT_DIR");
         int viewport = PAGE_HEIGHT;
         if (app->vertical_adjustment) {
@@ -785,13 +1040,40 @@ static void load_surface(App *app, const DAppPage *page)
                 add_native_controls(app);
             }
         }
-        free(template);
     }
     gtk_widget_set_size_request(app->drawing_area, PAGE_WIDTH, page_height);
     gtk_widget_set_size_request(app->event_box, PAGE_WIDTH, page_height);
     gtk_widget_set_size_request(app->form_layer, PAGE_WIDTH, page_height);
     if (app->vertical_adjustment) gtk_adjustment_set_value(app->vertical_adjustment, 0.0);
     render_visible_band(app);
+}
+
+/* The images the reader may open, taken from the links the template put on
+   the placeholders. Reading them from the laid-out document rather than from
+   a second file keeps one description of the page: what is clickable is
+   exactly what is in this list. */
+static void collect_page_media(App *app)
+{
+    if (app->page_media) g_ptr_array_free(app->page_media, TRUE);
+    app->page_media = g_ptr_array_new_with_free_func(g_free);
+    for (size_t i = 0; i < app->link_count; ++i) {
+        const char *href = app->link_boxes[i].href;
+        if (strncmp(href, MEDIA_SCHEME, strlen(MEDIA_SCHEME)) != 0) continue;
+        const char *url = href + strlen(MEDIA_SCHEME);
+        if (*url) g_ptr_array_add(app->page_media, g_strdup(url));
+    }
+}
+
+static void load_surface(App *app, const DAppPage *page)
+{
+    char *template = d_read_file(page->template_path, NULL);
+    build_document(app, template ? template : "");
+    free(template);
+    /* Navigating away is another way out of viewer mode, and the downloaded
+       file goes with it rather than waiting for the session to end. */
+    app->viewer_active = false;
+    if (app->viewer_file) { unlink(app->viewer_file); g_free(app->viewer_file); app->viewer_file = NULL; }
+    collect_page_media(app);
     gtk_entry_set_text(GTK_ENTRY(app->url_entry), page->url);
     gtk_combo_box_set_active_id(GTK_COMBO_BOX(app->theme_combo), page->theme ? page->theme : "warm");
     gtk_widget_set_sensitive(app->back_button, d_app_history_can_back(&app->history));
@@ -1106,6 +1388,8 @@ static void app_destroy(GtkWidget *widget, gpointer opaque)
     clear_controls(app);
     d_app_history_clear(&app->history, page_dispose);
     g_ptr_array_free(app->reading_list, TRUE);
+    if (app->page_media) g_ptr_array_free(app->page_media, TRUE);
+    if (app->viewer_file) { unlink(app->viewer_file); g_free(app->viewer_file); }
     g_application_quit(app->application);
     app_unref(app);
 }
@@ -1123,6 +1407,7 @@ static void app_activate(GtkApplication *application, gpointer opaque)
     gtk_window_set_default_size(GTK_WINDOW(app->window), 1080, 800);
     gtk_window_set_title(GTK_WINDOW(app->window), "Distill");
     g_signal_connect(app->window, "destroy", G_CALLBACK(app_destroy), app);
+    g_signal_connect(app->window, "key-press-event", G_CALLBACK(window_key_press), app);
 
     GtkWidget *root = gtk_box_new(GTK_ORIENTATION_VERTICAL, 0);
     gtk_container_add(GTK_CONTAINER(app->window), root);
@@ -1284,6 +1569,137 @@ static bool run_redirect_self_test(void)
     return ok;
 }
 
+/* A solid PNG, written with stored-deflate blocks so the self-test can make
+   one without pulling in an encoder. */
+static bool write_solid_test_png(const char *path, int width, int height)
+{
+    size_t row = (size_t)width * 3 + 1, raw_length = row * (size_t)height;
+    unsigned char *raw = g_malloc(raw_length);
+    for (int y = 0; y < height; ++y) {
+        unsigned char *line = raw + (size_t)y * row;
+        line[0] = 0;
+        for (int x = 0; x < width; ++x) {
+            line[1 + x * 3] = 0x30; line[2 + x * 3] = 0x70; line[3 + x * 3] = 0xb0;
+        }
+    }
+    GByteArray *stream = g_byte_array_new();
+    g_byte_array_append(stream, (const guint8 *)"\x78\x01", 2);
+    size_t left = raw_length, offset = 0;
+    do {
+        size_t take = left > 65535 ? 65535 : left;
+        guint8 block[5] = {(guint8)((left - take) ? 0 : 1),
+                           (guint8)(take & 0xff), (guint8)(take >> 8),
+                           (guint8)(~take & 0xff), (guint8)((~take >> 8) & 0xff)};
+        g_byte_array_append(stream, block, 5);
+        g_byte_array_append(stream, raw + offset, (guint)take);
+        offset += take; left -= take;
+    } while (left);
+    unsigned long s1 = 1, s2 = 0;
+    for (size_t i = 0; i < raw_length; ++i) { s1 = (s1 + raw[i]) % 65521; s2 = (s2 + s1) % 65521; }
+    unsigned long adler = (s2 << 16) | s1;
+    guint8 tail[4] = {(guint8)(adler >> 24), (guint8)(adler >> 16), (guint8)(adler >> 8), (guint8)adler};
+    g_byte_array_append(stream, tail, 4);
+    g_free(raw);
+
+    GByteArray *out = g_byte_array_new();
+    g_byte_array_append(out, (const guint8 *)"\x89PNG\r\n\x1a\n", 8);
+    guint8 ihdr[13] = {(guint8)(width >> 24), (guint8)(width >> 16), (guint8)(width >> 8), (guint8)width,
+                       (guint8)(height >> 24), (guint8)(height >> 16), (guint8)(height >> 8), (guint8)height,
+                       8, 2, 0, 0, 0};
+    const char *types[3] = {"IHDR", "IDAT", "IEND"};
+    const guint8 *bodies[3] = {ihdr, stream->data, NULL};
+    size_t lengths[3] = {sizeof(ihdr), stream->len, 0};
+    for (int i = 0; i < 3; ++i) {
+        size_t length = lengths[i];
+        guint8 size[4] = {(guint8)(length >> 24), (guint8)(length >> 16), (guint8)(length >> 8), (guint8)length};
+        g_byte_array_append(out, size, 4);
+        guint start = out->len;
+        g_byte_array_append(out, (const guint8 *)types[i], 4);
+        if (length) g_byte_array_append(out, bodies[i], (guint)length);
+        guint32 check = crc32(0, out->data + start, out->len - start);
+        guint8 crc[4] = {(guint8)(check >> 24), (guint8)(check >> 16), (guint8)(check >> 8), (guint8)check};
+        g_byte_array_append(out, crc, 4);
+    }
+    g_byte_array_free(stream, TRUE);
+    bool ok = g_file_set_contents(path, (const char *)out->data, out->len, NULL);
+    g_byte_array_free(out, TRUE);
+    return ok;
+}
+
+/* Viewer mode is mouse-and-eye work that a headless test cannot click, but
+   the two decisions behind it are ordinary functions: which destinations are
+   the shell's own rather than somewhere to navigate, and what a URL looks like
+   once it has been cut down to fit. */
+static bool run_media_self_test(void)
+{
+    bool ok = true;
+
+    char *shown = display_url("https://cdn.example.com/a/photo.jpg");
+    ok = shown && strcmp(shown, "cdn.example.com/a/photo.jpg") == 0 && ok;
+    if (!shown || strcmp(shown, "cdn.example.com/a/photo.jpg")) 
+        fprintf(stderr, "display_url: short URL became %s\n", shown ? shown : "(nothing)");
+    g_free(shown);
+
+    /* A URL past the budget keeps its host and its file name, loses the
+       middle, and comes back short enough to lay out. */
+    const char *long_url =
+        "https://cdn.example.com/2026/09/15/assets/rendition/cache/"
+        "8f2a1c9e4b7d6053a1f8/harbour-at-dawn-full-bleed.jpg";
+    shown = display_url(long_url);
+    ok = shown && g_str_has_prefix(shown, "cdn.example.com") && ok;
+    ok = shown && g_str_has_suffix(shown, "harbour-at-dawn-full-bleed.jpg") && ok;
+    ok = shown && g_utf8_strlen(shown, -1) <= DISPLAY_URL_BUDGET + 1 && ok;
+    if (!ok) fprintf(stderr, "display_url: long URL became %s\n", shown ? shown : "(nothing)");
+    g_free(shown);
+
+    /* The internal destinations must never be treated as pages to fetch. */
+    ok = !page_uri_allowed(MEDIA_SCHEME "https://example.com/a.png") && ok;
+    ok = !page_uri_allowed(CLOSE_URI) && ok;
+    ok = !external_uri_allowed(MEDIA_SCHEME "https://example.com/a.png") && ok;
+    if (!ok) fprintf(stderr, "media: an internal destination was treated as a URL\n");
+
+    /* Viewer mode's page, laid out by the renderer the shell actually uses.
+       Markup and renderer have to agree about the image or the reader gets an
+       empty frame, and that agreement is checkable without a window: a
+       document holding a 600x400 image is at least 400 tall, and one that
+       failed to find the image is nowhere near. */
+    App probe = {0};
+    probe.page_media = g_ptr_array_new_with_free_func(g_free);
+    g_ptr_array_add(probe.page_media, g_strdup("https://example.test/photo.png"));
+    char *source = NULL;
+    int descriptor = g_file_open_tmp("distill-selftest-XXXXXX.png", &source, NULL);
+    bool checked = false;
+    if (descriptor >= 0) {
+        close(descriptor);
+        if (write_solid_test_png(source, 600, 400)) {
+            char *html = viewer_html(&probe, "https://example.test/photo.png", source, NULL);
+            const char *font_dir = *DISTILL_FONT_DIR ? DISTILL_FONT_DIR : getenv("DISTILL_FONT_DIR");
+            int height = distill_litehtml_content_height(html, PAGE_WIDTH, font_dir);
+            checked = true;
+            if (height < 400) {
+                fprintf(stderr, "viewer: a 600x400 image laid out %d tall\n", height);
+                ok = false;
+            }
+            /* And the page must offer the ways back out of it. */
+            if (!strstr(html, CLOSE_URI)) {
+                fprintf(stderr, "viewer: no way to close the image\n");
+                ok = false;
+            }
+            g_free(html);
+        }
+        unlink(source);
+    }
+    /* A skipped check is a failed check: this is the assertion that would
+       have caught the image not being drawn at all. */
+    if (!checked) {
+        fprintf(stderr, "viewer: could not stage a test image, check skipped\n");
+        ok = false;
+    }
+    g_free(source);
+    g_ptr_array_free(probe.page_media, TRUE);
+    return ok;
+}
+
 static int run_state_self_test(void)
 {
     DAppHistory history;
@@ -1298,6 +1714,7 @@ static int run_state_self_test(void)
     ok = run_coordinate_self_test() && ok;
     ok = run_address_bar_self_test() && ok;
     ok = run_redirect_self_test() && ok;
+    ok = run_media_self_test() && ok;
     if (ok) puts("app-shell: ok");
     return ok ? 0 : 1;
 }

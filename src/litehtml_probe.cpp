@@ -1,9 +1,11 @@
 #include <litehtml/litehtml.h>
 
+#include "image.h"
 #include "render.h"
 
 #include <cctype>
 #include <cstring>
+#include <map>
 #include <memory>
 #include <string>
 #include <vector>
@@ -56,19 +58,80 @@ struct Probe final : litehtml::document_container {
                              marker.index > 0, marker.index);
     }
 
-    void load_image(const char *, const char *, bool) override {}
-
-    void get_image_size(const char *, const char *, litehtml::size &size) override {
-        size.width = 0;
-        size.height = 0;
+    /* The renderer never fetches. An image is drawn only from a file that is
+       already on disk, which in this program means one the engine downloaded:
+       keeping the network on one side of that line is what lets the reader
+       stay lazy about media and what stops a page from making the paint layer
+       issue requests of its own. Anything with a scheme is refused here. */
+    static bool local_path(const char *source, std::string &out) {
+        if (!source || !*source) return false;
+        std::string value(source);
+        if (value.compare(0, 7, "file://") == 0) value.erase(0, 7);
+        else if (value.find("://") != std::string::npos) return false;
+        else if (value.find(':') != std::string::npos) return false;
+        if (value.empty()) return false;
+        out = value;
+        return true;
     }
 
+    const DImage *image_for(const char *source) {
+        std::string path;
+        if (!local_path(source, path)) return nullptr;
+        auto found = images.find(path);
+        if (found != images.end())
+            return found->second.pixels ? &found->second : nullptr;
+        DImage decoded = {};
+        /* A failed decode is cached as an empty entry so a broken file is
+           opened once rather than on every layout pass and every repaint. */
+        if (!d_image_load_file(path.c_str(), &decoded)) decoded = DImage{};
+        auto inserted = images.emplace(path, decoded).first;
+        return inserted->second.pixels ? &inserted->second : nullptr;
+    }
+
+    void load_image(const char *source, const char *, bool) override {
+        image_for(source);
+    }
+
+    /* Fitting happens here rather than by styling the element. An <img> given
+       an explicit CSS width and height in this litehtml build reserves the box
+       but paints nothing into it, so the size litehtml is told is the size it
+       must lay out and draw. A reader lays out at a fixed width, and an image
+       wider than the surface is shown at the surface's width rather than
+       overflowing it. */
+    void get_image_size(const char *source, const char *, litehtml::size &size) override {
+        const DImage *image = image_for(source);
+        if (!image) { size.width = 0; size.height = 0; return; }
+        size.width = image->width;
+        size.height = image->height;
+        if (width > 0 && size.width > width) {
+            size.height = (int)((double)size.height * width / size.width);
+            size.width = width;
+            if (size.height < 1) size.height = 1;
+        }
+    }
+
+    /* litehtml draws <img> through this too, with the source in `image`. */
     void draw_background(litehtml::uint_ptr, const std::vector<litehtml::background_paint> &backgrounds) override {
         if (!renderer || backgrounds.empty()) return;
         const litehtml::background_paint &background = backgrounds.back();
         if (background.color.alpha) {
             d_render_fill(renderer, to_rect(background.clip_box), to_color(background.color));
         }
+        if (background.image.empty()) return;
+        const DImage *image = image_for(background.image.c_str());
+        if (!image) return;
+        int width = background.image_size.width > 0 ? background.image_size.width : image->width;
+        int height = background.image_size.height > 0 ? background.image_size.height : image->height;
+        /* position_x and position_y are document coordinates here, not an
+           offset from the origin box: litehtml has already resolved the
+           background position. Adding them to origin_box draws the image at
+           twice its own offset, which looks like a partly clipped image
+           rather than like a wrong coordinate, so it is worth naming. */
+        d_render_set_clip(renderer, to_rect(background.clip_box));
+        d_render_draw_image(renderer,
+                            {background.position_x, background.position_y, width, height},
+                            image->pixels, image->width, image->height);
+        d_render_del_clip(renderer);
     }
 
     void draw_borders(litehtml::uint_ptr, const litehtml::borders &borders,
@@ -133,9 +196,16 @@ struct Probe final : litehtml::document_container {
         return {position.x, position.y, position.width, position.height};
     }
 
+    ~Probe() {
+        for (auto &entry : images) d_image_free(&entry.second);
+    }
+
     DRenderContext *renderer;
     int width = 1280;
     int height = 1024;
+    /* Decoded once per document, keyed by path: a template may show the same
+       file more than once, and layout asks for the size before painting. */
+    std::map<std::string, DImage> images;
 };
 
 }

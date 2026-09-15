@@ -1916,6 +1916,12 @@ extern int distill_litehtml_render(const char *html, const char *output_path,
 /* Laid-out height of the reader page at a given width; see render.h. */
 extern int distill_litehtml_content_height(const char *html, int width,
                                            const char *font_dir);
+/* The format these bytes are in, or "" for none we recognise; see image.h. */
+extern const char *d_image_format_name(const unsigned char *bytes, size_t length);
+typedef struct { int width; int height; uint32_t *pixels; } DImage;
+extern bool d_image_load_file(const char *path, DImage *out);
+extern void d_image_free(DImage *image);
+extern const char *d_image_last_error(void);
 #define DISTILL_MAX_RENDER_HEIGHT 20000
 #endif
 
@@ -2242,6 +2248,40 @@ static void append_json_forms(Engine *engine, JSValueConst forms, DBuffer *outpu
     }
 }
 
+/* A URL as something to read rather than something to parse. litehtml
+   implements neither overflow-wrap nor word-break, so a CDN URL is one
+   unbreakable token that simply runs off the right edge of the column and
+   keeps going. Shortening it is not only a layout fix: the host and the file
+   name are the part that says where an image came from, and forty characters
+   of cache key in the middle say nothing. The whole URL stays in the link. */
+#define DISTILL_DISPLAY_URL_BUDGET 58
+
+static void append_display_url(DBuffer *output, const char *url)
+{
+    const char *text = url ? url : "";
+    if (!strncmp(text, "https://", 8)) text += 8;
+    else if (!strncmp(text, "http://", 7)) text += 7;
+    size_t length = strlen(text);
+    while (length && text[length - 1] == '/') --length;
+    if (length <= DISTILL_DISPLAY_URL_BUDGET) {
+        char *shown = d_strndup(text, length);
+        append_html_escaped(output, shown);
+        free(shown);
+        return;
+    }
+    /* Keep the host, and as much of the tail as the budget allows: the file
+       name is what identifies one image among a page of them. */
+    size_t host = strcspn(text, "/");
+    if (host > DISTILL_DISPLAY_URL_BUDGET / 2) host = DISTILL_DISPLAY_URL_BUDGET / 2;
+    size_t tail = DISTILL_DISPLAY_URL_BUDGET - host - 1;
+    if (tail > length) tail = length;
+    char *head = d_strndup(text, host);
+    append_html_escaped(output, head);
+    free(head);
+    dbuf_puts(output, "\u2026");
+    append_html_escaped(output, text + length - tail);
+}
+
 static void append_json_videos(Engine *engine, JSValueConst videos, DBuffer *output)
 {
     int64_t count = json_array_length(engine, videos);
@@ -2257,7 +2297,7 @@ static void append_json_videos(Engine *engine, JSValueConst videos, DBuffer *out
         dbuf_puts(output, ">Open externally</a>");
         if (*poster) {
             dbuf_puts(output, "<p class=\"media-url\">");
-            append_html_escaped(output, poster);
+            append_display_url(output, poster);
             dbuf_puts(output, "</p>");
         }
         dbuf_puts(output, "</section>");
@@ -2276,14 +2316,27 @@ static void append_json_media(Engine *engine, JSValueConst media, DBuffer *outpu
         char *kind = json_property_string(engine, item, "kind");
         char *url = json_property_string(engine, item, "url");
         char *alt = json_property_string(engine, item, "alt");
-        dbuf_puts(output, "<figure class=\"media-card\"><div class=\"media-placeholder\">");
+        dbuf_puts(output, "<figure class=\"media-card\">");
+        /* The placeholder is the activation target. Nothing has been fetched
+           at this point -- that is the whole point of a placeholder -- so the
+           link carries the image's own URL and the shell is what decides to
+           go and get it. */
+        bool openable = is_http_url(url);
+        if (openable) {
+            dbuf_puts(output, "<a class=\"media-open\" href=\"distill-media:");
+            append_html_escaped(output, url);
+            dbuf_puts(output, "\">");
+        }
+        dbuf_puts(output, "<div class=\"media-placeholder\">");
         append_html_escaped(output, *alt ? alt : "Decorative image");
-        dbuf_puts(output, "</div><figcaption>");
+        dbuf_puts(output, "</div>");
+        if (openable) dbuf_puts(output, "</a>");
+        dbuf_puts(output, "<figcaption>");
         append_html_escaped(output, *alt ? alt : "Decorative image");
         dbuf_puts(output, " <span>");
         append_html_escaped(output, d_eq(kind, "decorative") ? "decorative" : "content");
         dbuf_puts(output, "</span></figcaption><p class=\"media-url\">");
-        append_html_escaped(output, url);
+        append_display_url(output, url);
         dbuf_puts(output, "</p></figure>");
         free(kind); free(url); free(alt);
         JS_FreeValue(engine->context, item);
@@ -2455,8 +2508,16 @@ static char *reader_template(Engine *engine, const char *json, const char *theme
         ".form-field{display:block;margin:.8em 0;color:var(--page-text);}.form-field input{display:block;width:100%;box-sizing:border-box;margin-top:.25em;padding:.55em;border:1px solid var(--border);border-radius:3px;background:var(--main-background);color:var(--page-text);}"
         "button,.button{display:inline-block;padding:.55em .85em;border:0;border-radius:3px;background:var(--link);color:white;text-decoration:none;font:inherit;}"
         ".video-card h2,.table-card h2,.form-card h2,.media-gallery h2,.result-list h2{margin-top:0;}"
-        ".eyebrow,.media-url{font-size:.78em;color:var(--muted);}.media-placeholder{min-height:100px;display:flex;align-items:center;justify-content:center;background:var(--card-background);color:var(--page-text);text-align:center;padding:1em;}"
+        ".eyebrow,.media-url{font-size:.78em;color:var(--muted);}"
+        /* The placeholder is now something to activate, so it has to look
+           like it. On the card's own background it was invisible as a target:
+           the alt text appeared to be floating in the card. */
+        ".media-placeholder{min-height:92px;background:var(--main-background);border:1px solid var(--border);border-radius:4px;color:var(--link);text-align:center;padding:2.1em 1em;}"
         ".media-card{margin:0 0 1em;}.media-card figcaption{margin-top:.45em;}.media-card figcaption span{float:right;color:#827a6e;font-size:.8em;}"
+        /* Block, so the whole placeholder is the target and so litehtml gives
+           the anchor a box the shell can find for keyboard navigation. */
+        ".media-open{display:block;text-decoration:none;color:inherit;}"
+        ".media-open .media-placeholder{color:var(--link);}"
         ".reader-list-item{padding-left:1em;}"
         ".distill-meta{font-size:.8em;color:var(--muted);margin-bottom:2.6em;}"
         /* The promoted item keeps article spacing even when the page around it
@@ -2545,7 +2606,12 @@ static char *reader_template(Engine *engine, const char *json, const char *theme
     return dbuf_take(&output);
 }
 
-static char *viewer_template(Engine *engine, const char *json, int media_index)
+/* local_path is a file the engine has already downloaded, or empty. When it
+   is there the viewer shows the image; when it is not it shows what it knows
+   about the image instead, which is the honest state before a fetch has
+   happened or after one has failed. */
+static char *viewer_template(Engine *engine, const char *json, int media_index,
+                             const char *local_path)
 {
     JSValue parsed = JS_ParseJSON(engine->context, json, strlen(json), "distill-extraction.json");
     if (JS_IsException(parsed)) {
@@ -2567,29 +2633,56 @@ static char *viewer_template(Engine *engine, const char *json, int media_index)
     dbuf_init(&output);
     dbuf_puts(&output,
         "<!doctype html><html><head><meta charset=\"utf-8\"><title>Media viewer</title><style>"
-        "html,body{margin:0;width:100%;height:100%;background:#17191b;color:#f5f1e8;}"
-        "body{font-family:sans-serif;}main{box-sizing:border-box;width:100%;height:100%;padding:38px 52px;display:block;}"
-        ".top{font-size:.82em;color:#aaa79f;}.stage{margin:28px auto 22px;max-width:1000px;height:calc(100% - 150px);"
-        "min-height:300px;display:flex;align-items:center;justify-content:center;background:#292c2f;border:1px solid #474b4e;}"
-        ".placeholder{max-width:80%;padding:60px 80px;text-align:center;background:#3a3f42;color:#d4d0c7;font-size:1.3em;}"
-        ".caption{display:flex;justify-content:space-between;gap:20px;}.caption strong{font-size:1.2em;}"
-        ".url{color:#aaa79f;font-size:.8em;overflow:hidden;white-space:nowrap;text-overflow:ellipsis;}"
-        ".nav{color:#78b9cf;white-space:nowrap;}a{color:#78b9cf;text-decoration:none;}"
-        "</style></head><body><main><div class=\"top\">Distill media viewer · ");
+        /* Deliberately plain block layout. An earlier version centred the
+           image with flexbox inside a calc() height, and litehtml drew a
+           fraction of it.
+
+           The stage is full bleed and everything else is inset with margins,
+           for a reason worth writing down: the renderer fits an image to the
+           surface width, so a stage inset by N would lose N pixels off the
+           right of every wide image. Horizontal padding is avoided because in
+           this litehtml build a padding rule shifted sibling blocks as well
+           as its own, which moved the stage and clipped the image again. */
+        "html,body{margin:0;background:#17191b;color:#f5f1e8;}"
+        "body{font-family:sans-serif;padding:26px 0;}"
+        ".top{font-size:.82em;color:#aaa79f;margin:0 30px 20px;}"
+        ".stage{background:#24272a;margin:0 0 18px;}"
+        ".stage img{display:block;}"
+        ".placeholder{padding:60px 20px;text-align:center;background:#3a3f42;color:#d4d0c7;font-size:1.2em;}"
+        ".caption{margin:0 30px;}.caption strong{font-size:1.2em;}"
+        ".url{color:#aaa79f;font-size:.8em;margin:4px 30px 16px;}"
+        ".nav{color:#78b9cf;margin:0 30px;}a{color:#78b9cf;text-decoration:none;}.nav a{margin-right:16px;}"
+        "</style></head><body><div class=\"top\">Distill media viewer · ");
     dbuf_printf(&output, "%d of %lld · %s", media_index + 1, (long long)count,
                 d_eq(kind, "decorative") ? "decorative reference" : "content reference");
-    dbuf_puts(&output, "</div><div class=\"stage\"><div class=\"placeholder\">");
-    append_html_escaped(&output, *alt ? alt : "Image reference");
-    dbuf_puts(&output, "</div></div><div class=\"caption\"><div><strong>");
+    dbuf_puts(&output, "</p><div class=\"stage\">");
+    DImage decoded = {0};
+    bool shown = local_path && *local_path && d_image_load_file(local_path, &decoded);
+    if (shown) {
+        /* No width or height: the renderer fits the image to the surface and
+           an explicit size would stop it being drawn at all. */
+        d_image_free(&decoded);
+        dbuf_puts(&output, "<img src=\"");
+        append_html_escaped(&output, local_path);
+        dbuf_puts(&output, "\" alt=\"");
+        append_html_escaped(&output, alt);
+        dbuf_puts(&output, "\">");
+    } else {
+        dbuf_puts(&output, "<div class=\"placeholder\">");
+        if (local_path && *local_path) append_html_escaped(&output, d_image_last_error());
+        else append_html_escaped(&output, *alt ? alt : "Image reference");
+        dbuf_puts(&output, "</div>");
+    }
+    dbuf_puts(&output, "</div><div class=\"caption\"><strong>");
     append_html_escaped(&output, *alt ? alt : "Image reference");
     dbuf_puts(&output, "</strong><div class=\"url\">");
-    append_html_escaped(&output, url);
-    dbuf_puts(&output, "</div></div><div class=\"nav\">");
+    append_display_url(&output, url);
+    dbuf_puts(&output, "</div><div class=\"nav\">");
     if (media_index > 0) dbuf_puts(&output, "<a href=\"#previous\">Previous</a> · ");
     else dbuf_puts(&output, "Previous · ");
     if (media_index + 1 < count) dbuf_puts(&output, "<a href=\"#next\">Next</a>");
     else dbuf_puts(&output, "Next");
-    dbuf_puts(&output, "</div></div></main></body></html>");
+    dbuf_puts(&output, "</div></body></html>");
     free(kind); free(url); free(alt);
     JS_FreeValue(engine->context, item);
     JS_FreeValue(engine->context, media);
@@ -2776,7 +2869,8 @@ static bool set_document_base(Engine *engine)
 static int run_page(const char *input, uint64_t cap_ms, uint64_t memory_mb,
                     uint64_t max_scripts, bool dump_dom, bool extract,
                     const char *render_path, const char *viewer_path, int media_index,
-                    const char *save_media_path, int render_width, int render_height,
+                    const char *save_media_path, const char *fetch_media_path,
+                    int render_width, int render_height,
                     const char *font_dir, const char *template_path,
                     const char *theme, const char *request_method,
                     const char *request_data, const char *session_file)
@@ -2821,6 +2915,31 @@ static int run_page(const char *input, uint64_t cap_ms, uint64_t memory_mb,
     if (effective_url && *effective_url) { free(engine.source_url); engine.source_url = effective_url; }
     else free(effective_url);
     free(engine.base_url); engine.base_url = d_strdup(engine.source_url);
+#ifdef DISTILL_RENDER
+    /* One request and nothing else: no runtime, no scripts, no extraction.
+       The shell has no network of its own -- only the engine links libcurl --
+       so this is how an image a reader activated reaches the viewer, and
+       re-running a whole page to fetch one file it already named would cost
+       seconds for no new information.
+
+       The bytes decide whether this is an image. A served content type is
+       page controlled, and a file that says image/png while holding something
+       else must not reach a decoder as if it were a PNG. */
+    if (fetch_media_path) {
+        const char *format = d_image_format_name((const unsigned char *)html.data, html.length);
+        bool ok = *format && write_file_bytes(fetch_media_path, html.data, html.length);
+        if (!ok && !*format)
+            fprintf(stderr, "not an image: %s\n", engine.source_url);
+        else if (!ok)
+            fprintf(stderr, "unable to write %s\n", fetch_media_path);
+        else
+            fprintf(stderr, "fetched %s image, %zu bytes\n", format, html.length);
+        dbuf_free(&html);
+        engine_cleanup(&engine);
+        free(owned_font_dir);
+        return ok ? 0 : 2;
+    }
+#endif
     engine.challenge = challenge_kind(html.data, html.length,
                                       DISTILL_CHALLENGE_SERVED_BYTES);
     if (engine.challenge) {
@@ -2891,7 +3010,8 @@ static int run_page(const char *input, uint64_t cap_ms, uint64_t memory_mb,
 #ifdef DISTILL_RENDER
         char *json = run_extraction(&engine, serialized);
         bool saved = !save_media_path || save_media_file(&engine, json, media_index, save_media_path);
-        char *template = viewer_template(&engine, json, media_index);
+        char *template = viewer_template(&engine, json, media_index,
+                                         saved ? save_media_path : NULL);
         if (!saved || !*template || !distill_litehtml_render(template, viewer_path,
                                                                render_width, render_height, font_dir)) {
             fprintf(stderr, "unable to render media viewer %s\n", viewer_path);
@@ -2975,8 +3095,11 @@ static int run_page(const char *input, uint64_t cap_ms, uint64_t memory_mb,
 
 static void usage(const char *program)
 {
-    fprintf(stderr, "usage: %s --url URL [--dump-dom|--extract|--render FILE|--template FILE|--viewer FILE] [--media-index N] [--save-media FILE] [--width N] [--height N|0] [--font-dir DIR] [--theme warm|night|paper] [--request-method GET|POST] [--request-data DATA|--request-data-file FILE|-] [--session-file FILE] [--script-cap-ms N] [--memory-limit-mb N] [--max-scripts N]\n", program);
-    fprintf(stderr, "  --height 0            size the render to the content instead of cropping it.\n");
+    fprintf(stderr, "usage: %s --url URL [--dump-dom|--extract|--render FILE|--template FILE|--viewer FILE|--fetch-media FILE] [--media-index N] [--save-media FILE] [--width N] [--height N|0] [--font-dir DIR] [--theme warm|night|paper] [--request-method GET|POST] [--request-data DATA|--request-data-file FILE|-] [--session-file FILE] [--script-cap-ms N] [--memory-limit-mb N] [--max-scripts N]\n", program);
+    fprintf(stderr, "  --height 0            size the render to the content instead of cropping it.\n"
+        "  --fetch-media FILE    fetch one image and write its bytes, with no scripts and no\n"
+        "                        extraction. The format is taken from the bytes, not the\n"
+        "                        served content type, and a non-image is refused.\n");
     fprintf(stderr, "  --session-file FILE   keep cookies across runs, so a login survives the next navigation.\n");
     fprintf(stderr, "                        Created mode 600 and refused if others can read it.\n");
     fprintf(stderr, "  --request-data-file F read the POST body from a file, or from stdin when F is \"-\".\n");
@@ -3015,6 +3138,7 @@ int main(int argc, char **argv)
     const char *viewer_path = NULL;
     const char *template_path = NULL;
     const char *save_media_path = NULL;
+    const char *fetch_media_path = NULL;
     const char *font_dir = NULL;
     const char *theme = "warm";
     const char *request_method = NULL;
@@ -3035,6 +3159,7 @@ int main(int argc, char **argv)
         else if (d_eq(argv[i], "--viewer") && i + 1 < argc) viewer_path = argv[++i];
         else if (d_eq(argv[i], "--media-index") && i + 1 < argc) media_index = (int)strtol(argv[++i], NULL, 10);
         else if (d_eq(argv[i], "--save-media") && i + 1 < argc) save_media_path = argv[++i];
+        else if (d_eq(argv[i], "--fetch-media") && i + 1 < argc) fetch_media_path = argv[++i];
         else if (d_eq(argv[i], "--width") && i + 1 < argc) render_width = (int)strtol(argv[++i], NULL, 10);
         else if (d_eq(argv[i], "--height") && i + 1 < argc) render_height = (int)strtol(argv[++i], NULL, 10);
         else if (d_eq(argv[i], "--font-dir") && i + 1 < argc) font_dir = argv[++i];
@@ -3056,6 +3181,7 @@ int main(int argc, char **argv)
         (extract && (render_path || template_path || viewer_path)) ||
         (template_path && viewer_path) || (render_path && viewer_path) ||
         (save_media_path && !viewer_path) || media_index < 0 ||
+        (fetch_media_path && (dump_dom || extract || render_path || template_path || viewer_path)) ||
         render_width <= 0 || render_height < 0 ||
         ((request_data || request_data_file) && (!request_method || !d_ieq(request_method, "post"))) ||
         (request_method && !d_ieq(request_method, "get") && !d_ieq(request_method, "post"))) {
@@ -3069,6 +3195,7 @@ int main(int argc, char **argv)
     curl_global_init(CURL_GLOBAL_DEFAULT);
     int result = run_page(url, cap_ms, memory_mb, max_scripts, dump_dom, extract,
                           render_path, viewer_path, media_index, save_media_path,
+                          fetch_media_path,
                           render_width, render_height, font_dir, template_path, theme,
                           request_method, request_data, session_file);
     curl_global_cleanup();

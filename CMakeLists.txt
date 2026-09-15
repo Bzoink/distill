@@ -15,6 +15,9 @@ find_package(CURL REQUIRED)
 find_package(Threads REQUIRED)
 find_package(PkgConfig REQUIRED)
 pkg_check_modules(DISTILL_RENDER REQUIRED IMPORTED_TARGET freetype2 harfbuzz cairo libunibreak)
+# Still-image decoding is linked directly rather than taken from a toolkit, so
+# the framebuffer and TUI targets can use the same decoder as the desktop one.
+pkg_check_modules(DISTILL_IMAGE REQUIRED IMPORTED_TARGET libpng libjpeg libwebp)
 pkg_check_modules(DISTILL_GTK IMPORTED_TARGET gtk+-3.0)
 
 enable_testing()
@@ -33,12 +36,18 @@ target_link_libraries(distill-shaper-test PRIVATE PkgConfig::DISTILL_RENDER)
 distill_enable_assertions(distill-shaper-test)
 add_test(NAME distill-shaper COMMAND distill-shaper-test)
 
+add_executable(distill-image-test tests/image_test.c src/image.c)
+target_include_directories(distill-image-test PRIVATE src)
+target_link_libraries(distill-image-test PRIVATE PkgConfig::DISTILL_IMAGE)
+distill_enable_assertions(distill-image-test)
+add_test(NAME distill-image COMMAND distill-image-test)
+
 add_executable(distill-app-state-test tests/app_state_test.c src/app_state.c)
 target_include_directories(distill-app-state-test PRIVATE src)
 distill_enable_assertions(distill-app-state-test)
 add_test(NAME distill-app-state COMMAND distill-app-state-test)
 
-add_executable(distill-litehtml-geometry-test tests/litehtml_geometry_test.c src/litehtml_probe.cpp)
+add_executable(distill-litehtml-geometry-test tests/litehtml_geometry_test.c src/litehtml_probe.cpp src/image.c)
 target_include_directories(distill-litehtml-geometry-test PRIVATE
     src
     "${EXTERNAL_PREFIX}/include"
@@ -52,8 +61,8 @@ target_link_libraries(distill-litehtml-geometry-test PRIVATE
 distill_enable_assertions(distill-litehtml-geometry-test)
 add_test(NAME distill-litehtml-geometry COMMAND distill-litehtml-geometry-test)
 
-add_library(distill-render-core STATIC src/render.c src/shaper.c)
-target_link_libraries(distill-render-core PUBLIC PkgConfig::DISTILL_RENDER)
+add_library(distill-render-core STATIC src/render.c src/shaper.c src/image.c)
+target_link_libraries(distill-render-core PUBLIC PkgConfig::DISTILL_RENDER PkgConfig::DISTILL_IMAGE)
 
 add_executable(distill src/main.c src/litehtml_probe.cpp)
 target_compile_definitions(distill PRIVATE DISTILL_SOURCE_DIR="${CMAKE_SOURCE_DIR}" DISTILL_RENDER=1)
@@ -117,11 +126,11 @@ set_target_properties(distill-arm-b PROPERTIES
 )
 install(TARGETS distill-arm-b RUNTIME DESTINATION bin)
 
-add_executable(distill-arm-b-pruned src/main.c src/litehtml_probe.cpp src/render.c src/shaper.c)
+add_executable(distill-arm-b-pruned src/main.c src/litehtml_probe.cpp src/render.c src/shaper.c src/image.c)
 target_compile_definitions(distill-arm-b-pruned PRIVATE DISTILL_B_PRUNED=1 DISTILL_NO_EXTRACT=1)
 target_include_directories(distill-arm-b-pruned PRIVATE "${EXTERNAL_PREFIX}/include" ${CURL_INCLUDE_DIRS})
 target_link_directories(distill-arm-b-pruned PRIVATE "${EXTERNAL_PREFIX}/lib")
-target_link_libraries(distill-arm-b-pruned PRIVATE qjs CURL::libcurl litehtml gumbo Threads::Threads PkgConfig::DISTILL_RENDER ${CMAKE_DL_LIBS} m)
+target_link_libraries(distill-arm-b-pruned PRIVATE qjs CURL::libcurl litehtml gumbo Threads::Threads PkgConfig::DISTILL_RENDER PkgConfig::DISTILL_IMAGE ${CMAKE_DL_LIBS} m)
 set_target_properties(distill-arm-b-pruned PROPERTIES
     BUILD_RPATH "${EXTERNAL_PREFIX}/lib"
     INSTALL_RPATH "${EXTERNAL_PREFIX}/lib"
