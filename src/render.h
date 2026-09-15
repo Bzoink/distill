@@ -85,6 +85,13 @@ void d_render_draw_marker(DRenderContext *context, DRenderRect rect,
 void d_render_set_clip(DRenderContext *context, DRenderRect rect);
 void d_render_del_clip(DRenderContext *context);
 
+/* Upper bound on an auto-sized reader surface, in pixels. */
+#define DISTILL_MAX_RENDER_HEIGHT 20000
+
+/* Laid-out height of the document at this width, or 0 if it cannot be laid
+   out. Passing height <= 0 to distill_litehtml_render uses this, bounded. */
+int distill_litehtml_content_height(const char *html, int width, const char *font_dir);
+
 size_t distill_litehtml_form_boxes(const char *html, int width, int height,
                                    const char *font_dir, DFormBox *boxes,
                                    size_t box_capacity);

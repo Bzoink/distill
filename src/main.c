@@ -1913,6 +1913,10 @@ extern int distill_litehtml_probe(const char *html);
 #ifdef DISTILL_RENDER
 extern int distill_litehtml_render(const char *html, const char *output_path,
                                    int width, int height, const char *font_dir);
+/* Laid-out height of the reader page at a given width; see render.h. */
+extern int distill_litehtml_content_height(const char *html, int width,
+                                           const char *font_dir);
+#define DISTILL_MAX_RENDER_HEIGHT 20000
 #endif
 
 #ifdef DISTILL_RENDER
@@ -1971,11 +1975,21 @@ static void append_json_blocks(Engine *engine, JSValueConst blocks, DBuffer *out
         JSValue block = JS_GetPropertyUint32(engine->context, blocks, (uint32_t)i);
         char *type = json_property_string(engine, block, "type");
         char *text = json_property_string(engine, block, "text");
+        char *href = json_property_string(engine, block, "href");
         if (d_eq(type, "h1")) {
             /* The reader title is already displayed above the block stream. */
         } else if (d_eq(type, "h2") || d_eq(type, "h3")) {
             dbuf_printf(output, "<%s>", type);
+            /* A headline that was a link stays one. On a front page this is
+               the whole of the information: the words say what happened, the
+               link is the only way to go and read it. */
+            if (*href) {
+                dbuf_puts(output, "<a href=\"");
+                append_html_escaped(output, href);
+                dbuf_puts(output, "\">");
+            }
             append_html_escaped(output, text);
+            if (*href) dbuf_puts(output, "</a>");
             dbuf_printf(output, "</%s>", type);
         } else if (d_eq(type, "pre")) {
             dbuf_puts(output, "<pre><code>");
@@ -1983,15 +1997,28 @@ static void append_json_blocks(Engine *engine, JSValueConst blocks, DBuffer *out
             dbuf_puts(output, "</code></pre>");
         } else if (d_eq(type, "li")) {
             dbuf_puts(output, "<p class=\"reader-list-item\">• ");
+            if (*href) {
+                dbuf_puts(output, "<a href=\"");
+                append_html_escaped(output, href);
+                dbuf_puts(output, "\">");
+            }
             append_html_escaped(output, text);
+            if (*href) dbuf_puts(output, "</a>");
             dbuf_puts(output, "</p>");
         } else if (*text) {
             dbuf_puts(output, "<p>");
+            if (*href) {
+                dbuf_puts(output, "<a href=\"");
+                append_html_escaped(output, href);
+                dbuf_puts(output, "\">");
+            }
             append_html_escaped(output, text);
+            if (*href) dbuf_puts(output, "</a>");
             dbuf_puts(output, "</p>");
         }
         free(type);
         free(text);
+        free(href);
         JS_FreeValue(engine->context, block);
     }
 }
@@ -2203,12 +2230,14 @@ static char *reader_template(Engine *engine, const char *json, const char *theme
     JSValue media = JS_GetPropertyStr(engine->context, parsed, "media");
     JSValue links = JS_GetPropertyStr(engine->context, parsed, "links");
     char *shape_kind = json_property_string(engine, shape, "kind");
-    char *title = d_strdup("");
+    char *title = json_property_string(engine, parsed, "title");
     char *content = d_strdup("");
     char *text_dir = d_strdup("");
     char *text_lang = d_strdup("");
     if (!JS_IsNull(readability) && !JS_IsUndefined(readability)) {
-        title = json_property_string(engine, readability, "title");
+        char *readable_title = json_property_string(engine, readability, "title");
+        if (*readable_title) { free(title); title = readable_title; }
+        else free(readable_title);
         content = json_property_string(engine, readability, "content");
         free(text_dir); text_dir = json_property_string(engine, readability, "dir");
         free(text_lang); text_lang = json_property_string(engine, readability, "lang");
@@ -2733,12 +2762,21 @@ static int run_page(const char *input, uint64_t cap_ms, uint64_t memory_mb,
         char *json = run_extraction(&engine, serialized);
         char *template = reader_template(&engine, json, theme);
         bool template_ok = !template_path || write_file_bytes(template_path, template, strlen(template));
+        /* Height 0 means "as tall as the content". Measure here rather than
+           inside the renderer so the caller is told what it actually got: the
+           desktop shell sizes its scroll area from this. */
+        int used_height = render_height;
+        if (used_height <= 0 && *template) {
+            used_height = distill_litehtml_content_height(template, render_width, font_dir);
+            if (used_height < 1) used_height = 1;
+            if (used_height > DISTILL_MAX_RENDER_HEIGHT) used_height = DISTILL_MAX_RENDER_HEIGHT;
+        }
         if (!template_ok || !*template || !distill_litehtml_render(template, render_path,
-                                                                     render_width, render_height, font_dir)) {
+                                                                     render_width, used_height, font_dir)) {
             fprintf(stderr, "unable to render %s\n", render_path);
             result = 3;
         } else {
-            fprintf(stderr, "rendered %s (%dx%d)\n", render_path, render_width, render_height);
+            fprintf(stderr, "rendered %s (%dx%d)\n", render_path, render_width, used_height);
         }
         free(template);
         free(json);
@@ -2787,7 +2825,8 @@ static int run_page(const char *input, uint64_t cap_ms, uint64_t memory_mb,
 
 static void usage(const char *program)
 {
-    fprintf(stderr, "usage: %s --url URL [--dump-dom|--extract|--render FILE|--template FILE|--viewer FILE] [--media-index N] [--save-media FILE] [--width N] [--height N] [--font-dir DIR] [--theme warm|night|paper] [--request-method GET|POST] [--request-data DATA|--request-data-file FILE|-] [--session-file FILE] [--script-cap-ms N] [--memory-limit-mb N] [--max-scripts N]\n", program);
+    fprintf(stderr, "usage: %s --url URL [--dump-dom|--extract|--render FILE|--template FILE|--viewer FILE] [--media-index N] [--save-media FILE] [--width N] [--height N|0] [--font-dir DIR] [--theme warm|night|paper] [--request-method GET|POST] [--request-data DATA|--request-data-file FILE|-] [--session-file FILE] [--script-cap-ms N] [--memory-limit-mb N] [--max-scripts N]\n", program);
+    fprintf(stderr, "  --height 0            size the render to the content instead of cropping it.\n");
     fprintf(stderr, "  --session-file FILE   keep cookies across runs, so a login survives the next navigation.\n");
     fprintf(stderr, "                        Created mode 600 and refused if others can read it.\n");
     fprintf(stderr, "  --request-data-file F read the POST body from a file, or from stdin when F is \"-\".\n");
@@ -2867,7 +2906,7 @@ int main(int argc, char **argv)
         (extract && (render_path || template_path || viewer_path)) ||
         (template_path && viewer_path) || (render_path && viewer_path) ||
         (save_media_path && !viewer_path) || media_index < 0 ||
-        render_width <= 0 || render_height <= 0 ||
+        render_width <= 0 || render_height < 0 ||
         ((request_data || request_data_file) && (!request_method || !d_ieq(request_method, "post"))) ||
         (request_method && !d_ieq(request_method, "get") && !d_ieq(request_method, "post"))) {
         usage(argv[0]); return 2;

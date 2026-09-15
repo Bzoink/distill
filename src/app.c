@@ -321,10 +321,11 @@ static bool run_engine(const LoadRequest *request, const char *png_path,
     char *width = g_strdup_printf("%d", PAGE_WIDTH);
     add_arg(arguments, width);
     g_free(width);
+    /* 0 means "as tall as the content". A reader page is as long as what it
+       has to say, and a fixed surface silently drops the rest: the page looks
+       finished and simply stops. */
     add_arg(arguments, "--height");
-    char *height = g_strdup_printf("%d", PAGE_HEIGHT);
-    add_arg(arguments, height);
-    g_free(height);
+    add_arg(arguments, "0");
     add_arg(arguments, "--theme");
     add_arg(arguments, request->theme);
     if (request->method && *request->method) {
@@ -644,15 +645,24 @@ static void load_surface(App *app, const DAppPage *page)
     if (app->surface) cairo_surface_destroy(app->surface);
     app->surface = cairo_image_surface_create_from_png(page->png_path);
     clear_controls(app);
-    gtk_widget_set_size_request(app->drawing_area, PAGE_WIDTH, PAGE_HEIGHT);
-    gtk_widget_set_size_request(app->form_layer, PAGE_WIDTH, PAGE_HEIGHT);
+    /* The rendered surface is the authority on how long the page is. The
+       scroll area and the widget geometry must agree with it, or the window
+       scrolls to a bottom that is not the document's. */
+    int page_height = PAGE_HEIGHT;
+    if (app->surface &&
+        cairo_surface_status(app->surface) == CAIRO_STATUS_SUCCESS) {
+        int measured = cairo_image_surface_get_height(app->surface);
+        if (measured > 0) page_height = measured;
+    }
+    gtk_widget_set_size_request(app->drawing_area, PAGE_WIDTH, page_height);
+    gtk_widget_set_size_request(app->form_layer, PAGE_WIDTH, page_height);
 
     char *template = d_read_file(page->template_path, NULL);
     if (template) {
         const char *font_dir = *DISTILL_FONT_DIR ? DISTILL_FONT_DIR : getenv("DISTILL_FONT_DIR");
-        size_t form_count = distill_litehtml_form_boxes(template, PAGE_WIDTH, PAGE_HEIGHT,
+        size_t form_count = distill_litehtml_form_boxes(template, PAGE_WIDTH, page_height,
                                                         font_dir, NULL, 0);
-        size_t link_count = distill_litehtml_link_boxes(template, PAGE_WIDTH, PAGE_HEIGHT,
+        size_t link_count = distill_litehtml_link_boxes(template, PAGE_WIDTH, page_height,
                                                         font_dir, NULL, 0);
         if (form_count > MAX_FORM_BOXES) form_count = MAX_FORM_BOXES;
         if (link_count > MAX_LINK_BOXES) link_count = MAX_LINK_BOXES;
@@ -661,10 +671,10 @@ static void load_surface(App *app, const DAppPage *page)
         app->form_count = form_count;
         app->link_count = link_count;
         if (form_count)
-            distill_litehtml_form_boxes(template, PAGE_WIDTH, PAGE_HEIGHT, font_dir,
+            distill_litehtml_form_boxes(template, PAGE_WIDTH, page_height, font_dir,
                                         app->form_boxes, form_count);
         if (link_count)
-            distill_litehtml_link_boxes(template, PAGE_WIDTH, PAGE_HEIGHT, font_dir,
+            distill_litehtml_link_boxes(template, PAGE_WIDTH, page_height, font_dir,
                                         app->link_boxes, link_count);
         if (form_count) {
             app->controls = g_new0(FormControl, form_count);

@@ -626,6 +626,24 @@
         {"stage": "dom", "selector": "#content", "expect": "SIGNED-IN-AS-corpus"},
         {"stage": "dom", "selector": "#content", "expect_absent": ["SIGNED-OUT", "LOGIN-REJECTED"]}
       ]
+    },
+    {
+      "id": "28-link-index",
+      "path": "28-link-index.html",
+      "gate": true,
+      "render_fit": true,
+      "min_render_height": 1500,
+      "plan_section": "Phase 1 extraction breadth, link index",
+      "exercises": ["document-title", "block-links", "render-fit"],
+      "why": "A front page is headlines that are themselves links, with no article for Readability to find. Without a document title the reader showed 'Untitled page'; without the link on each block it showed headlines nobody could follow; and rendered into a fixed surface the page simply stopped partway down.",
+      "assertions": [
+        {"stage": "dom", "selector": "#content", "expect": "LINK-INDEX-OK"},
+        {"stage": "extract", "path": "title", "expect": "Kingfisher Gazette"},
+        {"stage": "extract", "path": "blocks[0].href", "expect": "/2026/09/kingfisher-dive-rates"},
+        {"stage": "extract", "path": "blocks[0].text", "expect": "Dive rates climb"},
+        {"stage": "extract", "path": "blocks[3].text", "expect": "Weather"},
+        {"stage": "extract", "path": "blocks[3].href", "expect_absent": ["/2026/", "http"]}
+      ]
     }
   ],
   "live": [

@@ -143,10 +143,44 @@ extern "C" int distill_litehtml_probe(const char *html)
     return document ? 1 : 0;
 }
 
+/* How tall the document becomes at this width. A reader page is as long as
+   its content, and rendering it into a fixed-height surface silently discards
+   whatever falls past the bottom -- the page looks complete and simply stops. */
+extern "C" int distill_litehtml_content_height(const char *html, int width,
+                                               const char *font_dir)
+{
+    if (!html || width <= 0) return 0;
+    /* Lay out against a nominal surface; only the resulting height is wanted. */
+    DRenderContext *renderer = d_render_create(width, 16, font_dir);
+    if (!renderer) return 0;
+    Probe probe(renderer);
+    probe.width = width;
+    probe.height = 16;
+    int measured = 0;
+    {
+        std::shared_ptr<litehtml::document> document =
+            litehtml::document::createFromString(html, &probe);
+        if (document) {
+            document->render(width, litehtml::render_all);
+            measured = document->height();
+        }
+    }
+    d_render_destroy(renderer);
+    return measured;
+}
+
 extern "C" int distill_litehtml_render(const char *html, const char *output_path,
                                          int width, int height, const char *font_dir)
 {
-    if (!html || !output_path || width <= 0 || height <= 0) return 0;
+    if (!html || !output_path || width <= 0) return 0;
+    if (height <= 0) {
+        /* Fit the content, but stay bounded: the surface is width * height * 4
+           bytes and a pathological page must not be allowed to ask for all of
+           memory. A page longer than the cap is truncated, as before. */
+        height = distill_litehtml_content_height(html, width, font_dir);
+        if (height < 1) height = 1;
+        if (height > DISTILL_MAX_RENDER_HEIGHT) height = DISTILL_MAX_RENDER_HEIGHT;
+    }
     DRenderContext *renderer = d_render_create(width, height, font_dir);
     if (!renderer) return 0;
     Probe probe(renderer);

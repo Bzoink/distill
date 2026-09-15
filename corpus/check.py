@@ -242,7 +242,8 @@ def dump_extract(engine, url, cap_ms, timeout_s, expect_exit=0):
         return None, f"extractor returned invalid JSON: {exc}"
 
 
-def render_page(engine, url, output_path, cap_ms, timeout_s, viewer=False, expect_exit=0):
+def render_page(engine, url, output_path, cap_ms, timeout_s, viewer=False, expect_exit=0,
+                fit_height=False):
     """Render a reader PNG and verify its basic PNG dimensions.
 
     As with the DOM and extract stages, a page may declare a non-zero expected
@@ -250,6 +251,9 @@ def render_page(engine, url, output_path, cap_ms, timeout_s, viewer=False, expec
     """
     cmd = [engine, "--url", url, "--viewer" if viewer else "--render", output_path,
            "--script-cap-ms", str(cap_ms)]
+    if fit_height:
+        # 0 asks the renderer to be as tall as the content instead of cropping.
+        cmd += ["--height", "0"]
     try:
         r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout_s)
     except subprocess.TimeoutExpired:
@@ -517,7 +521,8 @@ def main():
                 output_path = os.path.join(args.render, page["id"] + ".png")
                 render_info, err = render_page(engine, url, output_path,
                                                manifest.get("settle_cap_ms", 5000), args.timeout,
-                                               expect_exit=page.get("expect_exit", 0))
+                                               expect_exit=page.get("expect_exit", 0),
+                                               fit_height=bool(page.get("render_fit")))
                 html = None
                 extraction = None
             elif args.viewer:
@@ -562,6 +567,15 @@ def main():
 
             if args.render or args.viewer:
                 width, height = render_info
+                # A page that declares a minimum height is asserting that the
+                # render grew to fit its content rather than cropping it.
+                floor = page.get("min_render_height", 0)
+                if args.render and height < floor:
+                    print(f"  {RED}FAIL{RESET}  PNG {width}x{height}, expected at least {floor} tall")
+                    total_failed += 1
+                    gates_failed.append(page["id"])
+                    print(f"  {DIM}{elapsed:.1f}s{RESET}\n")
+                    continue
                 print(f"  {GREEN}pass{RESET}  PNG {width}x{height} -> {output_path}")
                 print(f"  {DIM}{elapsed:.1f}s{RESET}\n")
                 continue

@@ -1,0 +1,50 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>Kingfisher Gazette — front page</title>
+
+<!--
+  A front page: headlines that are themselves links, and almost no prose.
+  Three things this shape got wrong, all visible at once on a real news site.
+
+  1. Readability returns nothing here, because there is no article to find.
+     The reader then had no title at all and fell back to "Untitled page",
+     even though the document says what it is in <title>.
+
+  2. Blocks carried text but not the link around it, so the reader printed the
+     headlines as plain words. A headline you cannot follow is not a front
+     page; the link is the information.
+
+  3. The page is long. Rendering it into a fixed-height surface dropped
+     everything past the bottom, and the result looked complete -- it just
+     stopped. The declared minimum height below asserts that the render grew
+     to fit rather than cropping.
+-->
+
+<main>
+  <h2><a href="/2026/09/kingfisher-dive-rates">Dive rates climb along the lower river</a></h2>
+  <h2><a href="/2026/09/refraction-correction">How juveniles learn the refraction correction</a></h2>
+  <h2><a href="/2026/09/bank-nests-survey">Bank nest survey finds twelve new sites</a></h2>
+  <h2>Weather</h2>
+  <h3><a href="/2026/09/perch-heights">Perch heights and the cost of a missed strike</a></h3>
+  <ul>
+    <li><a href="/tags/rivers">Rivers</a></li>
+    <li><a href="/tags/nesting">Nesting</a></li>
+  </ul>
+  <p><a href="/archive">Browse the archive</a></p>
+  <p id="content">PENDING</p>
+
+  <h2><a href="/2026/08/winter-territories">Winter territories shift downstream</a></h2>
+  <h2><a href="/2026/08/fledging-mortality">Fledging mortality in a wet season</a></h2>
+  <h2><a href="/2026/08/tunnel-depth">Tunnel depth and predation</a></h2>
+  <h2><a href="/2026/08/fish-size-selection">Fish size selection at three sites</a></h2>
+  <h2><a href="/2026/07/dawn-activity">Dawn activity peaks earlier than expected</a></h2>
+  <h2><a href="/2026/07/colour-banding">Colour banding returns after five years</a></h2>
+  <h2><a href="/2026/07/river-turbidity">River turbidity and strike success</a></h2>
+  <h2><a href="/2026/07/nest-reuse">Nest reuse across seasons</a></h2>
+  <h2><a href="/2026/06/territory-disputes">Territory disputes on the middle reach</a></h2>
+  <h2><a href="/2026/06/moult-timing">Moult timing in resident adults</a></h2>
+</main>
+
+<script>
+  document.getElementById("content").textContent = "LINK-INDEX-OK";
+</script>

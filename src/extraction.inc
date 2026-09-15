@@ -493,7 +493,43 @@ static char *sanitize_content(const char *html)
     return dbuf_take(&out);
 }
 
-static void append_blocks(DBuffer *out, lxb_dom_node_t *root)
+/* The destination a block of text points at, if any. A front page is a list
+   of headlines that are themselves links, and a headline stripped of its link
+   is not usable information -- the reader shows the words but gives the reader
+   no way to follow them. Look outwards first, because the common shape is an
+   anchor wrapping the heading, then inwards for a heading containing a single
+   link. */
+static char *block_href(Engine *engine, lxb_dom_node_t *root, lxb_dom_node_t *node,
+                        size_t *rejected)
+{
+    for (lxb_dom_node_t *up = node->parent; up; up = up->parent) {
+        if (!is_element(up)) continue;
+        char *tag = node_tag(up);
+        bool anchor = d_eq(tag, "a");
+        free(tag);
+        if (!anchor) continue;
+        char *raw = attr_value(lxb_dom_interface_element(up), "href");
+        char *url = safe_uri(engine, raw, rejected);
+        free(raw);
+        if (*url) return url;
+        free(url);
+        break;
+    }
+    NodeVec inner = find_selector(node, "a");
+    char *found = d_strdup("");
+    for (size_t i = 0; i < inner.length; ++i) {
+        char *raw = attr_value(lxb_dom_interface_element(inner.items[i]), "href");
+        char *url = safe_uri(engine, raw, rejected);
+        free(raw);
+        if (*url) { free(found); found = url; break; }
+        free(url);
+    }
+    free(inner.items);
+    (void)root;
+    return found;
+}
+
+static void append_blocks(Engine *engine, DBuffer *out, lxb_dom_node_t *root, size_t *rejected)
 {
     const char *tags[] = {"h1","h2","h3","h4","h5","h6","p","pre","blockquote","li","dt","dd"};
     bool first = true; dbuf_puts(out, "[");
@@ -502,13 +538,33 @@ static void append_blocks(DBuffer *out, lxb_dom_node_t *root)
         for (size_t i = 0; i < nodes.length; ++i) {
             if (hidden_node(root, nodes.items[i])) continue;
             char *text = compact_text(nodes.items[i]); if (!*text) { free(text); continue; }
+            char *href = block_href(engine, root, nodes.items[i], rejected);
             if (!first) dbuf_puts(out, ","); first = false;
-            char *qt = json_quote(tags[t]), *qx = json_quote(text);
-            dbuf_printf(out, "{\"type\":%s,\"text\":%s}", qt, qx); free(qt); free(qx); free(text);
+            char *qt = json_quote(tags[t]), *qx = json_quote(text), *qh = json_quote(href);
+            dbuf_printf(out, "{\"type\":%s,\"text\":%s,\"href\":%s}", qt, qx, qh);
+            free(qt); free(qx); free(qh); free(text); free(href);
         }
         free(nodes.items);
     }
     dbuf_puts(out, "]");
+}
+
+/* The document's own title. Readability supplies one when it runs, but it
+   returns nothing at all on pages it cannot parse -- which are exactly the
+   pages where the reader has least else to show, and where labelling the tab
+   "Untitled page" is least helpful. */
+static char *document_title(lxb_dom_node_t *root)
+{
+    NodeVec titles = find_selector(root, "title");
+    char *text = d_strdup("");
+    for (size_t i = 0; i < titles.length; ++i) {
+        free(text);
+        text = compact_text(titles.items[i]);
+        if (*text) break;
+    }
+    free(titles.items);
+    if (!*text) { free(text); text = meta_value(root, "og:title"); }
+    return text;
 }
 
 static char *table_json(lxb_dom_node_t *root)
@@ -692,9 +748,10 @@ static char *run_extraction(Engine *engine, const char *serialized)
     ExtractShape shape = shape_for(root); ReadabilityFields readability = run_readability(engine, readability_input); size_t rejected = 0;
     char *content = sanitize_content(readability.content); char *tables = table_json(root); char *search = search_json(engine, root, &rejected); char *forms = forms_json(engine, root, &rejected); char *videos = videos_json(engine, root, &rejected); char *media = media_json(engine, root, &rejected); char *links = links_json(engine, root, &rejected); char *structured = structured_data_json(engine, root);
     const char *selected = "structured-text"; if (d_eq(shape.kind, "article")) selected = readability.ok ? "readability" : "structured-text"; else if (d_eq(shape.kind, "table")) selected = "table"; else if (d_eq(shape.kind, "search-results")) selected = "search-results"; else if (d_eq(shape.kind, "form")) selected = "form"; else if (d_eq(shape.kind, "video")) selected = "video-metadata"; else if (d_eq(shape.kind, "image-heavy")) selected = "media-reference";
-    DBuffer out; dbuf_init(&out); char *qurl = json_quote(engine->source_url), *qbase = json_quote(engine->base_url), *qkind = json_quote(shape.kind), *qevidence = json_quote(shape.evidence), *qselected = json_quote(selected);
-    dbuf_printf(&out, "{\"schema\":1,\"url\":%s,\"base_url\":%s,\"shape\":{\"kind\":%s,\"confidence\":%.2f,\"evidence\":%s},\"extractor\":%s,\"extractor_registry\":[\"readability\",\"structured-text\",\"table\",\"search-results\",\"form\",\"video-metadata\",\"media-reference\"],\"readability\":", qurl, qbase, qkind, shape.confidence, qevidence, qselected);
+    DBuffer out; dbuf_init(&out); char *page_title = document_title(root);
+    char *qurl = json_quote(engine->source_url), *qbase = json_quote(engine->base_url), *qkind = json_quote(shape.kind), *qevidence = json_quote(shape.evidence), *qselected = json_quote(selected), *qtitle = json_quote(page_title);
+    dbuf_printf(&out, "{\"schema\":1,\"url\":%s,\"base_url\":%s,\"title\":%s,\"shape\":{\"kind\":%s,\"confidence\":%.2f,\"evidence\":%s},\"extractor\":%s,\"extractor_registry\":[\"readability\",\"structured-text\",\"table\",\"search-results\",\"form\",\"video-metadata\",\"media-reference\"],\"readability\":", qurl, qbase, qtitle, qkind, shape.confidence, qevidence, qselected);
     if (!readability.ok) dbuf_puts(&out, "null"); else { char *qt = json_quote(readability.title), *qb = json_quote(readability.byline), *qd = json_quote(readability.dir), *ql = json_quote(readability.lang), *qc = json_quote(content), *qtc = json_quote(readability.text_content), *qe = json_quote(readability.excerpt), *qs = json_quote(readability.site_name), *qp = json_quote(readability.published_time); dbuf_printf(&out, "{\"title\":%s,\"byline\":%s,\"dir\":%s,\"lang\":%s,\"content\":%s,\"textContent\":%s,\"excerpt\":%s,\"siteName\":%s,\"publishedTime\":%s}", qt, readability.byline_null ? "null" : qb, readability.dir_null ? "null" : qd, readability.lang_null ? "null" : ql, qc, qtc, readability.excerpt_null ? "null" : qe, readability.site_name_null ? "null" : qs, readability.published_time_null ? "null" : qp); free(qt); free(qb); free(qd); free(ql); free(qc); free(qtc); free(qe); free(qs); free(qp); }
-    dbuf_puts(&out, ",\"blocks\":"); append_blocks(&out, root); dbuf_printf(&out, ",\"tables\":%s,\"search_results\":%s,\"forms\":%s,\"videos\":%s,\"media\":%s,\"links\":%s,\"structured_data\":%s,\"sanitization\":{\"allowed_schemes\":[\"http\",\"https\",\"mailto\",\"tel\"],\"rejected_uris\":%zu}}", tables, search, forms, videos, media, links, structured, rejected);
-    free(qurl); free(qbase); free(qkind); free(qevidence); free(qselected); free(content); free(tables); free(search); free(forms); free(videos); free(media); free(links); free(structured); free(shape.kind); free(shape.evidence); free_readability(&readability); lxb_html_document_destroy(document); return dbuf_take(&out);
+    dbuf_puts(&out, ",\"blocks\":"); append_blocks(engine, &out, root, &rejected); dbuf_printf(&out, ",\"tables\":%s,\"search_results\":%s,\"forms\":%s,\"videos\":%s,\"media\":%s,\"links\":%s,\"structured_data\":%s,\"sanitization\":{\"allowed_schemes\":[\"http\",\"https\",\"mailto\",\"tel\"],\"rejected_uris\":%zu}}", tables, search, forms, videos, media, links, structured, rejected);
+    free(qurl); free(qbase); free(qtitle); free(page_title); free(qkind); free(qevidence); free(qselected); free(content); free(tables); free(search); free(forms); free(videos); free(media); free(links); free(structured); free(shape.kind); free(shape.evidence); free_readability(&readability); lxb_html_document_destroy(document); return dbuf_take(&out);
 }

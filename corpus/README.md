@@ -129,6 +129,7 @@ exists to test.
 | `25-cjk-linebreak` | Japanese and Chinese text with no inter-word spaces | Writing systems |
 | `26-complex-script` | Thai with no word delimiter; Devanagari cluster reordering | Writing systems |
 | `27-login-session` | A login performed in one process and used by another | Sessions |
+| `28-link-index` | A front page: document title, links on blocks, render sized to content | Phase 1 extraction breadth |
 
 `00` is the control: it has no scripts, so a failure there is never a binding
 bug. `07` is where a raw-pointer binding over Lexbor's arena-allocated nodes
@@ -155,6 +156,30 @@ easy to write and wrong: the first version of ours matched Airbnb and Product
 Hunt, which serve full pages while naming those vendors, and it would have
 skipped their scripts. `22` is deliberately a small document so that the
 detector's size guard cannot rescue it — only the choice of markers can.
+
+## Front pages
+
+`28-link-index` is a front page rather than an article: headlines that are
+themselves links, and almost no prose. Three defects showed up together on
+dn.se in that shape, and none of them was visible on any existing fixture.
+
+- Readability finds nothing on a page with no article, so the reader had **no
+  title at all** and displayed "Untitled page" — while the document said what
+  it was in `<title>` the whole time. Extraction now carries a top-level
+  `title` taken from the document, and Readability's own title is preferred
+  only when it has one.
+- Blocks carried their text but not the link around them, so headlines
+  rendered as plain words. On a front page the link *is* the information: a
+  headline you cannot follow is not a front page. Blocks now carry `href`,
+  taken from the nearest wrapping anchor or a single contained one.
+- The page was rendered into a fixed-height surface, which dropped everything
+  past the bottom. The result did not look truncated; it looked finished and
+  simply stopped. `--height 0` now sizes the render to the laid-out content,
+  bounded, and the shell sizes its scroll area from the surface it gets back.
+
+A page may declare `render_fit` to be rendered that way and
+`min_render_height` to assert it grew rather than cropped. `28-link-index`
+fails all three ways against the previous engine.
 
 ## Sessions
 

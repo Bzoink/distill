@@ -383,7 +383,7 @@ Distill is a C23-rooted, content-first browser-like pipeline:
 | Page DOM | A LinkeDOM-compatible JavaScript DOM surface runs page scripts inside QuickJS; the settled result is serialized for native extraction |
 | Native parsing/extraction | Lexbor parses the settled HTML and provides native traversal; Readability.js is run as the article extractor, alongside structured blocks, tables, search results, forms, video metadata, media references, and links |
 | Networking | libcurl with shared cookies, an optional persistent session file, request/response headers, negotiated HTTP/2, bounded redirects, GET/POST with the body read from a private file, and the page/subresource bridge |
-| Reader layout | litehtml lays out Distill's own reader template rather than arbitrary source-site CSS |
+| Reader layout | litehtml lays out Distill's own reader template rather than arbitrary source-site CSS; the surface can be sized to the laid-out content instead of cropping it |
 | Font/render path | FreeType for glyph metrics/rasterization, HarfBuzz for shaping, libunibreak for line-break opportunities, and Cairo for desktop PNG/surface painting |
 | Desktop shell | GTK3 with a Cairo reader surface, native GTK form widgets positioned from litehtml geometry, one session shared across navigations, and an address bar that distinguishes a URL from a search term |
 | C++ boundary | litehtml is C++; `src/litehtml_probe.cpp` is the deliberate C++17 adapter. The rest of the bespoke application is C23, but binaries using litehtml still carry the C++ runtime |
