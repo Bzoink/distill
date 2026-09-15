@@ -1,4 +1,4 @@
-# Phase 0 corpus
+# Distill corpus
 
 The ruler, built before the thing it measures.
 
@@ -12,6 +12,8 @@ Arm B′ is decided on corpus pass rate. Until this exists, Phase 0 cannot start
 ```sh
 ./check.py                    # all gates, engine expectations
 ./check.py --extract          # Phase 1 extraction and golden-output gates
+./check.py --render /tmp/png  # Phase 2 reader PNG smoke renders
+./check.py --viewer /tmp/png  # Phase 2 media viewer smoke render
 ./check.py --bundles          # recorded saved-bundle smoke checks, never gates
 ./check.py --baseline         # validate the fixtures against a real browser
 ./check.py --id 07-churn      # one page
@@ -31,6 +33,18 @@ text, tables, search results, forms, video metadata, media references, links,
 and rejected URI counts. Its stable field checks live in
 [`golden/`](golden/); the combined saved-page bundle under `local/bundles/` is
 recorded for breadth and is never a gate.
+
+`--render DIR` sends the same settled extraction result through the reader
+template, litehtml layout, and the FreeType/HarfBuzz/Cairo paint backend. It
+writes one PNG per corpus page and gates only that the renderer creates a
+non-empty PNG with valid dimensions; visual quality remains a human review.
+
+`--viewer DIR` runs the gallery fixture through the fit-to-width media viewer
+path and checks its navigation surface produces a valid PNG.
+
+For a single page, `build/distill --url URL --viewer /tmp/media.png
+--media-index 0 --save-media /tmp/original.bin` renders one media reference and
+saves its original fetched bytes without decoding or rewriting them.
 
 **Validate with `--baseline` before trusting a failure.** A fixture bug and a
 binding bug look identical, and these fixtures are written to be hard. As of the

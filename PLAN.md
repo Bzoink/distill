@@ -2,7 +2,7 @@
 
 *A small, C23-rooted stack that runs a page's real JavaScript against a real DOM, pulls out what actually matters, and renders it back — clearly, consistently, on our own terms.*
 
-**Status:** Phase 1 complete — Phase 2 not started
+**Status:** Phase 2 complete — Phase 3 not started
 **Drafted:** 2026-09-14 · **Revised:** 2026-09-15 (Phase 1 implementation)
 **Origin:** NetSurf JS/rendering gap analysis (see `../netsurf`)
 **Rendered version:** https://claude.ai/code/artifact/fcbd8e5f-f6dc-4abd-a2a4-e7282070cf4a *(predates this revision)*
@@ -361,6 +361,24 @@ fixtures and never become gates.
 7. **Viewer mode's paint side** — fit-to-width, next/previous, save.
 
 **Done when:** output from Phase 1's test pages renders consistently and is genuinely pleasant to read.
+
+**Phase 2 result (2026-09-15):** The font-engine spike is complete. The
+litehtml adapter now uses a C23 FreeType/HarfBuzz backend for font creation,
+metrics, shaping, measurement, glyph painting, decorations, clipping, fills,
+borders, and list markers; it does not depend on Pango. The matcher scans a
+configured font directory and reads family/style metadata from FreeType, with
+standard system-font directories as the development fallback. A reader template
+and first theme are wired to Phase 1's Readability output, and `--render` emits
+Cairo PNGs. The bundled development faces live under `external/fonts`, while
+`--font-dir` and `DISTILL_FONT_DIR` support another configured collection.
+The libunibreak-backed greedy UTF-8 breaker is exposed through the C23 render
+API and has a CTest contract; litehtml uses the same shaped measurement callback
+for its layout. Structured table, search, form, video, and media-reference
+cards are rendered from the Phase 1 JSON contract. The CLI media viewer provides
+fit-to-width staging, previous/next state, external hand-off links, and original
+byte saving. `corpus/check.py --render DIR` and `--viewer DIR` cover the PNG
+paths, and the Phase 1 pages have been visually reviewed. Phase 3 can now add a
+window around this completed paint path.
 
 ### Phase 3 — App shell
 *Daily-usable*

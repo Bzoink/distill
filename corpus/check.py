@@ -7,6 +7,8 @@ Starts serve.py, drives the Phase 0 engine over each page, and checks the
 
     ./check.py                 all local gates
     ./check.py --extract       Phase 1 extraction and golden gates
+    ./check.py --render DIR    Phase 2 PNG smoke renders
+    ./check.py --viewer DIR    Phase 2 media-viewer smoke render
     ./check.py --id 03-settle  one page
     ./check.py --live          also record the live rungs (never gates)
     ./check.py --keep-dom DIR  save each dumped DOM for inspection
@@ -176,6 +178,30 @@ def dump_extract(engine, url, cap_ms, timeout_s):
         return None, f"extractor returned invalid JSON: {exc}"
 
 
+def render_page(engine, url, output_path, cap_ms, timeout_s, viewer=False):
+    """Render a reader PNG and verify its basic PNG dimensions."""
+    cmd = [engine, "--url", url, "--viewer" if viewer else "--render", output_path,
+           "--script-cap-ms", str(cap_ms)]
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout_s)
+    except subprocess.TimeoutExpired:
+        return None, f"renderer timed out after {timeout_s}s"
+    if r.returncode != 0:
+        return None, f"renderer exit {r.returncode}: {r.stderr.strip()[:300]}"
+    try:
+        with open(output_path, "rb") as fh:
+            header = fh.read(24)
+        if len(header) != 24 or header[:8] != b"\x89PNG\r\n\x1a\n":
+            return None, "renderer did not write a PNG"
+        width = int.from_bytes(header[16:20], "big")
+        height = int.from_bytes(header[20:24], "big")
+        if width <= 0 or height <= 0:
+            return None, "renderer wrote an empty PNG"
+        return (width, height), None
+    except OSError as exc:
+        return None, f"renderer output unavailable: {exc}"
+
+
 def dump_arm_b(engine, url, cap_ms, timeout_s):
     """Post-JS DOM from the JS-side-DOM comparison arm."""
     cmd = [engine, "--url", url, "--dump-dom", "--script-cap-ms", str(cap_ms)]
@@ -317,6 +343,10 @@ def main():
                          "browser_expect where we deliberately diverge from a browser")
     ap.add_argument("--extract", action="store_true",
                     help="run the Phase 1 extractor and check extract-stage assertions")
+    ap.add_argument("--render", metavar="DIR",
+                    help="render each corpus page to a Phase 2 PNG in DIR")
+    ap.add_argument("--viewer", metavar="DIR",
+                    help="render the gallery fixture through the Phase 2 media viewer")
     ap.add_argument("--bundles", action="store_true",
                     help="also run saved local bundles as recorded, non-gating checks")
     ap.add_argument("--arm", choices=("a", "b", "b-pruned"), default="a",
@@ -331,12 +361,24 @@ def main():
         ap.error("--baseline is only valid with the default reference-browser comparison")
     if args.baseline and args.extract:
         ap.error("--extract is only valid with the engine")
+    if args.baseline and args.render:
+        ap.error("--render is only valid with the engine")
+    if args.baseline and args.viewer:
+        ap.error("--viewer is only valid with the engine")
     if args.extract and args.arm != "a":
         ap.error("--extract currently targets the selected Arm A implementation")
+    if args.render and args.arm != "a":
+        ap.error("--render currently targets the selected Arm A implementation")
+    if args.viewer and args.arm != "a":
+        ap.error("--viewer currently targets the selected Arm A implementation")
     if args.baseline and args.bundles:
         ap.error("--bundles is only valid with the engine")
     if args.bundles and args.arm != "a":
         ap.error("--bundles currently targets the selected Arm A implementation")
+    if (args.render or args.viewer) and (args.extract or args.bundles):
+        ap.error("--render/--viewer cannot be combined with --extract or --bundles")
+    if args.render and args.viewer:
+        ap.error("--render and --viewer are mutually exclusive")
     browser = find_browser() if args.baseline else None
     engine = find_engine() if not args.baseline and args.arm == "a" else None
     arm_b = find_arm_b(args.arm == "b-pruned") if not args.baseline and args.arm in ("b", "b-pruned") else None
@@ -344,6 +386,10 @@ def main():
 
     if args.keep_dom:
         os.makedirs(args.keep_dom, exist_ok=True)
+    if args.render:
+        os.makedirs(args.render, exist_ok=True)
+    if args.viewer:
+        os.makedirs(args.viewer, exist_ok=True)
 
     server = subprocess.Popen([sys.executable, SERVE, "-p", str(port), "-q"],
                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
@@ -363,15 +409,32 @@ def main():
             if not pages:
                 sys.exit(f"no page with id {args.id!r}")
 
-        mode = "baseline (reference browser)" if args.baseline else ("Arm B' (no-Lexbor + litehtml)" if args.arm == "b-pruned" else ("Arm B (JS-side linkedom)" if args.arm == "b" else ("Arm A extraction (C23)" if args.extract else "Arm A (C23 runtime + Lexbor extraction)")))
+        mode = "baseline (reference browser)" if args.baseline else ("Arm B' (no-Lexbor + litehtml)" if args.arm == "b-pruned" else ("Arm B (JS-side linkedom)" if args.arm == "b" else ("Phase 2 media viewer" if args.viewer else ("Phase 2 reader PNG" if args.render else ("Arm A extraction (C23)" if args.extract else "Arm A (C23 runtime + Lexbor extraction)")))))
         driver = browser if args.baseline else (arm_b if args.arm in ("b", "b-pruned") else engine)
         print(f"{DIM}{'browser' if args.baseline else 'driver'}: {driver}\nserver:  http://127.0.0.1:{port}/\nmode:    {mode}{RESET}\n")
 
         total_failed, gates_failed = 0, []
+        if args.viewer:
+            pages = [p for p in pages if p["id"] == "15-gallery"]
+            if not pages:
+                sys.exit("--viewer requires the 15-gallery fixture")
         for page in pages:
             url = f"http://127.0.0.1:{port}/{page['path']}"
             t0 = time.time()
-            if args.extract:
+            if args.render:
+                output_path = os.path.join(args.render, page["id"] + ".png")
+                render_info, err = render_page(engine, url, output_path,
+                                               manifest.get("settle_cap_ms", 5000), args.timeout)
+                html = None
+                extraction = None
+            elif args.viewer:
+                output_path = os.path.join(args.viewer, page["id"] + ".png")
+                render_info, err = render_page(engine, url, output_path,
+                                               manifest.get("settle_cap_ms", 5000), args.timeout,
+                                               viewer=True)
+                html = None
+                extraction = None
+            elif args.extract:
                 extraction, err = dump_extract(engine, url, manifest.get("settle_cap_ms", 5000), args.timeout)
                 html = None
             elif args.baseline:
@@ -395,6 +458,12 @@ def main():
                 total_failed += 1
                 gates_failed.append(page["id"])
                 print()
+                continue
+
+            if args.render or args.viewer:
+                width, height = render_info
+                print(f"  {GREEN}pass{RESET}  PNG {width}x{height} -> {output_path}")
+                print(f"  {DIM}{elapsed:.1f}s{RESET}\n")
                 continue
 
             if args.keep_dom:

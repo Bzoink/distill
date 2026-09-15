@@ -13,9 +13,20 @@ set(EXTERNAL_PREFIX "${CMAKE_SOURCE_DIR}/external/install" CACHE PATH "Distill e
 
 find_package(CURL REQUIRED)
 find_package(Threads REQUIRED)
+find_package(PkgConfig REQUIRED)
+pkg_check_modules(DISTILL_RENDER REQUIRED IMPORTED_TARGET freetype2 harfbuzz cairo libunibreak)
 
-add_executable(distill src/main.c)
-target_compile_definitions(distill PRIVATE DISTILL_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
+enable_testing()
+add_executable(distill-shaper-test tests/shaper_test.c src/shaper.c)
+target_include_directories(distill-shaper-test PRIVATE src)
+target_link_libraries(distill-shaper-test PRIVATE PkgConfig::DISTILL_RENDER)
+add_test(NAME distill-shaper COMMAND distill-shaper-test)
+
+add_library(distill-render-core STATIC src/render.c src/shaper.c)
+target_link_libraries(distill-render-core PUBLIC PkgConfig::DISTILL_RENDER)
+
+add_executable(distill src/main.c src/litehtml_probe.cpp)
+target_compile_definitions(distill PRIVATE DISTILL_SOURCE_DIR="${CMAKE_SOURCE_DIR}" DISTILL_RENDER=1)
 target_include_directories(distill PRIVATE
     "${EXTERNAL_PREFIX}/include"
     ${CURL_INCLUDE_DIRS}
@@ -24,8 +35,11 @@ target_link_directories(distill PRIVATE "${EXTERNAL_PREFIX}/lib")
 target_link_libraries(distill PRIVATE
     qjs
     lexbor
+    litehtml
+    gumbo
     CURL::libcurl
     Threads::Threads
+    distill-render-core
     ${CMAKE_DL_LIBS}
     m
 )
@@ -47,11 +61,11 @@ set_target_properties(distill-arm-b PROPERTIES
 )
 install(TARGETS distill-arm-b RUNTIME DESTINATION bin)
 
-add_executable(distill-arm-b-pruned src/main.c src/litehtml_probe.cpp)
+add_executable(distill-arm-b-pruned src/main.c src/litehtml_probe.cpp src/render.c src/shaper.c)
 target_compile_definitions(distill-arm-b-pruned PRIVATE DISTILL_B_PRUNED=1 DISTILL_NO_EXTRACT=1)
 target_include_directories(distill-arm-b-pruned PRIVATE "${EXTERNAL_PREFIX}/include" ${CURL_INCLUDE_DIRS})
 target_link_directories(distill-arm-b-pruned PRIVATE "${EXTERNAL_PREFIX}/lib")
-target_link_libraries(distill-arm-b-pruned PRIVATE qjs CURL::libcurl litehtml gumbo Threads::Threads ${CMAKE_DL_LIBS} m)
+target_link_libraries(distill-arm-b-pruned PRIVATE qjs CURL::libcurl litehtml gumbo Threads::Threads PkgConfig::DISTILL_RENDER ${CMAKE_DL_LIBS} m)
 set_target_properties(distill-arm-b-pruned PROPERTIES
     BUILD_RPATH "${EXTERNAL_PREFIX}/lib"
     INSTALL_RPATH "${EXTERNAL_PREFIX}/lib"
