@@ -206,6 +206,80 @@
       "name": "Target",
       "url": "https://www.target.com/",
       "focus": "e-commerce application rendering and bot mitigation"
+    },
+    {
+      "id": "26-mdn-web-components",
+      "tier": 6,
+      "class": "web-components",
+      "name": "MDN Web Components",
+      "url": "https://developer.mozilla.org/en-US/docs/Web/API/Web_components",
+      "focus": "custom elements, open and closed shadow roots, slots, and encapsulated markup"
+    },
+    {
+      "id": "27-shoelace",
+      "tier": 6,
+      "class": "web-components",
+      "name": "Shoelace Component Library",
+      "url": "https://shoelace.style/",
+      "focus": "custom elements and nested shadow-DOM component UI"
+    },
+    {
+      "id": "28-hacker-news-newest",
+      "tier": 7,
+      "class": "content-feed",
+      "name": "Hacker News Newest",
+      "url": "https://news.ycombinator.com/newest",
+      "focus": "dense newest-item feed, pagination, rankings, and link extraction"
+    },
+    {
+      "id": "29-devto-infinite-feed",
+      "tier": 7,
+      "class": "blog-platform",
+      "name": "DEV Community Feed",
+      "url": "https://dev.to/",
+      "focus": "long feed, client hydration, and asynchronously appended article cards",
+      "note": "This URL was already used for site 07; this entry retests it with the infinite-feed challenge focus."
+    },
+    {
+      "id": "30-codepen-embed",
+      "tier": 8,
+      "class": "media-app",
+      "name": "CodePen",
+      "url": "https://codepen.io/",
+      "focus": "cross-origin iframe embeds and isolated user HTML/CSS/JavaScript",
+      "note": "The supplied challenge names CodePen details/embeds but gives no concrete Pen URL, so the public landing page is used until one is supplied."
+    },
+    {
+      "id": "31-jsfiddle",
+      "tier": 8,
+      "class": "media-app",
+      "name": "JSFiddle",
+      "url": "https://jsfiddle.net/",
+      "focus": "multi-frame editor preview and cross-origin iframe boundaries"
+    },
+    {
+      "id": "32-threejs-examples",
+      "tier": 9,
+      "class": "webgl",
+      "name": "Three.js Examples",
+      "url": "https://threejs.org/examples/",
+      "focus": "canvas, SVG, WebGL, and non-selectable rendered graphics"
+    },
+    {
+      "id": "33-chartjs-gallery",
+      "tier": 9,
+      "class": "canvas",
+      "name": "Chart.js",
+      "url": "https://www.chartjs.org/",
+      "focus": "canvas/SVG charts and data visualization outside ordinary DOM text"
+    },
+    {
+      "id": "34-html5-test",
+      "tier": 10,
+      "class": "malformed-html",
+      "name": "HTML5 Test",
+      "url": "https://html5test.com/",
+      "focus": "tag-soup parsing, malformed markup, and browser-compliance diagnostics"
     }
   ]
 }

@@ -11,8 +11,8 @@ is evidence for investigation rather than a permanent pass/fail assertion.
 
 ## What is included
 
-[`corpus/site-comparison.json`](corpus/site-comparison.json) contains the 25
-sites from the supplied list, corrected where the original links were search
+[`corpus/site-comparison.json`](corpus/site-comparison.json) contains the 34
+sites from the supplied lists, corrected where the original links were search
 redirects or incomplete examples. It records the URL, tier, site class, test
 focus, and important reproducibility notes.
 
@@ -58,7 +58,7 @@ python3 tools/compare_sites.py --id 06-bbc-news --screenshots
 ```
 
 To run a selected group, repeat `--id`; omitting both URLs and `--id` runs all
-25 entries:
+34 entries:
 
 ```sh
 python3 tools/compare_sites.py \
@@ -111,7 +111,12 @@ When a site is supplied for investigation:
 6. If both clients are stopped by an anti-bot, CAPTCHA, access-denied, or
    equivalent protection page, mark the site `antibot`, preserve the evidence,
    and continue with the next site. Do not treat that state as a Distill bug.
-7. Preserve the before/after report when the result is useful; never promote
+7. If a site requires browser-level behavior outside Distill's current scope
+   and the difference remains after focused fixes, mark it `out of scope —
+   deferred`, document the evidence and likely architectural cause, and
+   continue. This is neither a pass nor an anti-bot result; it is a candidate
+   for a later browser-runtime project.
+8. Preserve the before/after report when the result is useful; never promote
    an unstable live URL directly into a CI gate.
 
 The reference run uses a fresh temporary Chromium profile for each site. It
@@ -136,7 +141,7 @@ reproducible comparison should use a pinned URL and record the final state.
 
 ## Current setup status
 
-The first comparison has been completed:
+The original 25-site comparison has been completed:
 
 | Site | Status | Result |
 | --- | --- | --- |
@@ -152,6 +157,96 @@ The first comparison has been completed:
 | Stack Overflow (`10-stack-overflow`) | antibot | Chromium receives the site, but Distill receives Cloudflare's `Just a moment...` page; no meaningful content comparison is possible |
 | React Official Website (`11-react`) | checked and working | Same rendered documentation content, headings, links, images, and forms; reader extraction omits only a small amount of surrounding UI/code context |
 | Twitter / X (`12-x`) | antibot | Chromium reports `Access to x.com was denied` and Distill receives only the unauthenticated login shell; the supplied URL has no concrete public profile |
-| Airbnb (`13-airbnb`) | stopped — unsupported runtime mismatch | Chromium exposes the homepage content; Distill settles on its navigation shell and `0 of 0 items showing`. Missing browser APIs and HTTP request semantics were addressed, but the substantive content still does not render. |
+| Airbnb (`13-airbnb`) | out of scope — deferred | Chromium exposes the homepage content; Distill settles on its navigation shell and `0 of 0 items showing`. Focused fixes addressed the observed missing APIs, POST/XHR bodies, user agent, and layout shims, but the React application still does not hydrate. See the deferral rationale below. |
+| Notion (`14-notion`) | checked and working | Same substantive landing-page content and media; a 15-second script budget was needed for dynamic discovery, and minor heading wording differs between captures |
+| GitHub Trending (`15-github-trending`) | checked and working | Same trending repository list, headings, descriptions, links, and images; GitHub's large navigation and marketing shell is intentionally omitted from reader information |
+| YouTube (`16-youtube`) | out of scope — deferred | The supplied URL is the home page rather than a concrete watch page. Chromium exposes consent/history UI, while Distill cannot complete YouTube's Web Components/shadow-DOM bootstrap; this needs a real browser-level runtime and a pinned watch URL |
+| Imgur (`17-imgur`) | out of scope — deferred | Chromium receives Imgur's media/consent page, while Distill extracts only the title after third-party/media scripts fail on missing `TextEncoder`, `Document`, and related browser APIs; this is deferred with the heavy-media runtime work |
+| Reddit (`18-reddit`) | antibot | Chromium and Distill both receive Reddit's `Prove your humanity` challenge page; the available information matches, but no Reddit content is accessible |
+| CodePen Trending (`19-codepen-trending`) | antibot | Chromium and Distill both receive CodePen/Cloudflare's `Performing security verification` page, which reports the browser is not supported |
+| Product Hunt (`20-product-hunt`) | antibot | Chromium receives Product Hunt's Cloudflare verification page while Distill reaches the site content; the reference is blocked, so this is not a valid content comparison |
+| Cloudflare (`21-cloudflare`) | checked and working | Same substantive public homepage information with high Distill fidelity; navigation, cookie UI, and decorative marketing structure are reduced, and non-content custom-element/video errors do not prevent extraction |
+| Zillow (`22-zillow`) | antibot | Chromium and Distill both receive Zillow's `Access to this page has been denied` page with a human-verification prompt |
+| IMDb (`23-imdb`) | antibot | Chromium and Distill both receive `403 Forbidden` and no usable IMDb content |
+| Bloomberg (`24-bloomberg`) | antibot | Chromium and Distill both receive Bloomberg's unusual-activity robot check; matching text is only the shared protection page |
+| Target (`25-target`) | antibot | Chromium receives the Target homepage, while Distill receives Target's `Pardon the interruption` bot-mitigation page; this is not a content extraction mismatch |
 
-Testing stopped at site 13 because the remaining Airbnb mismatch could not be fixed. Sites 14-25 were not started.
+Testing completed for all 25 original entries: 12 checked and working, 10
+marked `antibot`, and 3 marked `out of scope — deferred`. The additional
+challenge entries below have also been completed.
+
+### Additional challenge ladder
+
+The second supplied challenge list adds nine entries, numbered 26–34:
+
+| Tier | Sites | Primary challenge |
+| --- | --- | --- |
+| 6 | MDN Web Components; Shoelace | custom elements, slots, and shadow DOM |
+| 7 | Hacker News Newest; DEV Community Feed | long feeds, pagination, and dynamic list growth |
+| 8 | CodePen; JSFiddle | isolated and cross-origin iframe content |
+| 9 | Three.js Examples; Chart.js | canvas, SVG, and WebGL-rendered information |
+| 10 | HTML5 Test | malformed HTML and parser recovery |
+
+Site 29 intentionally retests the DEV Community URL from site 07 with the
+infinite-feed focus. Site 30 uses CodePen's landing page because the supplied
+list did not provide a concrete Pen/embed URL; a pinned Pen should be added for
+a deterministic iframe test.
+
+The additional entries are tested sequentially. The same classification rules
+apply: fix focused Distill defects, mark anti-bot responses as `antibot` and
+continue, and mark genuine browser-runtime limits as `out of scope — deferred`
+with evidence rather than treating them as extraction failures.
+
+### Additional challenge status
+
+| Site | Status | Result |
+| --- | --- | --- |
+| MDN Web Components (`26-mdn-web-components`) | checked and working | Same substantive documentation, headings, and links; shadow-DOM concepts are represented in the page's ordinary extracted content |
+| Shoelace (`27-shoelace`) | checked and working | Same substantive component-library content, links, and images; a promotional banner's heading classification differs, but its text is preserved |
+| Hacker News Newest (`28-hacker-news-newest`) | checked and working | Same newest-story feed information with 100% reference vocabulary coverage and identical links, images, and form; extra reader terms reduce reverse fidelity but do not remove feed content |
+| DEV Community Feed (`29-devto-infinite-feed`) | checked and working | Same hydrated feed cards, titles, descriptions, links, and images; reader extraction omits surrounding UI and formats one date as an ISO timestamp rather than Chromium's short date |
+| CodePen (`30-codepen-embed`) | antibot | Chromium and Distill both receive CodePen's Cloudflare security-verification page; Distill also reports that its browser is unsupported, so no landing-page or iframe content is available |
+| JSFiddle (`31-jsfiddle`) | out of scope — deferred | Chromium loads the editor UI, but Distill remains at the SSR title shell: the main editor module fails with `unexpected token '<'`, supporting code reports missing `DOMParser`, and the intended preview/editor behavior requires isolated cross-origin frames |
+| Three.js Examples (`32-threejs-examples`) | checked and working | Reader now preserves the example index as links when an inline viewer iframe selects the embed path; refreshed comparison has 100% vocabulary coverage/fidelity, all 15 headings, and 608 links/images, while WebGL pixels remain outside text extraction |
+| Chart.js (`33-chartjs-gallery`) | checked and working | Same chart-library overview, headings, and links; 100% reference vocabulary coverage with identical links and images, while canvas-rendered chart pixels are intentionally not extracted |
+| HTML5 Test (`34-html5-test`) | out of scope — deferred | The page and detailed table load, but its central feature-detection score differs substantially: Chromium reports 521/555 while Distill reports 113/555; matching that diagnostic requires a much broader browser API surface, not a focused malformed-HTML parser fix |
+
+The additional challenge ladder is complete: 6 entries are checked and
+working, 1 is marked `antibot`, and 2 are marked `out of scope — deferred`.
+For media/embed-shaped pages, the reader now preserves extracted link records
+as a link index, so pages such as Three.js retain their example names even
+when their visual content is canvas/WebGL or an iframe. The comparison scorer
+counts those links as information for the corresponding media/embed
+extractors.
+
+Across all 34 entries, 18 are checked and working, 11 are marked `antibot`,
+and 5 are marked `out of scope — deferred`. No entry remains pending.
+
+### Airbnb deferral rationale
+
+Airbnb is not an anti-bot result: the regular Chromium reference received the
+homepage, while Distill received a successful HTTP response and executed its
+scripts. The failure is that the two environments do not expose equivalent
+browser behavior. The final comparison recorded 245 reference vocabulary words
+and seven headings, but only eight extracted Distill words and a placeholder
+`0 of 0 items showing` state; Distill also hit its 30-second settle cap after
+48 scripts.
+
+The first run exposed missing `CSS`, `AbortController`, `CustomEvent`, `Intl`,
+`PerformanceObserver`, `NodeFilter`, `URL`, `visualViewport`, and range/layout
+methods. Those were given focused compatibility shims. The runtime also gained
+POST/body handling for `fetch` and `XMLHttpRequest`, plus a Chromium-like user
+agent. These changes removed the fatal JavaScript errors, but did not make the
+React application populate its content.
+
+The remaining gap is architectural rather than one missing function. Airbnb's
+hydration path expects real layout measurements and observer updates, complete
+DOM and event semantics, browser request metadata/cookies/headers, and browser
+accurate asynchronous scheduling. Distill currently uses QuickJS and LinkeDOM
+with intentionally lightweight layout and browser-global shims; returning fixed
+geometry or empty observer data can leave a responsive application in its
+placeholder state even when its scripts technically execute. During tracing,
+only telemetry POSTs completed and no listing/content request populated the
+page. Matching this site reliably would therefore require either a real browser
+runtime or a substantially broader browser-compatibility layer. It is deferred
+for later investigation rather than counted as a working comparison.

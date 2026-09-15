@@ -276,6 +276,10 @@ def extraction_information(data):
     for media in data.get("media", []):
         if isinstance(media, dict):
             parts.append(media.get("alt", ""))
+    if data.get("extractor") in {"media-reference", "video-metadata"}:
+        for link in data.get("links", []):
+            if isinstance(link, dict):
+                parts.append(link.get("text", ""))
     return clean_text(" ".join(str(part) for part in parts if part))
 
 

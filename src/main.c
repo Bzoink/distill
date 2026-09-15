@@ -1478,6 +1478,28 @@ static void append_json_media(Engine *engine, JSValueConst media, DBuffer *outpu
     dbuf_puts(output, "</section>");
 }
 
+static void append_json_links(Engine *engine, JSValueConst links, DBuffer *output)
+{
+    int64_t count = json_array_length(engine, links);
+    if (!count) return;
+    dbuf_puts(output, "<section class=\"link-list\"><h2>Links</h2>");
+    for (int64_t i = 0; i < count; ++i) {
+        JSValue item = JS_GetPropertyUint32(engine->context, links, (uint32_t)i);
+        char *text = json_property_string(engine, item, "text");
+        char *url = json_property_string(engine, item, "url");
+        if (*text || *url) {
+            dbuf_puts(output, "<p><a");
+            if (*url) append_json_attr(output, "href", url);
+            dbuf_puts(output, ">");
+            append_html_escaped(output, *text ? text : url);
+            dbuf_puts(output, "</a></p>");
+        }
+        free(text); free(url);
+        JS_FreeValue(engine->context, item);
+    }
+    dbuf_puts(output, "</section>");
+}
+
 static char *reader_template(Engine *engine, const char *json, const char *theme)
 {
     JSValue parsed = JS_ParseJSON(engine->context, json, strlen(json), "distill-extraction.json");
@@ -1493,6 +1515,7 @@ static char *reader_template(Engine *engine, const char *json, const char *theme
     JSValue forms = JS_GetPropertyStr(engine->context, parsed, "forms");
     JSValue videos = JS_GetPropertyStr(engine->context, parsed, "videos");
     JSValue media = JS_GetPropertyStr(engine->context, parsed, "media");
+    JSValue links = JS_GetPropertyStr(engine->context, parsed, "links");
     char *shape_kind = json_property_string(engine, shape, "kind");
     char *title = d_strdup("");
     char *content = d_strdup("");
@@ -1594,8 +1617,10 @@ static char *reader_template(Engine *engine, const char *json, const char *theme
     } else if (d_eq(shape_kind, "video")) {
         append_json_blocks(engine, blocks, &output);
         append_json_videos(engine, videos, &output);
+        append_json_links(engine, links, &output);
     } else if (d_eq(shape_kind, "image-heavy")) {
         append_json_media(engine, media, &output);
+        append_json_links(engine, links, &output);
     } else {
         append_json_blocks(engine, blocks, &output);
         append_json_table(engine, tables, &output);
@@ -1615,6 +1640,7 @@ static char *reader_template(Engine *engine, const char *json, const char *theme
     JS_FreeValue(engine->context, forms);
     JS_FreeValue(engine->context, videos);
     JS_FreeValue(engine->context, media);
+    JS_FreeValue(engine->context, links);
     JS_FreeValue(engine->context, readability);
     JS_FreeValue(engine->context, parsed);
     return dbuf_take(&output);
