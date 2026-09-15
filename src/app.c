@@ -104,6 +104,7 @@ struct App {
        to outlive it for Previous and Next to mean anything. */
     GPtrArray *page_media;
     bool viewer_active;
+    bool entering_viewer;
     int viewer_index;
     char *viewer_file;
     guint load_serial;
@@ -645,6 +646,9 @@ static char *viewer_html(App *app, const char *url, const char *file,
                          const char *failure)
 {
     int count = app->page_media ? (int)app->page_media->len : 0;
+    /* A negative index means this image is not one the page offered, so there
+       is no "next" to speak of -- only a way back out. */
+    bool placed = app->viewer_index >= 0 && app->viewer_index < count;
     GString *out = g_string_new(
         "<!doctype html><html><head><meta charset=\"utf-8\"><style>"
         "html,body{margin:0;padding:0;background:#17191b;color:#f5f1e8;}"
@@ -661,13 +665,17 @@ static char *viewer_html(App *app, const char *url, const char *file,
         ".url{color:#aaa79f;font-size:.82em;margin:0 30px 18px;}"
         "a{color:#78b9cf;text-decoration:none;}"
         ".nav{margin:0 30px;}.nav a{margin-right:18px;}"
+        ".spent{color:#6b6862;margin-right:18px;}"
         /* <main> is not a block element in litehtml's master stylesheet, so
            the viewer puts its content straight in the body rather than
            wrapping it in one and laying out around an inline box. */
         "</style></head><body>");
 
-    g_string_append_printf(out, "<p class=\"top\">Image %d of %d</p>",
-                           app->viewer_index + 1, count > 0 ? count : 1);
+    if (placed)
+        g_string_append_printf(out, "<p class=\"top\">Image %d of %d</p>",
+                               app->viewer_index + 1, count);
+    else
+        g_string_append(out, "<p class=\"top\">Image</p>");
 
     g_string_append(out, "<div class=\"stage\">");
     DImage image = {0};
@@ -699,15 +707,24 @@ static char *viewer_html(App *app, const char *url, const char *file,
     g_free(escaped_url);
 
     g_string_append(out, "<p class=\"nav\">");
-    if (app->viewer_index > 0) {
+    /* Both labels are always present, and the ends of the list are shown as
+       plain text rather than by removing the link. A control that moves when
+       it becomes available is a control you click by accident: with Previous
+       appearing only from the second image on, Next shifted sideways after
+       the first step and the next click landed somewhere else. */
+    if (placed && app->viewer_index > 0) {
         char *previous = escape_markup(g_ptr_array_index(app->page_media, app->viewer_index - 1));
         g_string_append_printf(out, "<a href=\"%s%s\">Previous</a>", MEDIA_SCHEME, previous);
         g_free(previous);
+    } else {
+        g_string_append(out, "<span class=\"spent\">Previous</span>");
     }
-    if (count > 0 && app->viewer_index + 1 < count) {
+    if (placed && app->viewer_index + 1 < count) {
         char *next = escape_markup(g_ptr_array_index(app->page_media, app->viewer_index + 1));
         g_string_append_printf(out, "<a href=\"%s%s\">Next</a>", MEDIA_SCHEME, next);
         g_free(next);
+    } else {
+        g_string_append(out, "<span class=\"spent\">Next</span>");
     }
     g_string_append_printf(out, "<a href=\"%s\">Close</a>", CLOSE_URI);
     g_string_append(out, "</p><p class=\"top\">Escape closes, arrow keys move.</p>"
@@ -729,19 +746,27 @@ static void leave_viewer(App *app)
     set_status(app, "Closed the image");
 }
 
+/* Where this image sits among the page's images. -1 when the page does not
+   offer it, which is not the same as "the first one": answering 0 for an
+   unknown URL is what made Next walk to the second image and stop, because
+   every step after the first resolved back to the start. */
+static int media_index_of(const App *app, const char *url)
+{
+    if (!app->page_media || !url) return -1;
+    for (guint i = 0; i < app->page_media->len; ++i)
+        if (strcmp(g_ptr_array_index(app->page_media, i), url) == 0) return (int)i;
+    return -1;
+}
+
 static void enter_viewer(App *app, const char *url)
 {
     if (!url || !*url) return;
-    int index = 0;
-    if (app->page_media) {
-        for (guint i = 0; i < app->page_media->len; ++i)
-            if (strcmp(g_ptr_array_index(app->page_media, i), url) == 0) { index = (int)i; break; }
-    }
+    /* Re-entrant already: entering the viewer replaces the document that the
+       click being handled came from. */
+    if (app->entering_viewer) return;
+    app->entering_viewer = true;
+    int index = media_index_of(app, url);
     set_status(app, "Fetching the image\xe2\x80\xa6");
-    /* The fetch is synchronous and the first one has real network latency, so
-       the status line says what is happening before the window stops
-       repainting rather than after. */
-    while (gtk_events_pending()) gtk_main_iteration();
 
     char *failure = NULL;
     char *file = fetch_media_file(url, &failure);
@@ -756,6 +781,9 @@ static void enter_viewer(App *app, const char *url)
     if (file) set_status(app, "Escape closes the image");
     else set_status(app, failure ? failure : "The image could not be shown");
     g_free(failure);
+    /* The keys belong to the viewer now, not to the address bar. */
+    gtk_widget_grab_focus(app->event_box);
+    app->entering_viewer = false;
 }
 
 /* Viewer mode must be usable by keyboard alone: that is a requirement of
@@ -764,20 +792,32 @@ static void enter_viewer(App *app, const char *url)
 static void step_viewer(App *app, int delta)
 {
     if (!app->viewer_active || !app->page_media || !app->page_media->len) return;
+    if (app->viewer_index < 0) return;
     int next = app->viewer_index + delta;
     if (next < 0 || next >= (int)app->page_media->len) return;
-    enter_viewer(app, g_ptr_array_index(app->page_media, next));
+    /* enter_viewer replaces page_media's owner only when the page changes, so
+       the entry stays valid for the call -- but copy it anyway rather than
+       depending on that from a distance. */
+    char *target = g_strdup(g_ptr_array_index(app->page_media, next));
+    enter_viewer(app, target);
+    g_free(target);
 }
 
 static gboolean window_key_press(GtkWidget *widget, GdkEventKey *event, gpointer opaque)
 {
     (void)widget;
     App *app = opaque;
-    /* The address bar is a text field; its keys are its own. */
-    if (gtk_widget_has_focus(app->url_entry)) return FALSE;
     if (!app->viewer_active) return FALSE;
+    /* Escape closes wherever the focus is. The address bar keeps the keys it
+       needs -- typing, and the arrows that move the caret -- but Escape means
+       nothing to a text field here, and "the cursor happens to be in the URL
+       bar" is not a reason for the way out of an image to stop working. */
+    if (event->keyval == GDK_KEY_Escape) {
+        leave_viewer(app);
+        return TRUE;
+    }
+    if (gtk_widget_has_focus(app->url_entry)) return FALSE;
     switch (event->keyval) {
-        case GDK_KEY_Escape:
         case GDK_KEY_BackSpace:
             leave_viewer(app);
             return TRUE;
@@ -1456,6 +1496,10 @@ static void app_activate(GtkApplication *application, gpointer opaque)
     g_signal_connect(overlay, "motion-notify-event", G_CALLBACK(overlay_motion_notify), app);
     gtk_container_add(GTK_CONTAINER(scrolled), overlay);
     app->event_box = gtk_event_box_new();
+    /* Focusable so that entering viewer mode can take the keys away from the
+       address bar: an event box cannot hold focus by default, and
+       gtk_widget_grab_focus on a widget that cannot is a no-op. */
+    gtk_widget_set_can_focus(app->event_box, TRUE);
     gtk_event_box_set_visible_window(GTK_EVENT_BOX(app->event_box), FALSE);
     gtk_event_box_set_above_child(GTK_EVENT_BOX(app->event_box), TRUE);
     gtk_widget_set_size_request(app->event_box, PAGE_WIDTH, PAGE_HEIGHT);
@@ -1626,7 +1670,123 @@ static bool write_solid_test_png(const char *path, int width, int height)
     return ok;
 }
 
-/* Viewer mode is mouse-and-eye work that a headless test cannot click, but
+/* The URL behind one of the viewer's navigation links, as a click would
+   resolve it: entity references and all, because the page is HTML and the
+   renderer decodes it before the shell ever sees the href. */
+static char *viewer_nav_target(const char *html, const char *label)
+{
+    char *needle = g_strdup_printf(">%s</a>", label);
+    const char *end = strstr(html, needle);
+    g_free(needle);
+    if (!end) return NULL;
+    const char *open = end;
+    while (open > html && strncmp(open, "<a href=\"", 9) != 0) --open;
+    if (strncmp(open, "<a href=\"", 9) != 0) return NULL;
+    open += 9;
+    const char *close = strchr(open, '"');
+    if (!close || close > end) return NULL;
+    char *raw = g_strndup(open, (size_t)(close - open));
+    char *decoded = NULL;
+    if (g_str_has_prefix(raw, MEDIA_SCHEME)) {
+        /* g_markup escaped it on the way in; undo exactly that much. */
+        char **parts = g_strsplit(raw + strlen(MEDIA_SCHEME), "&amp;", -1);
+        decoded = g_strjoinv("&", parts);
+        g_strfreev(parts);
+    }
+    g_free(raw);
+    return decoded;
+}
+
+/* Walking the page's images was wrong in a way no smoke test would show: an
+   unknown URL resolved to index 0, so every step after the first came back to
+   the start, and Next appearing only once Previous existed moved the control
+   out from under the pointer. Both are index arithmetic over a list, so both
+   can be walked here without a window.
+
+   The walk reads each step's destination out of the page the viewer actually
+   generates, rather than calling the step function directly: that is what a
+   reader clicking Next does, and it is the part that was broken. */
+static bool run_viewer_walk_self_test(void)
+{
+    const char *urls[] = {
+        "https://static.example.test/a/one.png?io=1&width=640",
+        "https://static.example.test/a/two.jpg?io=1&width=640",
+        "https://static.example.test/a/three.webp",
+        "https://static.example.test/a/four.png?q=a&r=b",
+    };
+    const int count = (int)(sizeof(urls) / sizeof(urls[0]));
+    App probe = {0};
+    probe.page_media = g_ptr_array_new_with_free_func(g_free);
+    for (int i = 0; i < count; ++i) g_ptr_array_add(probe.page_media, g_strdup(urls[i]));
+
+    bool ok = true;
+    /* Forwards from the first to the last, one Next at a time. */
+    int at = 0;
+    for (int step = 0; step < count - 1; ++step) {
+        probe.viewer_index = at;
+        char *html = viewer_html(&probe, urls[at], NULL, "no fetch in a self-test");
+        char *target = viewer_nav_target(html, "Next");
+        int resolved = target ? media_index_of(&probe, target) : -1;
+        if (resolved != at + 1) {
+            fprintf(stderr, "viewer walk: Next from %d resolved to %d (%s)\n",
+                    at, resolved, target ? target : "no link");
+            ok = false;
+        }
+        g_free(target);
+        g_free(html);
+        if (resolved < 0) break;
+        at = resolved;
+    }
+    if (at != count - 1) {
+        fprintf(stderr, "viewer walk: reached image %d of %d\n", at + 1, count);
+        ok = false;
+    }
+
+    /* And backwards, which is where "Previous from the last goes to the
+       first" would show up. */
+    for (int step = 0; step < count - 1; ++step) {
+        probe.viewer_index = at;
+        char *html = viewer_html(&probe, urls[at], NULL, "no fetch in a self-test");
+        char *target = viewer_nav_target(html, "Previous");
+        int resolved = target ? media_index_of(&probe, target) : -1;
+        if (resolved != at - 1) {
+            fprintf(stderr, "viewer walk: Previous from %d resolved to %d (%s)\n",
+                    at, resolved, target ? target : "no link");
+            ok = false;
+        }
+        g_free(target);
+        g_free(html);
+        if (resolved < 0) break;
+        at = resolved;
+    }
+    if (at != 0) { fprintf(stderr, "viewer walk: came back to image %d\n", at + 1); ok = false; }
+
+    /* The ends offer no link in that direction, and say so rather than
+       dropping the label and moving the other one. */
+    probe.viewer_index = 0;
+    char *first = viewer_html(&probe, urls[0], NULL, "x");
+    char *back = viewer_nav_target(first, "Previous");
+    if (back) { fprintf(stderr, "viewer walk: the first image offered Previous\n"); ok = false; }
+    if (!strstr(first, ">Previous<")) { fprintf(stderr, "viewer walk: Previous label missing\n"); ok = false; }
+    g_free(back); g_free(first);
+
+    probe.viewer_index = count - 1;
+    char *last = viewer_html(&probe, urls[count - 1], NULL, "x");
+    char *onward = viewer_nav_target(last, "Next");
+    if (onward) { fprintf(stderr, "viewer walk: the last image offered Next\n"); ok = false; }
+    if (!strstr(last, ">Next<")) { fprintf(stderr, "viewer walk: Next label missing\n"); ok = false; }
+    g_free(onward); g_free(last);
+
+    /* An image the page never listed has no position and no neighbours. */
+    if (media_index_of(&probe, "https://static.example.test/a/absent.png") != -1) {
+        fprintf(stderr, "viewer walk: an unlisted image was placed in the list\n");
+        ok = false;
+    }
+    g_ptr_array_free(probe.page_media, TRUE);
+    return ok;
+}
+
+/* Viewer mode is mouse-and-eye work that a headless test cannot click, but/* Viewer mode is mouse-and-eye work that a headless test cannot click, but
    the two decisions behind it are ordinary functions: which destinations are
    the shell's own rather than somewhere to navigate, and what a URL looks like
    once it has been cut down to fit. */
@@ -1697,6 +1857,8 @@ static bool run_media_self_test(void)
     }
     g_free(source);
     g_ptr_array_free(probe.page_media, TRUE);
+
+    ok = run_viewer_walk_self_test() && ok;
     return ok;
 }
 
