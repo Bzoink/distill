@@ -106,6 +106,11 @@ int distill_litehtml_document_render_region(DLiteHtmlDocument *document, int scr
 void *distill_litehtml_document_surface(DLiteHtmlDocument *document);
 size_t distill_litehtml_document_form_boxes(const DLiteHtmlDocument *document,
                                             DFormBox *boxes, size_t box_capacity);
+/* Anchor URL under a document-space point, written to href_out; non-zero when
+   the point is over a link. Answers for inline anchors, which have no box. */
+int distill_litehtml_document_link_at(DLiteHtmlDocument *document, int x, int y,
+                                      char *href_out, size_t href_capacity);
+
 size_t distill_litehtml_document_link_boxes(const DLiteHtmlDocument *document,
                                             DLinkBox *boxes, size_t box_capacity);
 

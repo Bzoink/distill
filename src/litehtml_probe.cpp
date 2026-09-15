@@ -88,7 +88,11 @@ struct Probe final : litehtml::document_container {
     void set_base_url(const char *) override {}
     void link(const std::shared_ptr<litehtml::document> &, const litehtml::element::ptr &) override {}
     void on_anchor_click(const char *, const litehtml::element::ptr &) override {}
-    void set_cursor(const char *) override {}
+    /* litehtml resolves the CSS cursor for whatever is under the pointer, so
+       the hand over a link comes from the stylesheet rather than from us
+       guessing which rectangles are links. */
+    void set_cursor(const char *cursor) override { cursor_name = cursor ? cursor : ""; }
+    std::string cursor_name;
 
     void transform_text(litehtml::string &text, litehtml::text_transform transform) override {
         for (char &character : text) {
@@ -185,6 +189,35 @@ extern "C" void distill_litehtml_document_destroy(DLiteHtmlDocument *document)
     document->probe.reset();
     d_render_destroy(document->renderer);
     delete document;
+}
+
+/* What is under a point, asked of the same laid-out document that was
+   painted. Collected boxes cannot answer this: an inline element has no single
+   placement -- its text lives in one box per line -- so a link inside a
+   sentence, or a headline link, has no rectangle to test against. litehtml
+   knows, because it did the layout. */
+extern "C" int distill_litehtml_document_link_at(DLiteHtmlDocument *document,
+                                                 int x, int y,
+                                                 char *href_out, size_t href_capacity)
+{
+    if (href_out && href_capacity) href_out[0] = '\0';
+    if (!document || !document->document || !document->probe) return 0;
+    litehtml::position::vector redraw;
+    document->probe->cursor_name.clear();
+    document->document->on_mouse_over(x, y, x, y, redraw);
+    litehtml::element::const_ptr over = document->document->get_over_element();
+    for (litehtml::element::const_ptr element = over; element; element = element->parent()) {
+        const char *tag = element->get_tagName();
+        if (!tag || std::strcmp(tag, "a")) continue;
+        const char *href = element->get_attr("href", "");
+        if (!href || !*href) continue;
+        if (href_out && href_capacity) {
+            std::strncpy(href_out, href, href_capacity - 1);
+            href_out[href_capacity - 1] = '\0';
+        }
+        return 1;
+    }
+    return 0;
 }
 
 extern "C" int distill_litehtml_document_content_height(const DLiteHtmlDocument *document)

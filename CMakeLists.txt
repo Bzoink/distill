@@ -18,13 +18,24 @@ pkg_check_modules(DISTILL_RENDER REQUIRED IMPORTED_TARGET freetype2 harfbuzz cai
 pkg_check_modules(DISTILL_GTK IMPORTED_TARGET gtk+-3.0)
 
 enable_testing()
+
+# The unit tests assert with assert(), and a Release build defines NDEBUG,
+# which compiles every one of them away: the binaries contained no
+# __assert_fail at all and reported success whatever they checked. A test that
+# cannot fail is worse than no test, so the test targets keep their assertions
+# regardless of build type.
+function(distill_enable_assertions target)
+    target_compile_options(${target} PRIVATE -UNDEBUG)
+endfunction()
 add_executable(distill-shaper-test tests/shaper_test.c src/shaper.c)
 target_include_directories(distill-shaper-test PRIVATE src)
 target_link_libraries(distill-shaper-test PRIVATE PkgConfig::DISTILL_RENDER)
+distill_enable_assertions(distill-shaper-test)
 add_test(NAME distill-shaper COMMAND distill-shaper-test)
 
 add_executable(distill-app-state-test tests/app_state_test.c src/app_state.c)
 target_include_directories(distill-app-state-test PRIVATE src)
+distill_enable_assertions(distill-app-state-test)
 add_test(NAME distill-app-state COMMAND distill-app-state-test)
 
 add_executable(distill-litehtml-geometry-test tests/litehtml_geometry_test.c src/litehtml_probe.cpp)
@@ -38,6 +49,7 @@ target_link_libraries(distill-litehtml-geometry-test PRIVATE
     gumbo
     distill-render-core
 )
+distill_enable_assertions(distill-litehtml-geometry-test)
 add_test(NAME distill-litehtml-geometry COMMAND distill-litehtml-geometry-test)
 
 add_library(distill-render-core STATIC src/render.c src/shaper.c)

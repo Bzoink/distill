@@ -71,6 +71,7 @@ struct App {
     GtkWidget *theme_combo;
     GtkWidget *status;
     GtkWidget *drawing_area;
+    GtkWidget *event_box;
     GtkWidget *form_layer;
     GtkAdjustment *vertical_adjustment;
     cairo_surface_t *surface;
@@ -484,6 +485,67 @@ static bool point_in_box(double x, double y, int box_x, int box_y, int width, in
 
 static void app_navigate(App *app, const char *uri, const char *method,
                          const char *data, bool replace_current);
+static void open_link(App *app, const char *uri);
+
+/* Ask the laid-out document, not the collected boxes. Only block-level
+   anchors have a placement, so a box list finds headlines that happen to fill
+   their line and misses every link inside a sentence; litehtml did the layout
+   and knows what is under the point either way. The boxes remain for keyboard
+   navigation, which needs an ordered list rather than a point. */
+static bool link_href_at(const App *app, double x, double y, char *href, size_t capacity)
+{
+    if (!app || !app->document) return false;
+    return distill_litehtml_document_link_at(app->document, (int)x, (int)y,
+                                             href, capacity) != 0;
+}
+
+static bool link_present_at(const App *app, double x, double y)
+{
+    char href[sizeof(((DLinkBox *)0)->href)];
+    return link_href_at(app, x, y, href, sizeof(href));
+}
+
+/* An event arrives in the coordinate space of the widget it was delivered to.
+   The scrolled child is allocated the whole document, so its events are
+   already document coordinates; a widget allocated only the viewport is not.
+   Deciding from the allocation rather than assuming removes a guess that was
+   silently wrong for every click below the fold -- and right at the top of the
+   page, where the scroll offset is zero and both readings agree. */
+static double document_y_from(int content_height, int allocation_height,
+                              int scroll, double y)
+{
+    if (content_height > 0 && allocation_height >= content_height) return y;
+    return y + scroll;
+}
+
+static double document_y(const App *app, GtkWidget *widget, double y)
+{
+    if (!app || !widget) return y;
+    int content = app->document
+                      ? distill_litehtml_document_content_height(app->document) : 0;
+    GtkAllocation allocation;
+    gtk_widget_get_allocation(widget, &allocation);
+    return document_y_from(content, allocation.height, visible_scroll_y(app), y);
+}
+
+static gboolean activate_link_at(App *app, double x, double y)
+{
+    char href[sizeof(((DLinkBox *)0)->href)];
+    if (!link_href_at(app, x, y, href, sizeof(href))) return FALSE;
+    open_link(app, href);
+    return TRUE;
+}
+
+static void set_link_cursor(GtkWidget *widget, bool link)
+{
+    GdkWindow *window = gtk_widget_get_window(widget);
+    if (!window) return;
+    GdkCursor *cursor = gdk_cursor_new_for_display(
+        gdk_window_get_display(window), link ? GDK_HAND2 : GDK_LEFT_PTR);
+    if (!cursor) return;
+    gdk_window_set_cursor(window, cursor);
+    g_object_unref(cursor);
+}
 
 static void open_external(App *app, const char *uri)
 {
@@ -517,16 +579,32 @@ static void open_link(App *app, const char *uri)
 
 static gboolean page_button_press(GtkWidget *widget, GdkEventButton *event, gpointer opaque)
 {
-    (void)widget;
     App *app = opaque;
     if (event->type != GDK_BUTTON_PRESS || event->button != 1) return FALSE;
-    for (size_t i = 0; i < app->link_count; ++i) {
-        const DLinkBox *link = &app->link_boxes[i];
-        if (point_in_box(event->x, event->y, link->x, link->y, link->width, link->height)) {
-            open_link(app, link->href);
-            return TRUE;
-        }
-    }
+    return activate_link_at(app, event->x, document_y(app, widget, event->y));
+}
+
+static gboolean page_motion_notify(GtkWidget *widget, GdkEventMotion *event,
+                                   gpointer opaque)
+{
+    App *app = opaque;
+    set_link_cursor(widget, link_present_at(app, event->x, document_y(app, widget, event->y)));
+    return TRUE;
+}
+
+static gboolean overlay_button_press(GtkWidget *widget, GdkEventButton *event,
+                                     gpointer opaque)
+{
+    App *app = opaque;
+    if (event->type != GDK_BUTTON_PRESS || event->button != 1) return FALSE;
+    return activate_link_at(app, event->x, document_y(app, widget, event->y));
+}
+
+static gboolean overlay_motion_notify(GtkWidget *widget, GdkEventMotion *event,
+                                      gpointer opaque)
+{
+    App *app = opaque;
+    set_link_cursor(widget, link_present_at(app, event->x, document_y(app, widget, event->y)));
     return FALSE;
 }
 
@@ -710,6 +788,7 @@ static void load_surface(App *app, const DAppPage *page)
         free(template);
     }
     gtk_widget_set_size_request(app->drawing_area, PAGE_WIDTH, page_height);
+    gtk_widget_set_size_request(app->event_box, PAGE_WIDTH, page_height);
     gtk_widget_set_size_request(app->form_layer, PAGE_WIDTH, page_height);
     if (app->vertical_adjustment) gtk_adjustment_set_value(app->vertical_adjustment, 0.0);
     render_visible_band(app);
@@ -1086,13 +1165,24 @@ static void app_activate(GtkApplication *application, gpointer opaque)
                      G_CALLBACK(scroll_value_changed), app);
     gtk_box_pack_start(GTK_BOX(root), scrolled, TRUE, TRUE, 0);
     GtkWidget *overlay = gtk_overlay_new();
+    gtk_widget_add_events(overlay, GDK_BUTTON_PRESS_MASK | GDK_POINTER_MOTION_MASK |
+                          GDK_LEAVE_NOTIFY_MASK);
+    g_signal_connect(overlay, "button-press-event", G_CALLBACK(overlay_button_press), app);
+    g_signal_connect(overlay, "motion-notify-event", G_CALLBACK(overlay_motion_notify), app);
     gtk_container_add(GTK_CONTAINER(scrolled), overlay);
+    app->event_box = gtk_event_box_new();
+    gtk_event_box_set_visible_window(GTK_EVENT_BOX(app->event_box), FALSE);
+    gtk_event_box_set_above_child(GTK_EVENT_BOX(app->event_box), TRUE);
+    gtk_widget_set_size_request(app->event_box, PAGE_WIDTH, PAGE_HEIGHT);
+    gtk_widget_add_events(app->event_box, GDK_BUTTON_PRESS_MASK | GDK_POINTER_MOTION_MASK |
+                          GDK_LEAVE_NOTIFY_MASK);
+    g_signal_connect(app->event_box, "button-press-event", G_CALLBACK(page_button_press), app);
+    g_signal_connect(app->event_box, "motion-notify-event", G_CALLBACK(page_motion_notify), app);
     app->drawing_area = gtk_drawing_area_new();
     gtk_widget_set_size_request(app->drawing_area, PAGE_WIDTH, PAGE_HEIGHT);
-    gtk_widget_add_events(app->drawing_area, GDK_BUTTON_PRESS_MASK);
     g_signal_connect(app->drawing_area, "draw", G_CALLBACK(draw_page), app);
-    g_signal_connect(app->drawing_area, "button-press-event", G_CALLBACK(page_button_press), app);
-    gtk_container_add(GTK_CONTAINER(overlay), app->drawing_area);
+    gtk_container_add(GTK_CONTAINER(app->event_box), app->drawing_area);
+    gtk_container_add(GTK_CONTAINER(overlay), app->event_box);
     app->form_layer = gtk_fixed_new();
     gtk_widget_set_size_request(app->form_layer, PAGE_WIDTH, PAGE_HEIGHT);
     gtk_overlay_add_overlay(GTK_OVERLAY(overlay), app->form_layer);
@@ -1117,6 +1207,30 @@ static bool expect_resolved(const char *input, const char *expected)
                 input, got ? got : "(nothing)", expected ? expected : "(nothing)");
     }
     g_free(got);
+    return ok;
+}
+
+static bool run_coordinate_self_test(void)
+{
+    /* The link "Matematisk modell kan förklara resultat" sits at document
+       y=1296 on one dn.se front page. Scrolled 400px down, the pointer is at
+       viewport y=896. Reading that as document space and adding the scroll
+       again lands at 1696 -- a different part of the page, which is why every
+       click below the fold missed while clicks at the very top worked. */
+    bool ok = true;
+    if (document_y_from(17664, 17664, 400, 896) != 896) {
+        fprintf(stderr, "coords: scrolled child must already be document space\n");
+        ok = false;
+    }
+    if (document_y_from(17664, 1100, 400, 896) != 1296) {
+        fprintf(stderr, "coords: viewport-sized widget must gain the scroll offset\n");
+        ok = false;
+    }
+    /* At the top of the page both readings agree, which is what hid this. */
+    if (document_y_from(17664, 17664, 0, 300) != document_y_from(17664, 1100, 0, 300)) {
+        fprintf(stderr, "coords: readings must agree at scroll 0\n");
+        ok = false;
+    }
     return ok;
 }
 
@@ -1181,6 +1295,7 @@ static int run_state_self_test(void)
               strcmp(d_app_history_current(&history)->url, "one") == 0 &&
               d_app_history_forward(&history);
     d_app_history_clear(&history, NULL);
+    ok = run_coordinate_self_test() && ok;
     ok = run_address_bar_self_test() && ok;
     ok = run_redirect_self_test() && ok;
     if (ok) puts("app-shell: ok");
