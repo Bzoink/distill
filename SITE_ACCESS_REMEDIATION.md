@@ -195,7 +195,25 @@ report) for every site that ships its content in the initial HTML, which is
 most server-rendered React and Next.js. It helps far beyond the five deferred
 entries, and it cannot be defeated by a site's client-side complexity.
 
-**M5. Bring-your-own-session.** A `--cookie-file` flag reading a Netscape jar
+**M5. Sessions — done for the file itself, open for browser import.**
+A `--session-file PATH` now persists cookies across runs, and the desktop
+shell passes one session to every navigation it spawns, so a login survives
+the next click instead of dying with the process. Gated by
+`27-login-session`, which performs a two-step login with a CSRF token in one
+process and reads the gated page from another.
+
+Two safety decisions were made explicitly rather than by default. The session
+file holds live credentials for every site in it, so it is created `0600` and a
+file others can read is refused with an explanation rather than written to. And
+credentials must not reach `argv`, which is readable from the process table and
+recorded in shell history, so `--request-data-file PATH` (or `-` for stdin)
+reads the body from a private file; the desktop shell uses that path when
+submitting a form, and `--request-data` remains for bodies that are not
+secrets.
+
+What remains of the original M5:
+
+**M5b. Bring-your-own-session.** A `--cookie-file` flag reading a Netscape jar
 exported from the user's own logged-in browser, loaded into the M3 jar.
 This is the user reaching their own authorised sessions, and it is what
 `SITE_ACCESS_REPORT.md` already recommends as the correct follow-up. One

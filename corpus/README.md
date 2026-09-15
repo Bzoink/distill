@@ -107,6 +107,7 @@ exists to test.
 | `24-rtl-arabic` | Right-to-left direction and language metadata; Arabic text preserved | Writing systems |
 | `25-cjk-linebreak` | Japanese and Chinese text with no inter-word spaces | Writing systems |
 | `26-complex-script` | Thai with no word delimiter; Devanagari cluster reordering | Writing systems |
+| `27-login-session` | A login performed in one process and used by another | Sessions |
 
 `00` is the control: it has no scripts, so a failure there is never a binding
 bug. `07` is where a raw-pointer binding over Lexbor's arena-allocated nodes
@@ -133,6 +134,35 @@ easy to write and wrong: the first version of ours matched Airbnb and Product
 Hunt, which serve full pages while naming those vendors, and it would have
 skipped their scripts. `22` is deliberately a small document so that the
 detector's size guard cannot rescue it — only the choice of markers can.
+
+## Sessions
+
+`27-login-session` is the only fixture whose subject is what happens *between*
+runs. Each navigation is a separate engine process, so a session that lives in
+one process is no session at all: sign in, click a link, and you are signed
+out.
+
+The server serves a real two-step login. `GET /login` issues a form cookie and
+a one-time token; `POST /login` is accepted only if the credentials and that
+token arrive together; `/account` returns `SIGNED-IN-AS-corpus` only when a
+valid session cookie is present, and `401 SIGNED-OUT` otherwise. The two steps
+run as separate processes sharing nothing but a `--session-file`, and the
+assertion is simply that the third process reaches the gated page.
+
+The fixture fails without its `session` steps — dropping them yields
+`SIGNED-OUT` — so it tests the mechanism rather than the server.
+
+Two safety properties are deliberately built into the path this gate
+exercises, because they are easy to get wrong and invisible when wrong:
+
+- **Credentials never enter the argument vector.** `argv` is readable from the
+  process table and lands in shell history. The harness writes the POST body to
+  a private file and passes `--request-data-file`; so does the desktop shell
+  when it submits a form. `--request-data` remains for bodies that are not
+  secrets.
+- **The session file is private or refused.** It holds live credentials for
+  every site in it. It is created `0600`, and a run against a file others can
+  read fails with an explanation rather than writing cookies into it.
 
 ## Writing systems
 
@@ -186,6 +216,11 @@ is `08b-charset-lie.html`, deliberately left undecided and ungated. See
   Only `#id` selectors are supported, on purpose: every fixture is written to
   make its assertion unambiguous.
 - `browser_expect` — present only where we deliberately diverge, as above.
+
+A page may carry `session`, a list of requests to perform before the page
+itself, all sharing one private cookie file that is then used for the page.
+Each step takes a `path`, and optionally `method`, `data`, and `expect_exit`.
+Steps run as separate engine processes, which is the property under test.
 
 A page may also carry `expect_exit`, a process status the engine is required to
 report. It defaults to `0`. `21-challenge-shell` sets `4`: a recognised

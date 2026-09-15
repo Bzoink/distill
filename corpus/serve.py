@@ -28,6 +28,15 @@ ROOT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "local")
 # server can still be shut down cleanly.
 HANG_CAP_SECONDS = 120
 
+# Fixed credentials for the login gate. These are corpus fixtures served from
+# localhost and guard nothing; they are not secrets.
+LOGIN_USER = "corpus"
+LOGIN_PASSWORD = "fixture-password"
+LOGIN_TOKEN = "form-token-1"
+FORM_COOKIE = "login_form"
+SESSION_COOKIE = "corpus_session"
+SESSION_VALUE = "session-ok"
+
 
 class CorpusHandler(SimpleHTTPRequestHandler):
     quiet = False
@@ -40,6 +49,50 @@ class CorpusHandler(SimpleHTTPRequestHandler):
 
         if route.path == "/network-contract":
             self._request_contract("")
+            return
+
+        if route.path == "/login":
+            # The form carries a one-time token and sets the cookie that the
+            # POST must send back with it.
+            page = (
+                "<!doctype html><meta charset=\"utf-8\"><title>Sign in</title>"
+                "<form method=\"post\" action=\"/login\">"
+                f"<input type=\"hidden\" name=\"token\" value=\"{LOGIN_TOKEN}\">"
+                "<label for=\"user\">User</label><input id=\"user\" name=\"user\">"
+                "<label for=\"password\">Password</label>"
+                "<input id=\"password\" name=\"password\" type=\"password\">"
+                "<button type=\"submit\">Sign in</button></form>"
+                "<p id=\"content\">LOGIN-FORM</p>"
+            ).encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("Set-Cookie", f"{FORM_COOKIE}={LOGIN_TOKEN}; Path=/")
+            self.send_header("Content-Length", str(len(page)))
+            self.end_headers()
+            self.wfile.write(page)
+            return
+
+        if route.path == "/account":
+            cookies = self.headers.get("Cookie", "")
+            signed_in = f"{SESSION_COOKIE}={SESSION_VALUE}" in cookies
+            body = (
+                "<!doctype html><meta charset=\"utf-8\"><title>Account</title><main>"
+                "<h1>Account</h1>"
+                + (f"<p id=\"content\">SIGNED-IN-AS-{LOGIN_USER}</p>"
+                   "<p>The session cookie sent with this request was issued to a "
+                   "different process. Reaching this page at all is the assertion: "
+                   "it means the login outlived the run that performed it.</p>"
+                   if signed_in else
+                   "<p id=\"content\">SIGNED-OUT</p>"
+                   "<p>No valid session cookie accompanied this request.</p>")
+                + "</main>"
+            ).encode("utf-8")
+            self.send_response(200 if signed_in else 401)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("Content-Length", str(len(body)))
+            self.send_header("Cache-Control", "no-store")
+            self.end_headers()
+            self.wfile.write(body)
             return
 
         if route.path == "/network-redirect":
@@ -82,6 +135,34 @@ class CorpusHandler(SimpleHTTPRequestHandler):
 
     def do_POST(self):
         route = urlparse(self.path)
+        if route.path == "/login":
+            try:
+                length = max(0, int(self.headers.get("Content-Length", "0")))
+            except ValueError:
+                length = 0
+            body = self.rfile.read(length).decode("utf-8", errors="replace")
+            fields = parse_qs(body)
+            user = (fields.get("user") or [""])[0]
+            password = (fields.get("password") or [""])[0]
+            token = (fields.get("token") or [""])[0]
+            # The token ties the POST to the GET that issued the form, which is
+            # the reason a login needs cookies to survive between two requests
+            # at all: the pair only validates together.
+            if user == LOGIN_USER and password == LOGIN_PASSWORD and token == LOGIN_TOKEN:
+                self.send_response(303)
+                self.send_header("Location", "/account")
+                self.send_header("Set-Cookie",
+                                 f"{SESSION_COOKIE}={SESSION_VALUE}; Path=/; HttpOnly")
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+            else:
+                self.send_response(403)
+                self.send_header("Content-Type", "text/html; charset=utf-8")
+                page = b"<!doctype html><title>Denied</title><p id=\"content\">LOGIN-REJECTED</p>"
+                self.send_header("Content-Length", str(len(page)))
+                self.end_headers()
+                self.wfile.write(page)
+            return
         if route.path == "/network-contract":
             try:
                 length = max(0, int(self.headers.get("Content-Length", "0")))

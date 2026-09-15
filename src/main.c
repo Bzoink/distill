@@ -130,6 +130,7 @@ struct Engine {
     char *source_url;
     char *base_url;
     char *cookie_jar_path;
+    bool cookie_jar_persistent;
     char *script_cookies;
     uint64_t started;
     uint64_t cap_ms;
@@ -436,8 +437,13 @@ static void configure_curl_common(Engine *engine, CURL *easy, const char *refere
 {
     curl_easy_setopt(easy, CURLOPT_SHARE, engine->share);
     /* An empty COOKIEFILE enables libcurl's in-memory cookie engine. The
-       share handle makes it common to the main request and all subresources. */
-    curl_easy_setopt(easy, CURLOPT_COOKIEFILE, "");
+       share handle makes it common to the main request and all subresources.
+       A session file is named instead, so cookies written by an earlier run
+       are read back in -- which is what lets a login survive to the next
+       navigation. */
+    curl_easy_setopt(easy, CURLOPT_COOKIEFILE,
+                     engine->cookie_jar_persistent && engine->cookie_jar_path
+                         ? engine->cookie_jar_path : "");
     if (engine->cookie_jar_path) {
         curl_easy_setopt(easy, CURLOPT_COOKIEJAR, engine->cookie_jar_path);
     }
@@ -2481,28 +2487,81 @@ static void engine_cleanup(Engine *engine)
         JS_FreeContext(engine->context);
     }
     if (engine->runtime) JS_FreeRuntime(engine->runtime);
+    /* Cookies live in the share, not in any one easy handle, so closing the
+       request handles does not reliably write them out. Flush explicitly,
+       while the share is still alive, or a login is lost at exit. */
+    if (engine->cookie_jar_persistent && engine->cookie_jar_path && engine->share) {
+        CURL *flush = curl_easy_init();
+        if (flush) {
+            curl_easy_setopt(flush, CURLOPT_SHARE, engine->share);
+            /* Read before writing: a run that set no cookies must not
+               truncate a session file that already holds some. */
+            curl_easy_setopt(flush, CURLOPT_COOKIEFILE, engine->cookie_jar_path);
+            curl_easy_setopt(flush, CURLOPT_COOKIEJAR, engine->cookie_jar_path);
+            curl_easy_setopt(flush, CURLOPT_COOKIELIST, "FLUSH");
+            curl_easy_cleanup(flush);
+        }
+    }
     if (engine->multi) curl_multi_cleanup(engine->multi);
     if (engine->share) curl_share_cleanup(engine->share);
-    if (engine->cookie_jar_path) unlink(engine->cookie_jar_path);
+    /* A per-run jar is scratch and is removed. A session file belongs to the
+       user and is theirs to delete. */
+    if (engine->cookie_jar_path && !engine->cookie_jar_persistent) unlink(engine->cookie_jar_path);
     free(engine->cookie_jar_path);
     free(engine->script_cookies);
     free(engine->source_url); free(engine->base_url);
     *engine = (Engine){0};
 }
 
-static bool init_network(Engine *engine)
+/* A session file holds live credentials: anything able to read it can act as
+   the user on every site in it. It is created private and refused if it is
+   not, rather than silently writing cookies into a file others can read. */
+static bool prepare_session_file(Engine *engine, const char *path)
 {
-    char cookie_template[] = "/tmp/distill-cookies-XXXXXX";
-    int cookie_fd = mkstemp(cookie_template);
-    if (cookie_fd < 0) return false;
-    close(cookie_fd);
-    engine->cookie_jar_path = d_strdup(cookie_template);
+    struct stat info;
+    if (stat(path, &info) == 0) {
+        if (!S_ISREG(info.st_mode)) {
+            fprintf(stderr, "session file %s is not a regular file\n", path);
+            return false;
+        }
+        if (info.st_mode & (S_IRWXG | S_IRWXO)) {
+            fprintf(stderr,
+                    "refusing session file %s: mode %04o is accessible to other users; "
+                    "run chmod 600 on it\n",
+                    path, (unsigned)(info.st_mode & 07777));
+            return false;
+        }
+    } else {
+        int fd = open(path, O_WRONLY | O_CREAT | O_EXCL, S_IRUSR | S_IWUSR);
+        if (fd < 0) {
+            fprintf(stderr, "unable to create session file %s: %s\n", path, strerror(errno));
+            return false;
+        }
+        close(fd);
+    }
+    engine->cookie_jar_path = d_strdup(path);
+    engine->cookie_jar_persistent = true;
+    return true;
+}
+
+static bool init_network(Engine *engine, const char *session_file)
+{
+    if (session_file && *session_file) {
+        if (!prepare_session_file(engine, session_file)) return false;
+    } else {
+        char cookie_template[] = "/tmp/distill-cookies-XXXXXX";
+        int cookie_fd = mkstemp(cookie_template);
+        if (cookie_fd < 0) return false;
+        close(cookie_fd);
+        engine->cookie_jar_path = d_strdup(cookie_template);
+        engine->cookie_jar_persistent = false;
+    }
     engine->share = curl_share_init();
     if (!engine->share ||
         curl_share_setopt(engine->share, CURLSHOPT_SHARE, CURL_LOCK_DATA_COOKIE) != CURLSHE_OK) {
         if (engine->share) curl_share_cleanup(engine->share);
         engine->share = NULL;
-        unlink(engine->cookie_jar_path);
+        if (!engine->cookie_jar_persistent) unlink(engine->cookie_jar_path);
         free(engine->cookie_jar_path);
         engine->cookie_jar_path = NULL;
         return false;
@@ -2511,7 +2570,7 @@ static bool init_network(Engine *engine)
     if (!engine->multi) {
         curl_share_cleanup(engine->share);
         engine->share = NULL;
-        unlink(engine->cookie_jar_path);
+        if (!engine->cookie_jar_persistent) unlink(engine->cookie_jar_path);
         free(engine->cookie_jar_path);
         engine->cookie_jar_path = NULL;
         return false;
@@ -2541,7 +2600,7 @@ static int run_page(const char *input, uint64_t cap_ms, uint64_t memory_mb,
                     const char *save_media_path, int render_width, int render_height,
                     const char *font_dir, const char *template_path,
                     const char *theme, const char *request_method,
-                    const char *request_data)
+                    const char *request_data, const char *session_file)
 {
     Engine engine = {0};
 #ifdef DISTILL_RENDER
@@ -2557,7 +2616,7 @@ static int run_page(const char *input, uint64_t cap_ms, uint64_t memory_mb,
     engine.source_url = absolute_input(input);
     engine.base_url = d_strdup(engine.source_url);
     engine.started = clock_ms();
-    if (!init_network(&engine)) {
+    if (!init_network(&engine, session_file)) {
         fprintf(stderr, "unable to initialize network state\n");
 #ifdef DISTILL_RENDER
         free(owned_font_dir);
@@ -2728,7 +2787,36 @@ static int run_page(const char *input, uint64_t cap_ms, uint64_t memory_mb,
 
 static void usage(const char *program)
 {
-    fprintf(stderr, "usage: %s --url URL [--dump-dom|--extract|--render FILE|--template FILE|--viewer FILE] [--media-index N] [--save-media FILE] [--width N] [--height N] [--font-dir DIR] [--theme warm|night|paper] [--request-method GET|POST] [--request-data DATA] [--script-cap-ms N] [--memory-limit-mb N] [--max-scripts N]\n", program);
+    fprintf(stderr, "usage: %s --url URL [--dump-dom|--extract|--render FILE|--template FILE|--viewer FILE] [--media-index N] [--save-media FILE] [--width N] [--height N] [--font-dir DIR] [--theme warm|night|paper] [--request-method GET|POST] [--request-data DATA|--request-data-file FILE|-] [--session-file FILE] [--script-cap-ms N] [--memory-limit-mb N] [--max-scripts N]\n", program);
+    fprintf(stderr, "  --session-file FILE   keep cookies across runs, so a login survives the next navigation.\n");
+    fprintf(stderr, "                        Created mode 600 and refused if others can read it.\n");
+    fprintf(stderr, "  --request-data-file F read the POST body from a file, or from stdin when F is \"-\".\n");
+    fprintf(stderr, "                        Prefer this for credentials: --request-data puts them in argv,\n");
+    fprintf(stderr, "                        which is visible in the process table and in shell history.\n");
+}
+
+/* A request body carrying a password must not reach argv: the command line is
+   visible in the process table and lands in shell history. It is read from a
+   file, or from stdin when the path is "-". */
+static char *read_request_body(const char *path)
+{
+    if (d_eq(path, "-")) {
+        DBuffer body; dbuf_init(&body);
+        char chunk[4096];
+        size_t got;
+        while ((got = fread(chunk, 1, sizeof(chunk), stdin)) > 0) dbuf_append(&body, chunk, got);
+        dbuf_append(&body, "", 1);
+        return dbuf_take(&body);
+    }
+    size_t length = 0;
+    char *data = d_read_file(path, &length);
+    if (!data) {
+        fprintf(stderr, "unable to read request body from %s: %s\n", path, strerror(errno));
+        return NULL;
+    }
+    /* A trailing newline from an editor or a heredoc is not part of the body. */
+    while (length && (data[length - 1] == '\n' || data[length - 1] == '\r')) data[--length] = '\0';
+    return data;
 }
 
 int main(int argc, char **argv)
@@ -2742,6 +2830,9 @@ int main(int argc, char **argv)
     const char *theme = "warm";
     const char *request_method = NULL;
     const char *request_data = NULL;
+    const char *request_data_file = NULL;
+    const char *session_file = NULL;
+    char *owned_request_data = NULL;
     uint64_t cap_ms = 5000, memory_mb = 128, max_scripts = 1000;
     int render_width = 760, render_height = 1100;
     int media_index = 0;
@@ -2761,25 +2852,42 @@ int main(int argc, char **argv)
         else if (d_eq(argv[i], "--theme") && i + 1 < argc) theme = argv[++i];
         else if (d_eq(argv[i], "--request-method") && i + 1 < argc) request_method = argv[++i];
         else if (d_eq(argv[i], "--request-data") && i + 1 < argc) request_data = argv[++i];
+        else if (d_eq(argv[i], "--request-data-file") && i + 1 < argc) request_data_file = argv[++i];
+        else if (d_eq(argv[i], "--session-file") && i + 1 < argc) session_file = argv[++i];
         else if (d_eq(argv[i], "--script-cap-ms") && i + 1 < argc) cap_ms = strtoull(argv[++i], NULL, 10);
         else if (d_eq(argv[i], "--memory-limit-mb") && i + 1 < argc) memory_mb = strtoull(argv[++i], NULL, 10);
         else if (d_eq(argv[i], "--max-scripts") && i + 1 < argc) max_scripts = strtoull(argv[++i], NULL, 10);
         else if (d_eq(argv[i], "--help") || d_eq(argv[i], "-h")) { usage(argv[0]); return 0; }
+    }
+    if (request_data && request_data_file) {
+        fprintf(stderr, "use --request-data or --request-data-file, not both\n");
+        return 2;
     }
     if (!url || !*url || (dump_dom && (extract || render_path || template_path || viewer_path)) ||
         (extract && (render_path || template_path || viewer_path)) ||
         (template_path && viewer_path) || (render_path && viewer_path) ||
         (save_media_path && !viewer_path) || media_index < 0 ||
         render_width <= 0 || render_height <= 0 ||
-        (request_data && (!request_method || !d_ieq(request_method, "post"))) ||
+        ((request_data || request_data_file) && (!request_method || !d_ieq(request_method, "post"))) ||
         (request_method && !d_ieq(request_method, "get") && !d_ieq(request_method, "post"))) {
         usage(argv[0]); return 2;
+    }
+    if (request_data_file) {
+        owned_request_data = read_request_body(request_data_file);
+        if (!owned_request_data) return 2;
+        request_data = owned_request_data;
     }
     curl_global_init(CURL_GLOBAL_DEFAULT);
     int result = run_page(url, cap_ms, memory_mb, max_scripts, dump_dom, extract,
                           render_path, viewer_path, media_index, save_media_path,
                           render_width, render_height, font_dir, template_path, theme,
-                          request_method, request_data);
+                          request_method, request_data, session_file);
     curl_global_cleanup();
+    /* The body may hold a password; do not leave it in freed-but-readable
+       heap longer than necessary. */
+    if (owned_request_data) {
+        memset(owned_request_data, 0, strlen(owned_request_data));
+        free(owned_request_data);
+    }
     return result;
 }

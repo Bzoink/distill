@@ -28,6 +28,7 @@ import shutil
 import socket
 import subprocess
 import sys
+import tempfile
 import time
 import urllib.error
 import urllib.request
@@ -162,7 +163,42 @@ def dump_dom(browser, url, budget_ms, timeout_s):
     return r.stdout, None
 
 
-def dump_engine(engine, url, cap_ms, timeout_s, expect_exit=0):
+def run_session_steps(engine, base, steps, session_path, cap_ms, timeout_s):
+    """Perform a page's session prerequisites against one cookie file.
+
+    A login is two requests that only validate together: the GET that issues
+    the form and cookie, then the POST that returns them. Running them as
+    separate processes sharing only the session file is the point -- it is
+    what proves the session outlived the run that created it.
+    """
+    for step in steps:
+        cmd = [engine, "--url", base + step["path"], "--dump-dom",
+               "--script-cap-ms", str(cap_ms), "--session-file", session_path]
+        body_path = None
+        if step.get("method"):
+            cmd += ["--request-method", step["method"]]
+        if step.get("data") is not None:
+            # Credentials go through a private file, never the argument
+            # vector, which is exactly what the engine flag exists for.
+            handle, body_path = tempfile.mkstemp(prefix="corpus-body-")
+            with os.fdopen(handle, "w") as fh:
+                fh.write(step["data"])
+            os.chmod(body_path, 0o600)
+            cmd += ["--request-data-file", body_path]
+        try:
+            r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout_s)
+        except subprocess.TimeoutExpired:
+            return f"session step {step['path']} timed out after {timeout_s}s"
+        finally:
+            if body_path:
+                os.unlink(body_path)
+        if r.returncode != step.get("expect_exit", 0):
+            return (f"session step {step['path']} exit {r.returncode}, "
+                    f"expected {step.get('expect_exit', 0)}: {r.stderr.strip()[:200]}")
+    return None
+
+
+def dump_engine(engine, url, cap_ms, timeout_s, expect_exit=0, session_path=None):
     """Post-JS DOM from the Phase 0 engine, or (None, reason).
 
     A page may declare a non-zero expected status: a recognised bot challenge
@@ -172,6 +208,8 @@ def dump_engine(engine, url, cap_ms, timeout_s, expect_exit=0):
     cmd = [
         engine, "--url", url, "--dump-dom", "--script-cap-ms", str(cap_ms),
     ]
+    if session_path:
+        cmd += ["--session-file", session_path]
     try:
         r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout_s)
     except subprocess.TimeoutExpired:
@@ -466,6 +504,15 @@ def main():
         for page in pages:
             url = f"http://127.0.0.1:{port}/{page['path']}"
             t0 = time.time()
+            session_path = None
+            session_error = None
+            if page.get("session"):
+                handle, session_path = tempfile.mkstemp(prefix="corpus-session-")
+                os.close(handle)
+                os.chmod(session_path, 0o600)
+                session_error = run_session_steps(
+                    engine, f"http://127.0.0.1:{port}", page["session"],
+                    session_path, manifest.get("settle_cap_ms", 5000), args.timeout)
             if args.render:
                 output_path = os.path.join(args.render, page["id"] + ".png")
                 render_info, err = render_page(engine, url, output_path,
@@ -492,8 +539,13 @@ def main():
                 extraction = None
             else:
                 html, err = dump_engine(engine, url, manifest.get("settle_cap_ms", 5000),
-                                        args.timeout, page.get("expect_exit", 0))
+                                        args.timeout, page.get("expect_exit", 0),
+                                        session_path)
                 extraction = None
+            if session_error:
+                err = session_error
+            if session_path:
+                os.unlink(session_path)
             elapsed = time.time() - t0
 
             print(f"{page['id']}  {DIM}{page['plan_section']}{RESET}")

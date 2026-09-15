@@ -610,6 +610,22 @@
         {"stage": "extract", "path": "readability.textContent", "expect": "เว็บเบราว์เซอร์"},
         {"stage": "extract", "path": "readability.textContent", "expect": "वेब ब्राउज़र"}
       ]
+    },
+    {
+      "id": "27-login-session",
+      "path": "account",
+      "gate": true,
+      "plan_section": "Sessions",
+      "exercises": ["session-file", "login", "csrf-token", "cross-run-cookies"],
+      "why": "A login is two requests that only validate together: the GET that issues the form cookie and token, then the POST that returns both. Each navigation is a separate engine process, so without a session file the two halves never meet and a signed-in user is signed out by their next click. The steps below run as separate processes sharing only the cookie file; reaching the gated page at all is the assertion.",
+      "session": [
+        {"path": "/login"},
+        {"path": "/login", "method": "POST", "data": "user=corpus&password=fixture-password&token=form-token-1"}
+      ],
+      "assertions": [
+        {"stage": "dom", "selector": "#content", "expect": "SIGNED-IN-AS-corpus"},
+        {"stage": "dom", "selector": "#content", "expect_absent": ["SIGNED-OUT", "LOGIN-REJECTED"]}
+      ]
     }
   ],
   "live": [

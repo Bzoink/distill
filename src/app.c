@@ -14,6 +14,7 @@
 #include <string.h>
 #include <strings.h>
 #include <sys/types.h>
+#include <sys/stat.h>
 #include <unistd.h>
 
 #ifndef DISTILL_ENGINE_PATH
@@ -194,6 +195,77 @@ static void add_arg(GPtrArray *arguments, const char *value)
     g_ptr_array_add(arguments, g_strdup(value ? value : ""));
 }
 
+/* One session for the life of the window. Each navigation is a separate
+   engine process, so without a shared cookie file a user who signs in is
+   signed out again by their next click. */
+static char *session_file = NULL;
+
+static const char *session_file_path(void)
+{
+    if (session_file) return session_file;
+    GError *error = NULL;
+    char *path = NULL;
+    int descriptor = g_file_open_tmp("distill-session-XXXXXX", &path, &error);
+    if (descriptor < 0) {
+        if (error) {
+            g_warning("session file: %s", error->message);
+            g_error_free(error);
+        }
+        return NULL;
+    }
+    /* g_file_open_tmp already creates the file 0600; make that explicit
+       because the file holds live session cookies. */
+    if (fchmod(descriptor, S_IRUSR | S_IWUSR) != 0) {
+        close(descriptor);
+        unlink(path);
+        g_free(path);
+        return NULL;
+    }
+    close(descriptor);
+    session_file = path;
+    return session_file;
+}
+
+static void session_file_discard(void)
+{
+    if (!session_file) return;
+    unlink(session_file);
+    g_free(session_file);
+    session_file = NULL;
+}
+
+/* A submitted form may carry a password. Writing it to a private file keeps
+   it out of the argument vector, which is readable from the process table and
+   is the one place a credential must never appear. */
+static char *write_private_body(const char *data)
+{
+    GError *error = NULL;
+    char *path = NULL;
+    int descriptor = g_file_open_tmp("distill-body-XXXXXX", &path, &error);
+    if (descriptor < 0) {
+        if (error) {
+            g_warning("request body file: %s", error->message);
+            g_error_free(error);
+        }
+        return NULL;
+    }
+    size_t length = strlen(data);
+    bool ok = fchmod(descriptor, S_IRUSR | S_IWUSR) == 0;
+    while (ok && length) {
+        ssize_t written = write(descriptor, data, length);
+        if (written <= 0) { ok = false; break; }
+        data += written;
+        length -= (size_t)written;
+    }
+    close(descriptor);
+    if (!ok) {
+        unlink(path);
+        g_free(path);
+        return NULL;
+    }
+    return path;
+}
+
 static bool run_engine(const LoadRequest *request, const char *png_path,
                        const char *template_path, char **error_message)
 {
@@ -221,9 +293,22 @@ static bool run_engine(const LoadRequest *request, const char *png_path,
         add_arg(arguments, "--request-method");
         add_arg(arguments, request->method);
     }
+    char *body_path = NULL;
     if (request->data && *request->data) {
-        add_arg(arguments, "--request-data");
-        add_arg(arguments, request->data);
+        body_path = write_private_body(request->data);
+        if (!body_path) {
+            g_ptr_array_free(arguments, TRUE);
+            g_free(engine);
+            if (error_message) *error_message = g_strdup("unable to stage the request body");
+            return false;
+        }
+        add_arg(arguments, "--request-data-file");
+        add_arg(arguments, body_path);
+    }
+    const char *session = session_file_path();
+    if (session) {
+        add_arg(arguments, "--session-file");
+        add_arg(arguments, session);
     }
     add_arg(arguments, "--script-cap-ms");
     add_arg(arguments, "5000");
@@ -236,6 +321,10 @@ static bool run_engine(const LoadRequest *request, const char *png_path,
     gboolean spawned = g_spawn_sync(NULL, (char **)arguments->pdata, NULL,
                                     G_SPAWN_SEARCH_PATH, NULL, NULL, &stdout_text,
                                     &stderr_text, &wait_status, &error);
+    if (body_path) {
+        unlink(body_path);
+        g_free(body_path);
+    }
     bool ok = spawned && g_spawn_check_wait_status(wait_status, &error);
     if (!ok && error_message) {
         const char *message = error ? error->message : (stderr_text ? stderr_text : "engine failed");
@@ -874,5 +963,6 @@ int main(int argc, char **argv)
     g_signal_connect(application, "activate", G_CALLBACK(app_activate), (gpointer)initial_url);
     int result = g_application_run(G_APPLICATION(application), 0, NULL);
     g_object_unref(application);
+    session_file_discard();
     return result;
 }

@@ -382,7 +382,7 @@ Distill is a C23-rooted, content-first browser-like pipeline:
 | JavaScript | Embedded QuickJS-ng, with resource limits and a settle policy for timers, microtasks, requests, and script execution |
 | Page DOM | A LinkeDOM-compatible JavaScript DOM surface runs page scripts inside QuickJS; the settled result is serialized for native extraction |
 | Native parsing/extraction | Lexbor parses the settled HTML and provides native traversal; Readability.js is run as the article extractor, alongside structured blocks, tables, search results, forms, video metadata, media references, and links |
-| Networking | libcurl with per-run shared cookies, request/response headers, negotiated HTTP/2, bounded redirects, GET/POST, and the page/subresource bridge |
+| Networking | libcurl with shared cookies, an optional persistent session file, request/response headers, negotiated HTTP/2, bounded redirects, GET/POST with the body read from a private file, and the page/subresource bridge |
 | Reader layout | litehtml lays out Distill's own reader template rather than arbitrary source-site CSS |
 | Font/render path | FreeType for glyph metrics/rasterization, HarfBuzz for shaping, libunibreak for line-break opportunities, and Cairo for desktop PNG/surface painting |
 | Desktop shell | GTK3 with a Cairo reader surface and native GTK form widgets positioned from litehtml geometry |
@@ -393,6 +393,39 @@ External source dependencies are downloaded and built below `external/`, which
 is gitignored. The build uses the external prefix for components such as
 QuickJS-ng, Lexbor, litehtml, and Gumbo, while system/pkg-config dependencies
 provide libcurl, GTK3, Cairo, FreeType, HarfBuzz, and libunibreak.
+
+## Sessions and signing in
+
+Every ingredient of a login already worked except the one that made it useful.
+The POST was correct, `Set-Cookie` was honoured, and the desktop shell
+rendered and submitted forms — but the cookie jar was a temporary file created
+per run and deleted at exit, so the session died with the process. Because the
+shell spawns an engine process per navigation, that meant a user could sign in
+successfully and be signed out by their next click.
+
+A login is also two requests that only validate together: the GET that issues
+the form cookie and CSRF token, then the POST that returns both. Those were
+always two processes, so the halves never met.
+
+`--session-file PATH` now persists cookies across runs, and the shell passes
+one session to every navigation it spawns. Gate `27-login-session` performs
+the two-step login in separate processes and asserts that a third reaches the
+gated page; removing its session steps yields `SIGNED-OUT`.
+
+Two safety properties are part of the feature rather than additions to it:
+
+- The session file holds live credentials for every site in it, so it is
+  created `0600`, and a file that others can read is refused with an
+  explanation instead of being written to.
+- Credentials must never reach `argv`, which is readable from the process
+  table and recorded in shell history. `--request-data-file PATH` — or `-` for
+  stdin — reads the body from a private file, and the desktop shell uses that
+  path when submitting a form. `--request-data` remains for bodies that are
+  not secrets.
+
+This is session persistence, not credential management. Distill stores no
+passwords, and importing a browser's existing cookie jar — the route to sites
+whose sign-in cannot be scripted — remains future work.
 
 ## Intentional scope limits that explain the results
 
