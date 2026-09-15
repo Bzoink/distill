@@ -11,6 +11,7 @@ extern "C" {
 
 typedef struct DRenderContext DRenderContext;
 typedef struct DRenderFont DRenderFont;
+typedef struct DLiteHtmlDocument DLiteHtmlDocument;
 
 typedef struct {
     uint8_t red;
@@ -66,6 +67,8 @@ typedef struct {
 DRenderContext *d_render_create(int width, int height, const char *font_dir);
 void d_render_destroy(DRenderContext *context);
 int d_render_write_png(DRenderContext *context, const char *path);
+void d_render_clear(DRenderContext *context);
+void *d_render_surface(DRenderContext *context);
 
 DRenderFont *d_render_font_create(DRenderContext *context, const char *face_name,
                                   int size, int weight, bool italic,
@@ -91,6 +94,26 @@ void d_render_del_clip(DRenderContext *context);
 /* Laid-out height of the document at this width, or 0 if it cannot be laid
    out. Passing height <= 0 to distill_litehtml_render uses this, bounded. */
 int distill_litehtml_content_height(const char *html, int width, const char *font_dir);
+
+/* A laid-out reader document and the fixed-size paint surface used to draw
+   visible bands from it. The document owns the returned surface. */
+DLiteHtmlDocument *distill_litehtml_document_create(const char *html, int width,
+                                                     int surface_height,
+                                                     const char *font_dir);
+void distill_litehtml_document_destroy(DLiteHtmlDocument *document);
+int distill_litehtml_document_content_height(const DLiteHtmlDocument *document);
+int distill_litehtml_document_render_region(DLiteHtmlDocument *document, int scroll_y);
+void *distill_litehtml_document_surface(DLiteHtmlDocument *document);
+size_t distill_litehtml_document_form_boxes(const DLiteHtmlDocument *document,
+                                            DFormBox *boxes, size_t box_capacity);
+size_t distill_litehtml_document_link_boxes(const DLiteHtmlDocument *document,
+                                            DLinkBox *boxes, size_t box_capacity);
+
+/* One-shot region rendering for callers that do not need to retain a
+   document between paints. */
+int distill_litehtml_render_region(const char *html, const char *output_path,
+                                   int width, int viewport, int scroll_y,
+                                   const char *font_dir);
 
 size_t distill_litehtml_form_boxes(const char *html, int width, int height,
                                    const char *font_dir, DFormBox *boxes,

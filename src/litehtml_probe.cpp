@@ -136,11 +136,77 @@ struct Probe final : litehtml::document_container {
 
 }
 
+struct DLiteHtmlDocument {
+    DRenderContext *renderer = nullptr;
+    std::unique_ptr<Probe> probe;
+    std::shared_ptr<litehtml::document> document;
+    int width = 0;
+    int surface_height = 0;
+    int content_height = 0;
+};
+
 extern "C" int distill_litehtml_probe(const char *html)
 {
     Probe probe(nullptr);
     std::shared_ptr<litehtml::document> document = litehtml::document::createFromString(html ? html : "", &probe);
     return document ? 1 : 0;
+}
+
+extern "C" DLiteHtmlDocument *distill_litehtml_document_create(const char *html,
+                                                                  int width,
+                                                                  int surface_height,
+                                                                  const char *font_dir)
+{
+    if (!html || width <= 0 || surface_height <= 0) return nullptr;
+    std::unique_ptr<DLiteHtmlDocument> result(new DLiteHtmlDocument);
+    result->renderer = d_render_create(width, surface_height, font_dir);
+    if (!result->renderer) return nullptr;
+    result->width = width;
+    result->surface_height = surface_height;
+    result->probe = std::make_unique<Probe>(result->renderer);
+    result->probe->width = width;
+    result->probe->height = surface_height;
+    result->document = litehtml::document::createFromString(html, result->probe.get());
+    if (!result->document) {
+        result->probe.reset();
+        d_render_destroy(result->renderer);
+        result->renderer = nullptr;
+        return nullptr;
+    }
+    result->document->render(width, litehtml::render_all);
+    result->content_height = result->document->height();
+    return result.release();
+}
+
+extern "C" void distill_litehtml_document_destroy(DLiteHtmlDocument *document)
+{
+    if (!document) return;
+    document->document.reset();
+    document->probe.reset();
+    d_render_destroy(document->renderer);
+    delete document;
+}
+
+extern "C" int distill_litehtml_document_content_height(const DLiteHtmlDocument *document)
+{
+    return document ? document->content_height : 0;
+}
+
+extern "C" int distill_litehtml_document_render_region(DLiteHtmlDocument *document,
+                                                          int scroll_y)
+{
+    if (!document || !document->document || !document->renderer) return 0;
+    if (scroll_y < 0) scroll_y = 0;
+    d_render_clear(document->renderer);
+    litehtml::position clip(0, 0, document->width, document->surface_height);
+    document->document->draw(reinterpret_cast<litehtml::uint_ptr>(document->renderer),
+                             0, -scroll_y, &clip);
+    return 1;
+}
+
+extern "C" void *distill_litehtml_document_surface(DLiteHtmlDocument *document)
+{
+    return document ? d_render_surface(document->renderer) : nullptr;
 }
 
 /* How tall the document becomes at this width. A reader page is as long as
@@ -149,23 +215,10 @@ extern "C" int distill_litehtml_probe(const char *html)
 extern "C" int distill_litehtml_content_height(const char *html, int width,
                                                const char *font_dir)
 {
-    if (!html || width <= 0) return 0;
-    /* Lay out against a nominal surface; only the resulting height is wanted. */
-    DRenderContext *renderer = d_render_create(width, 16, font_dir);
-    if (!renderer) return 0;
-    Probe probe(renderer);
-    probe.width = width;
-    probe.height = 16;
-    int measured = 0;
-    {
-        std::shared_ptr<litehtml::document> document =
-            litehtml::document::createFromString(html, &probe);
-        if (document) {
-            document->render(width, litehtml::render_all);
-            measured = document->height();
-        }
-    }
-    d_render_destroy(renderer);
+    DLiteHtmlDocument *document = distill_litehtml_document_create(html, width, 1, font_dir);
+    if (!document) return 0;
+    int measured = distill_litehtml_document_content_height(document);
+    distill_litehtml_document_destroy(document);
     return measured;
 }
 
@@ -181,24 +234,24 @@ extern "C" int distill_litehtml_render(const char *html, const char *output_path
         if (height < 1) height = 1;
         if (height > DISTILL_MAX_RENDER_HEIGHT) height = DISTILL_MAX_RENDER_HEIGHT;
     }
-    DRenderContext *renderer = d_render_create(width, height, font_dir);
-    if (!renderer) return 0;
-    Probe probe(renderer);
-    probe.width = width;
-    probe.height = height;
-    int result = 0;
-    {
-        std::shared_ptr<litehtml::document> document = litehtml::document::createFromString(html, &probe);
-        if (!document) {
-            d_render_destroy(renderer);
-            return 0;
-        }
-        document->render(width, litehtml::render_all);
-        litehtml::position clip(0, 0, width, height);
-        document->draw(reinterpret_cast<litehtml::uint_ptr>(renderer), 0, 0, &clip);
-        result = d_render_write_png(renderer, output_path);
-    }
-    d_render_destroy(renderer);
+    DLiteHtmlDocument *document = distill_litehtml_document_create(html, width, height, font_dir);
+    if (!document) return 0;
+    int result = distill_litehtml_document_render_region(document, 0) &&
+                 d_render_write_png(document->renderer, output_path);
+    distill_litehtml_document_destroy(document);
+    return result;
+}
+
+extern "C" int distill_litehtml_render_region(const char *html, const char *output_path,
+                                                int width, int viewport, int scroll_y,
+                                                const char *font_dir)
+{
+    if (!html || !output_path || width <= 0 || viewport <= 0) return 0;
+    DLiteHtmlDocument *document = distill_litehtml_document_create(html, width, viewport, font_dir);
+    if (!document) return 0;
+    int result = distill_litehtml_document_render_region(document, scroll_y) &&
+                 d_render_write_png(document->renderer, output_path);
+    distill_litehtml_document_destroy(document);
     return result;
 }
 
@@ -282,6 +335,50 @@ static void collect_link_boxes(const litehtml::element::ptr &element,
     for (const auto &child : element->children()) collect_link_boxes(child, output);
 }
 
+static size_t copy_form_boxes(const DLiteHtmlDocument *document, DFormBox *boxes,
+                              size_t box_capacity)
+{
+    if (!document || !document->document) return 0;
+    std::vector<DFormBox> collected;
+    unsigned int next_form_index = 0;
+    collect_form_boxes(document->document->root(), false, 0, next_form_index,
+                       "", "get", collected);
+    size_t count = collected.size();
+    if (boxes && box_capacity) {
+        size_t copy_count = count < box_capacity ? count : box_capacity;
+        std::memcpy(boxes, collected.data(), copy_count * sizeof(*boxes));
+    }
+    return count;
+}
+
+static size_t copy_link_boxes(const DLiteHtmlDocument *document, DLinkBox *boxes,
+                              size_t box_capacity)
+{
+    if (!document || !document->document) return 0;
+    std::vector<DLinkBox> collected;
+    collect_link_boxes(document->document->root(), collected);
+    size_t count = collected.size();
+    if (boxes && box_capacity) {
+        size_t copy_count = count < box_capacity ? count : box_capacity;
+        std::memcpy(boxes, collected.data(), copy_count * sizeof(*boxes));
+    }
+    return count;
+}
+
+}
+
+extern "C" size_t distill_litehtml_document_form_boxes(const DLiteHtmlDocument *document,
+                                                          DFormBox *boxes,
+                                                          size_t box_capacity)
+{
+    return copy_form_boxes(document, boxes, box_capacity);
+}
+
+extern "C" size_t distill_litehtml_document_link_boxes(const DLiteHtmlDocument *document,
+                                                          DLinkBox *boxes,
+                                                          size_t box_capacity)
+{
+    return copy_link_boxes(document, boxes, box_capacity);
 }
 
 extern "C" size_t distill_litehtml_form_boxes(const char *html, int width, int height,

@@ -9,18 +9,16 @@ static void page_free(DAppPage *page, DAppPageDisposer disposer)
     if (!page) return;
     if (disposer) disposer(page);
     free(page->url);
-    free(page->png_path);
     free(page->template_path);
     free(page->theme);
     *page = (DAppPage){0};
 }
 
-static DAppPage page_copy(const char *url, const char *png_path,
-                          const char *template_path, const char *theme)
+static DAppPage page_copy(const char *url, const char *template_path,
+                          const char *theme)
 {
     return (DAppPage){
         .url = d_strdup(url),
-        .png_path = d_strdup(png_path),
         .template_path = d_strdup(template_path),
         .theme = d_strdup(theme ? theme : "warm")
     };
@@ -49,26 +47,26 @@ static void discard_forward(DAppHistory *history, DAppPageDisposer disposer)
 }
 
 bool d_app_history_push(DAppHistory *history, const char *url,
-                        const char *png_path, const char *template_path,
+                        const char *template_path,
                         const char *theme, DAppPageDisposer disposer)
 {
     if (!history || !url || !*url) return false;
     if (history->current != SIZE_MAX) discard_forward(history, disposer);
     d_vec_reserve((void **)&history->entries, &history->capacity,
                   history->length, sizeof(*history->entries), history->length + 1);
-    history->entries[history->length] = page_copy(url, png_path, template_path, theme);
+    history->entries[history->length] = page_copy(url, template_path, theme);
     history->current = history->length++;
     return true;
 }
 
 bool d_app_history_replace_current(DAppHistory *history, const char *url,
-                                   const char *png_path, const char *template_path,
+                                   const char *template_path,
                                    const char *theme, DAppPageDisposer disposer)
 {
     if (!history || history->current == SIZE_MAX || history->current >= history->length)
         return false;
     page_free(&history->entries[history->current], disposer);
-    history->entries[history->current] = page_copy(url, png_path, template_path, theme);
+    history->entries[history->current] = page_copy(url, template_path, theme);
     return true;
 }
 

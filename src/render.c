@@ -243,6 +243,21 @@ int d_render_write_png(DRenderContext *context, const char *path)
     return cairo_surface_write_to_png(context->surface, path) == CAIRO_STATUS_SUCCESS;
 }
 
+void d_render_clear(DRenderContext *context)
+{
+    if (!context) return;
+    cairo_save(context->cairo);
+    cairo_set_source_rgb(context->cairo, 0.96, 0.95, 0.92);
+    cairo_set_operator(context->cairo, CAIRO_OPERATOR_SOURCE);
+    cairo_paint(context->cairo);
+    cairo_restore(context->cairo);
+}
+
+void *d_render_surface(DRenderContext *context)
+{
+    return context ? context->surface : NULL;
+}
+
 DRenderFont *d_render_font_create(DRenderContext *context, const char *face_name,
                                   int size, int weight, bool italic,
                                   unsigned int decoration, DRenderFontMetrics *metrics)

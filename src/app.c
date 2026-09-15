@@ -28,6 +28,7 @@
 enum {
     PAGE_WIDTH = 760,
     PAGE_HEIGHT = 1400,
+    RENDER_OVERSCAN = 200,
     MAX_FORM_BOXES = 512,
     MAX_LINK_BOXES = 2048
 };
@@ -50,7 +51,6 @@ typedef struct {
 
 typedef struct {
     char *url;
-    char *png_path;
     char *template_path;
     char *theme;
     char *error;
@@ -72,7 +72,10 @@ struct App {
     GtkWidget *status;
     GtkWidget *drawing_area;
     GtkWidget *form_layer;
+    GtkAdjustment *vertical_adjustment;
     cairo_surface_t *surface;
+    DLiteHtmlDocument *document;
+    int surface_top;
     DFormBox *form_boxes;
     size_t form_count;
     FormControl *controls;
@@ -101,7 +104,6 @@ static void app_unref(App *app)
 static void page_dispose(DAppPage *page)
 {
     if (!page) return;
-    if (page->png_path && *page->png_path) unlink(page->png_path);
     if (page->template_path && *page->template_path) unlink(page->template_path);
 }
 
@@ -218,10 +220,8 @@ static void free_load_request(LoadRequest *request)
 static void free_load_result(LoadResult *result)
 {
     if (!result) return;
-    if (result->png_path) unlink(result->png_path);
     if (result->template_path) unlink(result->template_path);
     g_free(result->url);
-    g_free(result->png_path);
     g_free(result->template_path);
     g_free(result->theme);
     g_free(result->error);
@@ -304,8 +304,8 @@ static char *write_private_body(const char *data)
     return path;
 }
 
-static bool run_engine(const LoadRequest *request, const char *png_path,
-                       const char *template_path, char **error_message)
+static bool run_engine(const LoadRequest *request, const char *template_path,
+                       char **error_message)
 {
     char *engine = engine_path();
     if (!engine) return false;
@@ -313,8 +313,6 @@ static bool run_engine(const LoadRequest *request, const char *png_path,
     add_arg(arguments, engine);
     add_arg(arguments, "--url");
     add_arg(arguments, request->url);
-    add_arg(arguments, "--render");
-    add_arg(arguments, png_path);
     add_arg(arguments, "--template");
     add_arg(arguments, template_path);
     add_arg(arguments, "--width");
@@ -388,12 +386,11 @@ static void load_worker(GTask *task, gpointer source_object, gpointer task_data,
     result->theme = g_strdup(request->theme);
     result->serial = request->serial;
     result->replace_current = request->replace_current;
-    result->png_path = temporary_path("distill-page-XXXXXX");
     result->template_path = temporary_path("distill-template-XXXXXX");
-    if (!result->png_path || !result->template_path) {
+    if (!result->template_path) {
         result->error = g_strdup("unable to create temporary page files");
     } else {
-        result->ok = run_engine(request, result->png_path, result->template_path,
+        result->ok = run_engine(request, result->template_path,
                                 &result->error);
     }
     g_task_return_pointer(task, result, (GDestroyNotify)free_load_result);
@@ -441,7 +438,7 @@ static gboolean draw_page(GtkWidget *widget, cairo_t *cairo, gpointer opaque)
     cairo_set_source_rgb(cairo, 0.10, 0.11, 0.12);
     cairo_paint(cairo);
     if (app->surface && cairo_surface_status(app->surface) == CAIRO_STATUS_SUCCESS) {
-        cairo_set_source_surface(cairo, app->surface, 0, 0);
+        cairo_set_source_surface(cairo, app->surface, 0, app->surface_top);
         cairo_paint(cairo);
     } else {
         cairo_set_source_rgb(cairo, 0.82, 0.79, 0.73);
@@ -452,6 +449,32 @@ static gboolean draw_page(GtkWidget *widget, cairo_t *cairo, gpointer opaque)
     }
     (void)allocation;
     return FALSE;
+}
+
+static int visible_scroll_y(const App *app)
+{
+    if (!app || !app->vertical_adjustment) return 0;
+    double value = gtk_adjustment_get_value(app->vertical_adjustment);
+    return value > 0.0 ? (int)value : 0;
+}
+
+static void render_visible_band(App *app)
+{
+    if (!app || !app->document) return;
+    int scroll_y = visible_scroll_y(app);
+    int top = scroll_y - RENDER_OVERSCAN;
+    if (top < 0) top = 0;
+    if (!distill_litehtml_document_render_region(app->document, top)) return;
+    app->surface_top = top;
+    app->surface = (cairo_surface_t *)distill_litehtml_document_surface(app->document);
+    if (app->surface) cairo_surface_flush(app->surface);
+    gtk_widget_queue_draw(app->drawing_area);
+}
+
+static void scroll_value_changed(GtkAdjustment *adjustment, gpointer opaque)
+{
+    (void)adjustment;
+    render_visible_band(opaque);
 }
 
 static bool point_in_box(double x, double y, int box_x, int box_y, int width, int height)
@@ -642,54 +665,59 @@ static void form_submit(App *app, const FormControl *submit_control)
 
 static void load_surface(App *app, const DAppPage *page)
 {
-    if (app->surface) cairo_surface_destroy(app->surface);
-    app->surface = cairo_image_surface_create_from_png(page->png_path);
+    if (app->document) distill_litehtml_document_destroy(app->document);
+    app->document = NULL;
+    app->surface = NULL;
+    app->surface_top = 0;
     clear_controls(app);
-    /* The rendered surface is the authority on how long the page is. The
-       scroll area and the widget geometry must agree with it, or the window
-       scrolls to a bottom that is not the document's. */
     int page_height = PAGE_HEIGHT;
-    if (app->surface &&
-        cairo_surface_status(app->surface) == CAIRO_STATUS_SUCCESS) {
-        int measured = cairo_image_surface_get_height(app->surface);
-        if (measured > 0) page_height = measured;
-    }
-    gtk_widget_set_size_request(app->drawing_area, PAGE_WIDTH, page_height);
-    gtk_widget_set_size_request(app->form_layer, PAGE_WIDTH, page_height);
 
     char *template = d_read_file(page->template_path, NULL);
     if (template) {
         const char *font_dir = *DISTILL_FONT_DIR ? DISTILL_FONT_DIR : getenv("DISTILL_FONT_DIR");
-        size_t form_count = distill_litehtml_form_boxes(template, PAGE_WIDTH, page_height,
-                                                        font_dir, NULL, 0);
-        size_t link_count = distill_litehtml_link_boxes(template, PAGE_WIDTH, page_height,
-                                                        font_dir, NULL, 0);
-        if (form_count > MAX_FORM_BOXES) form_count = MAX_FORM_BOXES;
-        if (link_count > MAX_LINK_BOXES) link_count = MAX_LINK_BOXES;
-        app->form_boxes = form_count ? g_new0(DFormBox, form_count) : NULL;
-        app->link_boxes = link_count ? g_new0(DLinkBox, link_count) : NULL;
-        app->form_count = form_count;
-        app->link_count = link_count;
-        if (form_count)
-            distill_litehtml_form_boxes(template, PAGE_WIDTH, page_height, font_dir,
-                                        app->form_boxes, form_count);
-        if (link_count)
-            distill_litehtml_link_boxes(template, PAGE_WIDTH, page_height, font_dir,
-                                        app->link_boxes, link_count);
-        if (form_count) {
-            app->controls = g_new0(FormControl, form_count);
-            app->control_count = form_count;
-            for (size_t i = 0; i < form_count; ++i) app->controls[i].box = app->form_boxes[i];
-            add_native_controls(app);
+        int viewport = PAGE_HEIGHT;
+        if (app->vertical_adjustment) {
+            double size = gtk_adjustment_get_page_size(app->vertical_adjustment);
+            if (size > 1.0) viewport = (int)size;
+        }
+        int band_height = viewport + RENDER_OVERSCAN * 2;
+        if (band_height < PAGE_HEIGHT) band_height = PAGE_HEIGHT;
+        app->document = distill_litehtml_document_create(template, PAGE_WIDTH,
+                                                         band_height, font_dir);
+        if (app->document) {
+            page_height = distill_litehtml_document_content_height(app->document);
+            if (page_height < 1) page_height = 1;
+            app->surface = (cairo_surface_t *)distill_litehtml_document_surface(app->document);
+            size_t form_count = distill_litehtml_document_form_boxes(app->document, NULL, 0);
+            size_t link_count = distill_litehtml_document_link_boxes(app->document, NULL, 0);
+            if (form_count > MAX_FORM_BOXES) form_count = MAX_FORM_BOXES;
+            if (link_count > MAX_LINK_BOXES) link_count = MAX_LINK_BOXES;
+            app->form_boxes = form_count ? g_new0(DFormBox, form_count) : NULL;
+            app->link_boxes = link_count ? g_new0(DLinkBox, link_count) : NULL;
+            app->form_count = form_count;
+            app->link_count = link_count;
+            if (form_count)
+                distill_litehtml_document_form_boxes(app->document, app->form_boxes, form_count);
+            if (link_count)
+                distill_litehtml_document_link_boxes(app->document, app->link_boxes, link_count);
+            if (form_count) {
+                app->controls = g_new0(FormControl, form_count);
+                app->control_count = form_count;
+                for (size_t i = 0; i < form_count; ++i) app->controls[i].box = app->form_boxes[i];
+                add_native_controls(app);
+            }
         }
         free(template);
     }
+    gtk_widget_set_size_request(app->drawing_area, PAGE_WIDTH, page_height);
+    gtk_widget_set_size_request(app->form_layer, PAGE_WIDTH, page_height);
+    if (app->vertical_adjustment) gtk_adjustment_set_value(app->vertical_adjustment, 0.0);
+    render_visible_band(app);
     gtk_entry_set_text(GTK_ENTRY(app->url_entry), page->url);
     gtk_combo_box_set_active_id(GTK_COMBO_BOX(app->theme_combo), page->theme ? page->theme : "warm");
     gtk_widget_set_sensitive(app->back_button, d_app_history_can_back(&app->history));
     gtk_widget_set_sensitive(app->forward_button, d_app_history_can_forward(&app->history));
     update_list_button(app);
-    gtk_widget_queue_draw(app->drawing_area);
 }
 
 static void load_done(GObject *source_object, GAsyncResult *result, gpointer opaque)
@@ -730,11 +758,12 @@ static void load_done(GObject *source_object, GAsyncResult *result, gpointer opa
     bool history_ok;
     if (loaded->replace_current && d_app_history_current(&app->history)) {
         history_ok = d_app_history_replace_current(&app->history, loaded->url,
-                                                    loaded->png_path, loaded->template_path,
+                                                    loaded->template_path,
                                                     loaded->theme, page_dispose);
     } else {
-        history_ok = d_app_history_push(&app->history, loaded->url, loaded->png_path,
-                                        loaded->template_path, loaded->theme, page_dispose);
+        history_ok = d_app_history_push(&app->history, loaded->url,
+                                        loaded->template_path,
+                                        loaded->theme, page_dispose);
     }
     if (!history_ok) {
         free_load_result(loaded);
@@ -744,9 +773,7 @@ static void load_done(GObject *source_object, GAsyncResult *result, gpointer opa
         return;
     }
     /* The history owns copies of these names now. */
-    g_free(loaded->png_path);
     g_free(loaded->template_path);
-    loaded->png_path = NULL;
     loaded->template_path = NULL;
     const DAppPage *page = d_app_history_current(&app->history);
     load_surface(app, page);
@@ -994,7 +1021,9 @@ static void app_destroy(GtkWidget *widget, gpointer opaque)
     (void)widget;
     App *app = opaque;
     app->closing = true;
-    if (app->surface) cairo_surface_destroy(app->surface);
+    if (app->document) distill_litehtml_document_destroy(app->document);
+    app->document = NULL;
+    app->surface = NULL;
     clear_controls(app);
     d_app_history_clear(&app->history, page_dispose);
     g_ptr_array_free(app->reading_list, TRUE);
@@ -1052,6 +1081,9 @@ static void app_activate(GtkApplication *application, gpointer opaque)
 
     GtkWidget *scrolled = gtk_scrolled_window_new(NULL, NULL);
     gtk_scrolled_window_set_policy(GTK_SCROLLED_WINDOW(scrolled), GTK_POLICY_AUTOMATIC, GTK_POLICY_AUTOMATIC);
+    app->vertical_adjustment = gtk_scrolled_window_get_vadjustment(GTK_SCROLLED_WINDOW(scrolled));
+    g_signal_connect(app->vertical_adjustment, "value-changed",
+                     G_CALLBACK(scroll_value_changed), app);
     gtk_box_pack_start(GTK_BOX(root), scrolled, TRUE, TRUE, 0);
     GtkWidget *overlay = gtk_overlay_new();
     gtk_container_add(GTK_CONTAINER(scrolled), overlay);
@@ -1142,8 +1174,8 @@ static int run_state_self_test(void)
 {
     DAppHistory history;
     d_app_history_init(&history);
-    bool ok = d_app_history_push(&history, "one", "one", "one", "warm", NULL) &&
-              d_app_history_push(&history, "two", "two", "two", "night", NULL) &&
+    bool ok = d_app_history_push(&history, "one", "one", "warm", NULL) &&
+              d_app_history_push(&history, "two", "two", "night", NULL) &&
               d_app_history_back(&history) &&
               d_app_history_current(&history) &&
               strcmp(d_app_history_current(&history)->url, "one") == 0 &&

@@ -178,8 +178,10 @@ dn.se in that shape, and none of them was visible on any existing fixture.
   bounded, and the shell sizes its scroll area from the surface it gets back.
 
 A page may declare `render_fit` to be rendered that way and
-`min_render_height` to assert it grew rather than cropped. `28-link-index`
-fails all three ways against the previous engine.
+`min_render_height` to assert it grew rather than cropped. The reader now
+recognises its dense linked-heading stream and applies index typography, so
+the fixture is deliberately shorter than the old article-heading layout while
+still asserting that the full page was rendered.
 
 ## Sessions
 

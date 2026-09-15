@@ -632,7 +632,7 @@
       "path": "28-link-index.html",
       "gate": true,
       "render_fit": true,
-      "min_render_height": 1500,
+      "min_render_height": 900,
       "plan_section": "Phase 1 extraction breadth, link index",
       "exercises": ["document-title", "block-links", "render-fit"],
       "why": "A front page is headlines that are themselves links, with no article for Readability to find. Without a document title the reader showed 'Untitled page'; without the link on each block it showed headlines nobody could follow; and rendered into a fixed surface the page simply stopped partway down.",

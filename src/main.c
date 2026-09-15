@@ -2023,6 +2023,52 @@ static void append_json_blocks(Engine *engine, JSValueConst blocks, DBuffer *out
     }
 }
 
+/* A front page is a block stream whose links are the content. Treating its
+   h2/h3 elements like article subheads makes every item pay article-sized
+   margins, so identify the dense linked-heading shape before writing the
+   template. */
+static bool json_is_dense_link_index(Engine *engine, JSValueConst blocks)
+{
+    int64_t block_count = json_array_length(engine, blocks);
+    int64_t linked_count = 0;
+    int64_t heading_count = 0;
+    int64_t linked_heading_count = 0;
+    for (int64_t i = 0; i < block_count; ++i) {
+        JSValue block = JS_GetPropertyUint32(engine->context, blocks, (uint32_t)i);
+        char *type = json_property_string(engine, block, "type");
+        char *href = json_property_string(engine, block, "href");
+        bool heading = d_eq(type, "h2") || d_eq(type, "h3");
+        if (*href) ++linked_count;
+        if (heading) {
+            ++heading_count;
+            if (*href) ++linked_heading_count;
+        }
+        free(type);
+        free(href);
+        JS_FreeValue(engine->context, block);
+    }
+    return heading_count >= 3 && linked_heading_count * 2 >= heading_count &&
+           linked_count * 2 >= block_count;
+}
+
+static int count_literal(const char *text, const char *literal)
+{
+    if (!text || !literal || !*literal) return 0;
+    int count = 0;
+    size_t length = strlen(literal);
+    for (const char *cursor = text; (cursor = strstr(cursor, literal)); cursor += length)
+        ++count;
+    return count;
+}
+
+static bool html_is_dense_link_index(const char *html)
+{
+    int headings = count_literal(html, "<h2") + count_literal(html, "<h3");
+    int linked_headings = count_literal(html, "<h2><a") + count_literal(html, "<h3><a");
+    int links = count_literal(html, "<a ") + count_literal(html, "<a>");
+    return headings >= 3 && linked_headings * 2 >= headings && links * 2 >= headings;
+}
+
 static void append_json_table(Engine *engine, JSValueConst tables, DBuffer *output)
 {
     int64_t table_count = json_array_length(engine, tables);
@@ -2246,6 +2292,8 @@ static char *reader_template(Engine *engine, const char *json, const char *theme
        directionality has to be carried across deliberately or a
        right-to-left article is laid out flush left. */
     bool rtl = d_ieq(text_dir, "rtl");
+    bool link_index = json_is_dense_link_index(engine, blocks) ||
+                      html_is_dense_link_index(content);
 
     const char *selected_theme = theme && *theme ? theme : "warm";
     const char *page_background = "#f4f1ea";
@@ -2321,6 +2369,10 @@ static char *reader_template(Engine *engine, const char *json, const char *theme
         "main{max-width:612px;margin:0 auto;background:var(--main-background);}"
         "h1{font-size:2.35em;line-height:1.08;letter-spacing:-.025em;margin:0 0 1.1em;color:var(--heading-text);}"
         "h2{font-size:1.45em;line-height:1.2;margin:1.7em 0 .55em;color:var(--heading-text);}"
+        "h3{font-size:1.15em;line-height:1.25;margin:1.35em 0 .45em;color:var(--heading-text);}"
+        ".link-index h2,.link-index h3{font-size:1em;line-height:1.35;margin:0 0 .55em;font-weight:600;}"
+        ".link-index p,.link-index ul,.link-index ol{line-height:1.35;margin:0 0 .55em;}"
+        ".link-index .distill-meta{margin-bottom:1.1em;}"
         "p,ul,ol,pre,blockquote{margin:0 0 1.05em;}"
         "a{color:var(--link);}pre{padding:1em;overflow:hidden;white-space:pre-wrap;overflow-wrap:anywhere;background:var(--pre-background);border-radius:4px;font-size:.86em;line-height:1.45;}"
         "blockquote{margin-left:1.2em;padding-left:1em;border-left:3px solid var(--border);color:var(--muted);}"
@@ -2348,7 +2400,9 @@ static char *reader_template(Engine *engine, const char *json, const char *theme
             "pre{text-align:left;}");
     }
     dbuf_puts(&output,
-        "</style></head><body><main><h1>");
+        "</style></head><body><main");
+    if (link_index) dbuf_puts(&output, " class=\"link-index\"");
+    dbuf_puts(&output, "><h1>");
     append_html_escaped(&output, *title ? title : "Untitled page");
     dbuf_puts(&output, "</h1><p class=\"distill-meta\">Rendered by Distill</p>");
     if (d_eq(shape_kind, "article") && *content) {
