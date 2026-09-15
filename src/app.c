@@ -77,12 +77,11 @@ struct App {
     GApplication *application;
     GtkWidget *window;
     GtkWidget *url_entry;
-    GtkWidget *go_button;
     GtkWidget *back_button;
     GtkWidget *forward_button;
-    GtkWidget *external_button;
     GtkWidget *list_button;
-    GtkWidget *theme_combo;
+    GtkWidget *settings_button;
+    GtkWidget *theme_items[3];
     GtkWidget *status;
     GtkWidget *drawing_area;
     GtkWidget *event_box;
@@ -107,10 +106,13 @@ struct App {
     bool entering_viewer;
     int viewer_index;
     char *viewer_file;
+    double reader_scroll_y;
+    guint restore_scroll_source;
     guint load_serial;
     unsigned int references;
     bool closing;
     bool loading;
+    bool updating_theme;
 };
 
 static void app_ref(App *app)
@@ -133,6 +135,61 @@ static void page_dispose(DAppPage *page)
 static void set_status(App *app, const char *message)
 {
     gtk_label_set_text(GTK_LABEL(app->status), message ? message : "");
+}
+
+static const char *active_theme_id(const App *app)
+{
+    static const char *fallback = "warm";
+    if (!app) return fallback;
+    for (size_t i = 0; i < sizeof(app->theme_items) / sizeof(app->theme_items[0]); ++i) {
+        if (app->theme_items[i] &&
+            gtk_check_menu_item_get_active(GTK_CHECK_MENU_ITEM(app->theme_items[i]))) {
+            const char *theme = g_object_get_data(G_OBJECT(app->theme_items[i]),
+                                                  "distill-theme-id");
+            if (theme && *theme) return theme;
+        }
+    }
+    return fallback;
+}
+
+static void select_theme_id(App *app, const char *theme)
+{
+    if (!app) return;
+    app->updating_theme = true;
+    for (size_t i = 0; i < sizeof(app->theme_items) / sizeof(app->theme_items[0]); ++i) {
+        const char *item_theme = app->theme_items[i]
+                                     ? g_object_get_data(G_OBJECT(app->theme_items[i]),
+                                                         "distill-theme-id")
+                                     : NULL;
+        if (item_theme && strcmp(item_theme, theme ? theme : "warm") == 0)
+            gtk_check_menu_item_set_active(GTK_CHECK_MENU_ITEM(app->theme_items[i]), TRUE);
+    }
+    app->updating_theme = false;
+}
+
+/* Rebuilding the litehtml document resets the adjustment while GTK lays out
+   the new child. Restore the reader position from an idle callback, after the
+   child has its real height, so the adjustment can accept the old offset. */
+static gboolean restore_reader_scroll(gpointer opaque)
+{
+    App *app = opaque;
+    app->restore_scroll_source = 0;
+    if (!app->closing && !app->viewer_active && app->vertical_adjustment)
+        gtk_adjustment_set_value(app->vertical_adjustment, app->reader_scroll_y);
+    return G_SOURCE_REMOVE;
+}
+
+static void cancel_reader_scroll_restore(App *app)
+{
+    if (!app->restore_scroll_source) return;
+    g_source_remove(app->restore_scroll_source);
+    app->restore_scroll_source = 0;
+}
+
+static void schedule_reader_scroll_restore(App *app)
+{
+    cancel_reader_scroll_restore(app);
+    app->restore_scroll_source = g_idle_add(restore_reader_scroll, app);
 }
 
 static bool has_scheme(const char *uri, const char *scheme)
@@ -571,7 +628,7 @@ static void set_link_cursor(GtkWidget *widget, bool link)
     g_object_unref(cursor);
 }
 
-/* Activating a placeholder is the only thing that fetches an image, so the
+/* Activating a media link is the only thing that fetches an image, so the
    first one a reader opens costs a request. The shell has no network of its
    own -- libcurl is linked into the engine and nowhere else -- so the request
    is one short-lived engine run that does nothing but fetch and validate. */
@@ -743,6 +800,7 @@ static void leave_viewer(App *app)
     build_document(app, template ? template : "");
     free(template);
     collect_page_media(app);
+    schedule_reader_scroll_restore(app);
     set_status(app, "Closed the image");
 }
 
@@ -765,6 +823,8 @@ static void enter_viewer(App *app, const char *url)
        click being handled came from. */
     if (app->entering_viewer) return;
     app->entering_viewer = true;
+    if (!app->viewer_active && app->vertical_adjustment)
+        app->reader_scroll_y = gtk_adjustment_get_value(app->vertical_adjustment);
     int index = media_index_of(app, url);
     set_status(app, "Fetching the image\xe2\x80\xa6");
 
@@ -1088,10 +1148,10 @@ static void build_document(App *app, const char *template)
     render_visible_band(app);
 }
 
-/* The images the reader may open, taken from the links the template put on
-   the placeholders. Reading them from the laid-out document rather than from
-   a second file keeps one description of the page: what is clickable is
-   exactly what is in this list. */
+/* The images the reader may open, taken from the media links in the template.
+   Reading them from the laid-out document rather than from a second file keeps
+   one description of the page: what is clickable is exactly what is in this
+   list. */
 static void collect_page_media(App *app)
 {
     if (app->page_media) g_ptr_array_free(app->page_media, TRUE);
@@ -1106,6 +1166,7 @@ static void collect_page_media(App *app)
 
 static void load_surface(App *app, const DAppPage *page)
 {
+    cancel_reader_scroll_restore(app);
     char *template = d_read_file(page->template_path, NULL);
     build_document(app, template ? template : "");
     free(template);
@@ -1115,7 +1176,7 @@ static void load_surface(App *app, const DAppPage *page)
     if (app->viewer_file) { unlink(app->viewer_file); g_free(app->viewer_file); app->viewer_file = NULL; }
     collect_page_media(app);
     gtk_entry_set_text(GTK_ENTRY(app->url_entry), page->url);
-    gtk_combo_box_set_active_id(GTK_COMBO_BOX(app->theme_combo), page->theme ? page->theme : "warm");
+    select_theme_id(app, page->theme);
     gtk_widget_set_sensitive(app->back_button, d_app_history_can_back(&app->history));
     gtk_widget_set_sensitive(app->forward_button, d_app_history_can_forward(&app->history));
     update_list_button(app);
@@ -1137,7 +1198,6 @@ static void load_done(GObject *source_object, GAsyncResult *result, gpointer opa
         set_status(app, error->message);
         g_error_free(error);
         app->loading = false;
-        gtk_widget_set_sensitive(app->go_button, TRUE);
         app_unref(app);
         return;
     }
@@ -1152,7 +1212,6 @@ static void load_done(GObject *source_object, GAsyncResult *result, gpointer opa
         set_status(app, message);
         g_free(message);
         free_load_result(loaded);
-        gtk_widget_set_sensitive(app->go_button, TRUE);
         app_unref(app);
         return;
     }
@@ -1169,7 +1228,6 @@ static void load_done(GObject *source_object, GAsyncResult *result, gpointer opa
     if (!history_ok) {
         free_load_result(loaded);
         set_status(app, "Unable to update navigation history");
-        gtk_widget_set_sensitive(app->go_button, TRUE);
         app_unref(app);
         return;
     }
@@ -1180,7 +1238,6 @@ static void load_done(GObject *source_object, GAsyncResult *result, gpointer opa
     load_surface(app, page);
     gtk_window_set_title(GTK_WINDOW(app->window), page && page->url ? page->url : "Distill");
     set_status(app, "Ready");
-    gtk_widget_set_sensitive(app->go_button, TRUE);
     free_load_result(loaded);
     app_unref(app);
 }
@@ -1202,13 +1259,11 @@ static void app_begin_load(App *app, const char *uri, const char *method,
     request->url = g_strdup(uri);
     request->method = g_strdup(method ? method : "");
     request->data = g_strdup(data ? data : "");
-    const char *theme_id = gtk_combo_box_get_active_id(GTK_COMBO_BOX(app->theme_combo));
-    request->theme = g_strdup(theme_id && *theme_id ? theme_id : "warm");
+    request->theme = g_strdup(active_theme_id(app));
     request->serial = ++app->load_serial;
     request->replace_current = replace_current;
     app->loading = true;
     app_ref(app);
-    gtk_widget_set_sensitive(app->go_button, FALSE);
     set_status(app, "Loading…");
     GTask *task = g_task_new(NULL, NULL, load_done, app);
     g_task_set_task_data(task, request, (GDestroyNotify)free_load_request);
@@ -1329,12 +1384,6 @@ static void url_activate(GtkWidget *widget, gpointer opaque)
     g_free(uri);
 }
 
-static void go_clicked(GtkWidget *widget, gpointer opaque)
-{
-    (void)widget;
-    url_activate(opaque ? GTK_WIDGET(((App *)opaque)->url_entry) : NULL, opaque);
-}
-
 static void show_history_page(App *app)
 {
     const DAppPage *page = d_app_history_current(&app->history);
@@ -1400,14 +1449,51 @@ static void list_clicked(GtkWidget *widget, gpointer opaque)
     update_list_tooltip(app);
 }
 
-static void theme_changed(GtkComboBox *combo, gpointer opaque)
+static void theme_changed(GtkCheckMenuItem *item, gpointer opaque)
 {
+    if (!gtk_check_menu_item_get_active(item)) return;
     App *app = opaque;
-    if (app->loading || !d_app_history_current(&app->history)) return;
+    if (app->updating_theme || app->loading) return;
     const DAppPage *page = d_app_history_current(&app->history);
-    const char *theme = gtk_combo_box_get_active_id(combo);
-    if (!theme || strcmp(theme, page->theme) == 0) return;
+    const char *theme = g_object_get_data(G_OBJECT(item), "distill-theme-id");
+    if (!theme || !page || strcmp(theme, page->theme) == 0) return;
     app_begin_load(app, page->url, NULL, NULL, true);
+}
+
+static GtkWidget *make_settings_button(App *app)
+{
+    static const char *theme_ids[] = {"warm", "night", "paper"};
+    static const char *theme_labels[] = {"Warm light", "Night", "Paper"};
+
+    GtkWidget *menu = gtk_menu_new();
+    GtkWidget *external = gtk_menu_item_new_with_label("Open externally");
+    g_signal_connect(external, "activate", G_CALLBACK(external_clicked), app);
+    gtk_menu_shell_append(GTK_MENU_SHELL(menu), external);
+
+    GtkWidget *theme_item = gtk_menu_item_new_with_label("Theme");
+    GtkWidget *theme_menu = gtk_menu_new();
+    GSList *group = NULL;
+    for (size_t i = 0; i < sizeof(theme_ids) / sizeof(theme_ids[0]); ++i) {
+        GtkWidget *item = gtk_radio_menu_item_new_with_label(group, theme_labels[i]);
+        group = gtk_radio_menu_item_get_group(GTK_RADIO_MENU_ITEM(item));
+        g_object_set_data(G_OBJECT(item), "distill-theme-id", (gpointer)theme_ids[i]);
+        app->theme_items[i] = item;
+        g_signal_connect(item, "toggled", G_CALLBACK(theme_changed), app);
+        gtk_menu_shell_append(GTK_MENU_SHELL(theme_menu), item);
+    }
+    gtk_check_menu_item_set_active(GTK_CHECK_MENU_ITEM(app->theme_items[0]), TRUE);
+    gtk_menu_item_set_submenu(GTK_MENU_ITEM(theme_item), theme_menu);
+    gtk_menu_shell_append(GTK_MENU_SHELL(menu), theme_item);
+
+    GtkWidget *button = gtk_menu_button_new();
+    GtkWidget *icon = gtk_image_new_from_icon_name("preferences-system-symbolic",
+                                                   GTK_ICON_SIZE_BUTTON);
+    gtk_button_set_image(GTK_BUTTON(button), icon);
+    gtk_button_set_relief(GTK_BUTTON(button), GTK_RELIEF_NONE);
+    gtk_widget_set_tooltip_text(button, "Settings");
+    gtk_menu_button_set_popup(GTK_MENU_BUTTON(button), menu);
+    gtk_widget_show_all(menu);
+    return button;
 }
 
 static GtkWidget *make_button(const char *label, GCallback callback, App *app)
@@ -1422,6 +1508,7 @@ static void app_destroy(GtkWidget *widget, gpointer opaque)
     (void)widget;
     App *app = opaque;
     app->closing = true;
+    cancel_reader_scroll_restore(app);
     if (app->document) distill_litehtml_document_destroy(app->document);
     app->document = NULL;
     app->surface = NULL;
@@ -1469,19 +1556,10 @@ static void app_activate(GtkApplication *application, gpointer opaque)
     gtk_widget_set_hexpand(app->url_entry, TRUE);
     g_signal_connect(app->url_entry, "activate", G_CALLBACK(url_activate), app);
     gtk_box_pack_start(GTK_BOX(toolbar), app->url_entry, TRUE, TRUE, 0);
-    app->go_button = make_button("Go", G_CALLBACK(go_clicked), app);
-    gtk_box_pack_start(GTK_BOX(toolbar), app->go_button, FALSE, FALSE, 0);
-    app->external_button = make_button("Open externally", G_CALLBACK(external_clicked), app);
-    gtk_box_pack_start(GTK_BOX(toolbar), app->external_button, FALSE, FALSE, 0);
     app->list_button = make_button("☆", G_CALLBACK(list_clicked), app);
     gtk_box_pack_start(GTK_BOX(toolbar), app->list_button, FALSE, FALSE, 0);
-    app->theme_combo = gtk_combo_box_text_new();
-    gtk_combo_box_text_append(GTK_COMBO_BOX_TEXT(app->theme_combo), "warm", "Warm light");
-    gtk_combo_box_text_append(GTK_COMBO_BOX_TEXT(app->theme_combo), "night", "Night");
-    gtk_combo_box_text_append(GTK_COMBO_BOX_TEXT(app->theme_combo), "paper", "Paper");
-    gtk_combo_box_set_active_id(GTK_COMBO_BOX(app->theme_combo), "warm");
-    g_signal_connect(app->theme_combo, "changed", G_CALLBACK(theme_changed), app);
-    gtk_box_pack_start(GTK_BOX(toolbar), app->theme_combo, FALSE, FALSE, 0);
+    app->settings_button = make_settings_button(app);
+    gtk_box_pack_start(GTK_BOX(toolbar), app->settings_button, FALSE, FALSE, 0);
 
     GtkWidget *scrolled = gtk_scrolled_window_new(NULL, NULL);
     gtk_scrolled_window_set_policy(GTK_SCROLLED_WINDOW(scrolled), GTK_POLICY_AUTOMATIC, GTK_POLICY_AUTOMATIC);

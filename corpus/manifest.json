@@ -484,7 +484,9 @@
         {
           "stage": "template",
           "expect_absent": [
-            "media-url\">http"
+            "media-placeholder",
+            "figcaption",
+            "class=\"media-url\""
           ]
         }
       ]

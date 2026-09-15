@@ -2313,32 +2313,23 @@ static void append_json_media(Engine *engine, JSValueConst media, DBuffer *outpu
     dbuf_puts(output, "<section class=\"media-gallery\"><h2>Images</h2>");
     for (int64_t i = 0; i < count; ++i) {
         JSValue item = JS_GetPropertyUint32(engine->context, media, (uint32_t)i);
-        char *kind = json_property_string(engine, item, "kind");
         char *url = json_property_string(engine, item, "url");
         char *alt = json_property_string(engine, item, "alt");
-        dbuf_puts(output, "<figure class=\"media-card\">");
-        /* The placeholder is the activation target. Nothing has been fetched
-           at this point -- that is the whole point of a placeholder -- so the
-           link carries the image's own URL and the shell is what decides to
-           go and get it. */
+        dbuf_puts(output, "<p class=\"media-item\">");
+        /* Keep the media activation target as one ordinary inline link. The
+           desktop shell still recognizes distill-media: and fetches lazily,
+           but the reader does not repeat the alt text in a placeholder and a
+           caption. */
         bool openable = is_http_url(url);
         if (openable) {
             dbuf_puts(output, "<a class=\"media-open\" href=\"distill-media:");
             append_html_escaped(output, url);
             dbuf_puts(output, "\">");
         }
-        dbuf_puts(output, "<div class=\"media-placeholder\">");
         append_html_escaped(output, *alt ? alt : "Decorative image");
-        dbuf_puts(output, "</div>");
         if (openable) dbuf_puts(output, "</a>");
-        dbuf_puts(output, "<figcaption>");
-        append_html_escaped(output, *alt ? alt : "Decorative image");
-        dbuf_puts(output, " <span>");
-        append_html_escaped(output, d_eq(kind, "decorative") ? "decorative" : "content");
-        dbuf_puts(output, "</span></figcaption><p class=\"media-url\">");
-        append_display_url(output, url);
-        dbuf_puts(output, "</p></figure>");
-        free(kind); free(url); free(alt);
+        dbuf_puts(output, "</p>");
+        free(url); free(alt);
         JS_FreeValue(engine->context, item);
     }
     dbuf_puts(output, "</section>");
@@ -2509,15 +2500,7 @@ static char *reader_template(Engine *engine, const char *json, const char *theme
         "button,.button{display:inline-block;padding:.55em .85em;border:0;border-radius:3px;background:var(--link);color:white;text-decoration:none;font:inherit;}"
         ".video-card h2,.table-card h2,.form-card h2,.media-gallery h2,.result-list h2{margin-top:0;}"
         ".eyebrow,.media-url{font-size:.78em;color:var(--muted);}"
-        /* The placeholder is now something to activate, so it has to look
-           like it. On the card's own background it was invisible as a target:
-           the alt text appeared to be floating in the card. */
-        ".media-placeholder{min-height:92px;background:var(--main-background);border:1px solid var(--border);border-radius:4px;color:var(--link);text-align:center;padding:2.1em 1em;}"
-        ".media-card{margin:0 0 1em;}.media-card figcaption{margin-top:.45em;}.media-card figcaption span{float:right;color:#827a6e;font-size:.8em;}"
-        /* Block, so the whole placeholder is the target and so litehtml gives
-           the anchor a box the shell can find for keyboard navigation. */
-        ".media-open{display:block;text-decoration:none;color:inherit;}"
-        ".media-open .media-placeholder{color:var(--link);}"
+        ".media-item{margin:0 0 .75em;}"
         ".reader-list-item{padding-left:1em;}"
         ".distill-meta{font-size:.8em;color:var(--muted);margin-bottom:2.6em;}"
         /* The promoted item keeps article spacing even when the page around it
@@ -2536,7 +2519,6 @@ static char *reader_template(Engine *engine, const char *json, const char *theme
             "blockquote{margin-left:0;margin-right:1.2em;padding-left:0;padding-right:1em;"
             "border-left:0;border-right:3px solid var(--border);}"
             ".reader-list-item{padding-left:0;padding-right:1em;}"
-            ".media-card figcaption span{float:left;}"
             "pre{text-align:left;}");
     }
     dbuf_puts(&output,
