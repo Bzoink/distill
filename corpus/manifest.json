@@ -494,6 +494,17 @@
       "assertions": [
         {"stage": "dom", "selector": "#content", "expect": "EMPTY-ASYNC-SAFE"}
       ]
+    },
+    {
+      "id": "18-network-contract",
+      "path": "18-network-contract.html",
+      "gate": true,
+      "plan_section": "Network ↔ JS bridge",
+      "exercises": ["request-headers", "response-headers", "cookies", "POST", "redirect", "XHR"],
+      "why": "Locks down browser-like request defaults, page-supplied headers, response metadata, cookie persistence, and XHR forwarding against a local server.",
+      "assertions": [
+        {"stage": "dom", "selector": "#content", "expect": "NETWORK-CONTRACT-OK"}
+      ]
     }
   ],
   "live": [

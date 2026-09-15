@@ -7,6 +7,7 @@
 #include <curl/curl.h>
 
 #include <errno.h>
+#include <fcntl.h>
 #include <limits.h>
 #include <sys/stat.h>
 #include <time.h>
@@ -39,6 +40,39 @@ typedef struct {
     JSValue callback;
 } Listener;
 
+typedef struct {
+    char *name;
+    char *value;
+} Header;
+
+typedef struct {
+    Header *items;
+    size_t length;
+    size_t capacity;
+} HeaderVec;
+
+static void header_vec_free(HeaderVec *headers)
+{
+    for (size_t i = 0; i < headers->length; ++i) {
+        free(headers->items[i].name);
+        free(headers->items[i].value);
+    }
+    free(headers->items);
+    *headers = (HeaderVec){0};
+}
+
+static void header_vec_clear(HeaderVec *headers)
+{
+    header_vec_free(headers);
+}
+
+static void header_vec_push(HeaderVec *headers, const char *name, const char *value)
+{
+    d_vec_reserve((void **)&headers->items, &headers->capacity, headers->length,
+                  sizeof(*headers->items), headers->length + 1);
+    headers->items[headers->length++] = (Header){d_strdup(name), d_strdup(value)};
+}
+
 typedef struct Request {
     RequestKind kind;
     bool module_script;
@@ -56,6 +90,9 @@ typedef struct Request {
     JSValue reject;
     bool completed;
     unsigned attempts;
+    char *effective_url;
+    struct curl_slist *wire_headers;
+    HeaderVec response_headers;
 } Request;
 
 typedef struct {
@@ -89,8 +126,11 @@ struct Engine {
     JSValue window;
     JSValue document;
     CURLM *multi;
+    CURLSH *share;
     char *source_url;
     char *base_url;
+    char *cookie_jar_path;
+    char *script_cookies;
     uint64_t started;
     uint64_t cap_ms;
     uint64_t memory_limit;
@@ -134,9 +174,42 @@ static JSValue js_strn(JSContext *ctx, const char *value, size_t length)
     return JS_NewStringLen(ctx, value ? value : "", length);
 }
 
+static int64_t json_array_length_for_context(JSContext *ctx, JSValueConst array)
+{
+    int64_t length = 0;
+    if (JS_GetLength(ctx, array, &length) < 0 || length < 0) return 0;
+    return length;
+}
+
 static bool is_http_url(const char *url)
 {
     return d_starts(url, "http://") || d_starts(url, "https://");
+}
+
+static char *url_origin(const char *url);
+
+static char *url_cookie_domain(const char *url)
+{
+    char *origin = url_origin(url);
+    const char *scheme = strstr(origin, "://");
+    const char *start = scheme ? scheme + 3 : origin;
+    char *authority = d_strdup(start);
+    char *at = strrchr(authority, '@');
+    if (at) memmove(authority, at + 1, strlen(at + 1) + 1);
+    if (authority[0] == '[') {
+        char *end = strchr(authority, ']');
+        if (end) end[1] = 0;
+    } else {
+        char *port = strrchr(authority, ':');
+        if (port) *port = 0;
+    }
+    free(origin);
+    return authority;
+}
+
+static char *url_host_for_cookie(const char *url)
+{
+    return url_cookie_domain(url);
 }
 
 static char *url_origin(const char *url)
@@ -310,6 +383,266 @@ static long connection_timeout_ms(const Engine *engine)
     return (long)(timeout ? timeout : 1);
 }
 
+static bool header_list_has(const struct curl_slist *headers, const char *name)
+{
+    for (const struct curl_slist *item = headers; item; item = item->next) {
+        const char *colon = strchr(item->data, ':');
+        size_t length = colon ? (size_t)(colon - item->data) : strlen(item->data);
+        char *candidate = d_strndup(item->data, length);
+        bool match = d_ieq(candidate, name);
+        free(candidate);
+        if (match) return true;
+    }
+    return false;
+}
+
+static void curl_header_append(struct curl_slist **headers, const char *name,
+                               const char *value)
+{
+    DBuffer line;
+    dbuf_init(&line);
+    dbuf_printf(&line, "%s: %s", name, value ? value : "");
+    struct curl_slist *updated = curl_slist_append(*headers, line.data);
+    dbuf_free(&line);
+    if (updated) *headers = updated;
+}
+
+static struct curl_slist *default_request_headers(const char *referer,
+                                                   const struct curl_slist *custom,
+                                                   bool document_request)
+{
+    struct curl_slist *headers = NULL;
+    if (!header_list_has(custom, "Accept")) {
+        curl_header_append(&headers, "Accept",
+                           document_request
+                               ? "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8"
+                               : "*/*");
+    }
+    if (!header_list_has(custom, "Accept-Language")) {
+        curl_header_append(&headers, "Accept-Language", "en-US,en;q=0.9");
+    }
+    if (referer && *referer && !header_list_has(custom, "Referer")) {
+        curl_header_append(&headers, "Referer", referer);
+    }
+    for (const struct curl_slist *item = custom; item; item = item->next) {
+        struct curl_slist *updated = curl_slist_append(headers, item->data);
+        if (updated) headers = updated;
+    }
+    return headers;
+}
+
+static void configure_curl_common(Engine *engine, CURL *easy, const char *referer)
+{
+    curl_easy_setopt(easy, CURLOPT_SHARE, engine->share);
+    /* An empty COOKIEFILE enables libcurl's in-memory cookie engine. The
+       share handle makes it common to the main request and all subresources. */
+    curl_easy_setopt(easy, CURLOPT_COOKIEFILE, "");
+    if (engine->cookie_jar_path) {
+        curl_easy_setopt(easy, CURLOPT_COOKIEJAR, engine->cookie_jar_path);
+    }
+    curl_easy_setopt(easy, CURLOPT_USERAGENT,
+                     "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/152.0.0.0 Safari/537.36");
+    curl_easy_setopt(easy, CURLOPT_ACCEPT_ENCODING, "");
+    curl_easy_setopt(easy, CURLOPT_AUTOREFERER, 1L);
+    (void)referer;
+}
+
+static bool cookie_domain_matches(const char *cookie_domain, const char *host)
+{
+    while (*cookie_domain == '.') ++cookie_domain;
+    size_t domain_length = strlen(cookie_domain);
+    size_t host_length = strlen(host);
+    if (domain_length > host_length) return false;
+    const char *suffix = host + host_length - domain_length;
+    return d_ieq(suffix, cookie_domain) &&
+           (suffix == host || suffix[-1] == '.');
+}
+
+static bool cookie_path_matches(const char *cookie_path, const char *path)
+{
+    if (!cookie_path || !*cookie_path) cookie_path = "/";
+    if (!path || !*path) path = "/";
+    size_t length = strlen(cookie_path);
+    if (strncmp(cookie_path, path, length) != 0) return false;
+    return length == 1 || path[length] == '\0' || cookie_path[length - 1] == '/' ||
+           path[length] == '/';
+}
+
+static char *cookie_string_from_list(const struct curl_slist *list, const char *url)
+{
+    char *host = url_host_for_cookie(url);
+    char *path = url_path(url);
+    bool secure_url = d_starts(url, "https://");
+    DBuffer out;
+    dbuf_init(&out);
+    time_t now = time(NULL);
+    for (const struct curl_slist *item = list; item; item = item->next) {
+        char *line = d_strdup(item->data);
+        char *fields[7] = {0};
+        size_t field_count = 0;
+        char *cursor = line;
+        while (field_count < 7) {
+            fields[field_count++] = cursor;
+            char *tab = strchr(cursor, '\t');
+            if (!tab) break;
+            *tab = '\0';
+            cursor = tab + 1;
+        }
+        if (field_count == 7) {
+            const char *domain = fields[0];
+            if (d_starts(domain, "#HttpOnly_")) domain += strlen("#HttpOnly_");
+            long long expires = strtoll(fields[4], NULL, 10);
+            bool valid_expiry = expires <= 0 || (time_t)expires > now;
+            bool domain_ok = cookie_domain_matches(domain, host);
+            bool path_ok = cookie_path_matches(fields[2], path);
+            bool secure_ok = !d_ieq(fields[3], "TRUE") || secure_url;
+            if (valid_expiry && domain_ok && path_ok && secure_ok && *fields[5]) {
+                if (out.length) dbuf_puts(&out, "; ");
+                dbuf_printf(&out, "%s=%s", fields[5], fields[6]);
+            }
+        }
+        free(line);
+    }
+    free(host);
+    free(path);
+    return dbuf_take(&out);
+}
+
+static char *cookie_string_for_url(Engine *engine, const char *url)
+{
+    if (!is_http_url(url) || !engine->share) return d_strdup(engine->script_cookies);
+    CURL *probe = curl_easy_init();
+    if (!probe) return d_strdup(engine->script_cookies);
+    configure_curl_common(engine, probe, NULL);
+    struct curl_slist *list = NULL;
+    CURLcode result = curl_easy_getinfo(probe, CURLINFO_COOKIELIST, &list);
+    char *cookies = result == CURLE_OK ? cookie_string_from_list(list, url) : d_strdup("");
+    curl_slist_free_all(list);
+    curl_easy_cleanup(probe);
+    if (!*cookies && engine->script_cookies && *engine->script_cookies) {
+        free(cookies);
+        cookies = d_strdup(engine->script_cookies);
+    }
+    return cookies;
+}
+
+static char *cookie_pair(const char *value)
+{
+    const char *end = strchr(value ? value : "", ';');
+    char *raw = d_strndup(value ? value : "", end ? (size_t)(end - value) : strlen(value ? value : ""));
+    char *pair = d_trim(raw);
+    free(raw);
+    const char *equals = strchr(pair, '=');
+    if (!equals || equals == pair) {
+        free(pair);
+        return d_strdup("");
+    }
+    return pair;
+}
+
+static void remember_script_cookie(Engine *engine, const char *pair)
+{
+    const char *equals = strchr(pair, '=');
+    if (!equals || equals == pair) return;
+    size_t name_length = (size_t)(equals - pair);
+    DBuffer out;
+    dbuf_init(&out);
+    const char *cursor = engine->script_cookies ? engine->script_cookies : "";
+    bool replaced = false;
+    while (*cursor) {
+        const char *end = strchr(cursor, ';');
+        size_t length = end ? (size_t)(end - cursor) : strlen(cursor);
+        char *old = d_trim(d_strndup(cursor, length));
+        const char *old_equals = strchr(old, '=');
+        bool same = old_equals && (size_t)(old_equals - old) == name_length &&
+                    strncmp(old, pair, name_length) == 0;
+        if (!same && *old) {
+            if (out.length) dbuf_puts(&out, "; ");
+            dbuf_puts(&out, old);
+        } else if (same) {
+            replaced = true;
+        }
+        free(old);
+        cursor = end ? end + 1 : cursor + length;
+        if (!end) break;
+    }
+    if (!replaced && out.length) dbuf_puts(&out, "; ");
+    dbuf_puts(&out, pair);
+    free(engine->script_cookies);
+    engine->script_cookies = dbuf_take(&out);
+}
+
+static void import_script_cookie(Engine *engine, const char *pair)
+{
+    if (!engine->share || !is_http_url(engine->source_url)) return;
+    char *domain = url_cookie_domain(engine->source_url);
+    DBuffer line;
+    dbuf_init(&line);
+    dbuf_printf(&line, "Set-Cookie: %s; Domain=%s; Path=/", pair, domain);
+    if (d_starts(engine->source_url, "https://")) dbuf_puts(&line, "; Secure");
+    CURL *easy = curl_easy_init();
+    if (easy) {
+        configure_curl_common(engine, easy, NULL);
+        curl_easy_setopt(easy, CURLOPT_COOKIELIST, line.data);
+        curl_easy_cleanup(easy);
+    }
+    dbuf_free(&line);
+    free(domain);
+}
+
+static JSValue cookie_get_callback(JSContext *ctx, JSValueConst this_val,
+                                   int argc, JSValueConst *argv)
+{
+    (void)this_val; (void)argc; (void)argv;
+    Engine *engine = JS_GetContextOpaque(ctx);
+    char *cookies = cookie_string_for_url(engine, engine->source_url);
+    JSValue result = js_str(ctx, cookies);
+    free(cookies);
+    return result;
+}
+
+static JSValue cookie_set_callback(JSContext *ctx, JSValueConst this_val,
+                                   int argc, JSValueConst *argv)
+{
+    (void)this_val;
+    if (!argc) return JS_UNDEFINED;
+    Engine *engine = JS_GetContextOpaque(ctx);
+    char *value = js_string(ctx, argv[0]);
+    char *pair = cookie_pair(value);
+    if (*pair) {
+        remember_script_cookie(engine, pair);
+        import_script_cookie(engine, pair);
+    }
+    free(pair);
+    free(value);
+    return JS_UNDEFINED;
+}
+
+static size_t response_header_callback(void *ptr, size_t size, size_t count,
+                                       void *opaque)
+{
+    Request *request = opaque;
+    size_t length = size * count;
+    const char *line = ptr;
+    if (length >= 5 && strncmp(line, "HTTP/", 5) == 0) {
+        header_vec_clear(&request->response_headers);
+        return length;
+    }
+    if (!length || line[0] == '\r' || line[0] == '\n') return length;
+    const char *colon = memchr(line, ':', length);
+    if (!colon || colon == line) return length;
+    char *name = d_trim(d_strndup(line, (size_t)(colon - line)));
+    char *value = d_trim(d_strndup(colon + 1, length - (size_t)(colon - line) - 1));
+    if (*name) {
+        char *normalized = d_lower(name);
+        header_vec_push(&request->response_headers, normalized, value);
+        free(normalized);
+    }
+    free(name);
+    free(value);
+    return length;
+}
+
 static bool fetch_sync_request(Engine *engine, const char *url, DBuffer *body,
                                long *status, char **effective_url,
                                const char *request_method, const char *request_data)
@@ -339,7 +672,12 @@ static bool fetch_sync_request(Engine *engine, const char *url, DBuffer *body,
     curl_easy_setopt(easy, CURLOPT_FOLLOWLOCATION, 1L);
     curl_easy_setopt(easy, CURLOPT_WRITEFUNCTION, curl_write);
     curl_easy_setopt(easy, CURLOPT_WRITEDATA, body);
-    curl_easy_setopt(easy, CURLOPT_USERAGENT, "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/152.0.0.0 Safari/537.36");
+    configure_curl_common(engine, easy, engine->source_url == url ? NULL : engine->source_url);
+    bool document_request = d_eq(engine->source_url, url) &&
+                            (!request_method || d_ieq(request_method, "GET"));
+    struct curl_slist *headers = default_request_headers(
+        document_request ? NULL : engine->source_url, NULL, document_request);
+    curl_easy_setopt(easy, CURLOPT_HTTPHEADER, headers);
     curl_easy_setopt(easy, CURLOPT_CONNECTTIMEOUT_MS, connection_timeout_ms(engine));
     curl_easy_setopt(easy, CURLOPT_TIMEOUT_MS, (long)engine->cap_ms);
     if (request_method && d_ieq(request_method, "post")) {
@@ -354,6 +692,7 @@ static bool fetch_sync_request(Engine *engine, const char *url, DBuffer *body,
         curl_easy_getinfo(easy, CURLINFO_EFFECTIVE_URL, &final_url);
         *effective_url = final_url ? d_strdup(final_url) : d_strdup(url);
     }
+    curl_slist_free_all(headers);
     curl_easy_cleanup(easy);
     if (status) *status = code;
     return result == CURLE_OK;
@@ -444,9 +783,12 @@ static void free_request(Engine *engine, Request *request)
         curl_easy_cleanup(request->easy);
     }
     curl_slist_free_all(request->headers);
+    curl_slist_free_all(request->wire_headers);
+    header_vec_free(&request->response_headers);
     free(request->url);
     free(request->method);
     free(request->request_data);
+    free(request->effective_url);
     dbuf_free(&request->body);
     if (!JS_IsUndefined(request->resolve)) JS_FreeValue(engine->context, request->resolve);
     if (!JS_IsUndefined(request->reject)) JS_FreeValue(engine->context, request->reject);
@@ -457,12 +799,20 @@ static bool attach_request_handle(Engine *engine, Request *request)
 {
     request->easy = curl_easy_init();
     if (!request->easy) return false;
+    header_vec_clear(&request->response_headers);
+    free(request->effective_url);
+    request->effective_url = NULL;
     curl_easy_setopt(request->easy, CURLOPT_URL, request->url);
     curl_easy_setopt(request->easy, CURLOPT_FOLLOWLOCATION, 1L);
     curl_easy_setopt(request->easy, CURLOPT_WRITEFUNCTION, curl_write);
     curl_easy_setopt(request->easy, CURLOPT_WRITEDATA, &request->body);
     curl_easy_setopt(request->easy, CURLOPT_PRIVATE, request);
-    curl_easy_setopt(request->easy, CURLOPT_USERAGENT, "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/152.0.0.0 Safari/537.36");
+    configure_curl_common(engine, request->easy, engine->source_url);
+    curl_easy_setopt(request->easy, CURLOPT_HEADERFUNCTION, response_header_callback);
+    curl_easy_setopt(request->easy, CURLOPT_HEADERDATA, request);
+    curl_slist_free_all(request->wire_headers);
+    request->wire_headers = default_request_headers(engine->source_url, request->headers, false);
+    curl_easy_setopt(request->easy, CURLOPT_HTTPHEADER, request->wire_headers);
     curl_easy_setopt(request->easy, CURLOPT_CONNECTTIMEOUT_MS, connection_timeout_ms(engine));
     if (request->method && !d_ieq(request->method, "GET")) {
         if (d_ieq(request->method, "POST")) {
@@ -473,13 +823,6 @@ static bool attach_request_handle(Engine *engine, Request *request)
             if (request->request_data) curl_easy_setopt(request->easy, CURLOPT_POSTFIELDS, request->request_data);
         }
     }
-    if (request->request_data) {
-        struct curl_slist *headers = NULL;
-        curl_slist_free_all(request->headers);
-        headers = curl_slist_append(headers, "Content-Type: application/json");
-        curl_easy_setopt(request->easy, CURLOPT_HTTPHEADER, headers);
-        request->headers = headers;
-    }
     if (curl_multi_add_handle(engine->multi, request->easy) != CURLM_OK) {
         curl_easy_cleanup(request->easy);
         request->easy = NULL;
@@ -489,7 +832,8 @@ static bool attach_request_handle(Engine *engine, Request *request)
 }
 
 static Request *start_request(Engine *engine, RequestKind kind, const char *url,
-                              const char *method, const char *request_data)
+                              const char *method, const char *request_data,
+                              struct curl_slist *headers)
 {
     Request *request = d_xcalloc(1, sizeof(*request));
     request->kind = kind;
@@ -497,6 +841,7 @@ static Request *start_request(Engine *engine, RequestKind kind, const char *url,
     request->url = d_strdup(url);
     request->method = d_strdup(method && *method ? method : "GET");
     request->request_data = request_data ? d_strdup(request_data) : NULL;
+    request->headers = headers;
     request->resolve = JS_UNDEFINED;
     request->reject = JS_UNDEFINED;
     dbuf_init(&request->body);
@@ -547,40 +892,249 @@ static JSValue response_json(JSContext *ctx, JSValueConst self, int argc, JSValu
 static JSValue response_header_get(JSContext *ctx, JSValueConst this_val, int argc,
                                     JSValueConst *argv)
 {
-    (void)ctx; (void)this_val; (void)argc; (void)argv;
-    return JS_NULL;
+    if (argc < 1) return JS_NULL;
+    char *needle = js_string(ctx, argv[0]);
+    JSValue items = JS_GetPropertyStr(ctx, this_val, "_items");
+    int64_t length = json_array_length_for_context(ctx, items);
+    DBuffer value;
+    dbuf_init(&value);
+    bool found = false;
+    for (int64_t i = 0; i < length; ++i) {
+        JSValue item = JS_GetPropertyUint32(ctx, items, (uint32_t)i);
+        JSValue name_value = JS_GetPropertyStr(ctx, item, "name");
+        JSValue item_value = JS_GetPropertyStr(ctx, item, "value");
+        char *name = js_string(ctx, name_value);
+        if (d_ieq(name, needle)) {
+            char *text = js_string(ctx, item_value);
+            if (found) dbuf_puts(&value, ", ");
+            dbuf_puts(&value, text);
+            found = true;
+            free(text);
+        }
+        free(name);
+        JS_FreeValue(ctx, name_value);
+        JS_FreeValue(ctx, item_value);
+        JS_FreeValue(ctx, item);
+    }
+    JS_FreeValue(ctx, items);
+    free(needle);
+    if (!found) {
+        dbuf_free(&value);
+        return JS_NULL;
+    }
+    char *text = dbuf_take(&value);
+    JSValue result = js_str(ctx, text);
+    free(text);
+    return result;
 }
 
 static JSValue response_header_has(JSContext *ctx, JSValueConst this_val, int argc,
                                    JSValueConst *argv)
 {
-    (void)ctx; (void)this_val; (void)argc; (void)argv;
-    return JS_FALSE;
+    if (argc < 1) return JS_FALSE;
+    char *needle = js_string(ctx, argv[0]);
+    JSValue items = JS_GetPropertyStr(ctx, this_val, "_items");
+    int64_t length = json_array_length_for_context(ctx, items);
+    bool found = false;
+    for (int64_t i = 0; i < length && !found; ++i) {
+        JSValue item = JS_GetPropertyUint32(ctx, items, (uint32_t)i);
+        JSValue name_value = JS_GetPropertyStr(ctx, item, "name");
+        char *name = js_string(ctx, name_value);
+        found = d_ieq(name, needle);
+        free(name);
+        JS_FreeValue(ctx, name_value);
+        JS_FreeValue(ctx, item);
+    }
+    JS_FreeValue(ctx, items);
+    free(needle);
+    return JS_NewBool(ctx, found);
 }
 
 static JSValue response_header_for_each(JSContext *ctx, JSValueConst this_val, int argc,
                                         JSValueConst *argv)
 {
-    (void)ctx; (void)this_val; (void)argc; (void)argv;
+    if (argc < 1 || !JS_IsFunction(ctx, argv[0])) return JS_UNDEFINED;
+    JSValue items = JS_GetPropertyStr(ctx, this_val, "_items");
+    int64_t length = json_array_length_for_context(ctx, items);
+    for (int64_t i = 0; i < length; ++i) {
+        JSValue item = JS_GetPropertyUint32(ctx, items, (uint32_t)i);
+        JSValue name_value = JS_GetPropertyStr(ctx, item, "name");
+        JSValue item_value = JS_GetPropertyStr(ctx, item, "value");
+        JSValue args[3] = {
+            JS_DupValue(ctx, item_value),
+            JS_DupValue(ctx, name_value),
+            JS_DupValue(ctx, this_val)
+        };
+        JSValue result = JS_Call(ctx, argv[0], argc > 1 ? argv[1] : JS_UNDEFINED, 3, args);
+        for (size_t j = 0; j < 3; ++j) JS_FreeValue(ctx, args[j]);
+        JS_FreeValue(ctx, name_value);
+        JS_FreeValue(ctx, item_value);
+        JS_FreeValue(ctx, item);
+        if (JS_IsException(result)) {
+            JS_FreeValue(ctx, items);
+            return result;
+        }
+        JS_FreeValue(ctx, result);
+    }
+    JS_FreeValue(ctx, items);
     return JS_UNDEFINED;
+}
+
+static JSValue response_header_entries(JSContext *ctx, JSValueConst this_val,
+                                       int argc, JSValueConst *argv)
+{
+    (void)argc; (void)argv;
+    JSValue items = JS_GetPropertyStr(ctx, this_val, "_items");
+    int64_t length = json_array_length_for_context(ctx, items);
+    JSValue result = JS_NewArray(ctx);
+    for (int64_t i = 0; i < length; ++i) {
+        JSValue item = JS_GetPropertyUint32(ctx, items, (uint32_t)i);
+        JSValue name = JS_GetPropertyStr(ctx, item, "name");
+        JSValue value = JS_GetPropertyStr(ctx, item, "value");
+        JSValue pair = JS_NewArray(ctx);
+        JS_SetPropertyUint32(ctx, pair, 0, name);
+        JS_SetPropertyUint32(ctx, pair, 1, value);
+        JS_SetPropertyUint32(ctx, result, (uint32_t)i, pair);
+        JS_FreeValue(ctx, item);
+    }
+    JS_FreeValue(ctx, items);
+    return result;
+}
+
+static JSValue response_header_keys(JSContext *ctx, JSValueConst this_val,
+                                    int argc, JSValueConst *argv)
+{
+    (void)argc; (void)argv;
+    JSValue items = JS_GetPropertyStr(ctx, this_val, "_items");
+    int64_t length = json_array_length_for_context(ctx, items);
+    JSValue result = JS_NewArray(ctx);
+    for (int64_t i = 0; i < length; ++i) {
+        JSValue item = JS_GetPropertyUint32(ctx, items, (uint32_t)i);
+        JSValue name = JS_GetPropertyStr(ctx, item, "name");
+        JS_SetPropertyUint32(ctx, result, (uint32_t)i, name);
+        JS_FreeValue(ctx, item);
+    }
+    JS_FreeValue(ctx, items);
+    return result;
+}
+
+static JSValue response_header_values(JSContext *ctx, JSValueConst this_val,
+                                      int argc, JSValueConst *argv)
+{
+    (void)argc; (void)argv;
+    JSValue items = JS_GetPropertyStr(ctx, this_val, "_items");
+    int64_t length = json_array_length_for_context(ctx, items);
+    JSValue result = JS_NewArray(ctx);
+    for (int64_t i = 0; i < length; ++i) {
+        JSValue item = JS_GetPropertyUint32(ctx, items, (uint32_t)i);
+        JSValue value = JS_GetPropertyStr(ctx, item, "value");
+        JS_SetPropertyUint32(ctx, result, (uint32_t)i, value);
+        JS_FreeValue(ctx, item);
+    }
+    JS_FreeValue(ctx, items);
+    return result;
+}
+
+static bool forbidden_request_header(const char *name)
+{
+    char *lower = d_lower(name);
+    const char *forbidden[] = {
+        "connection", "content-length", "cookie", "host", "origin",
+        "referer", "user-agent", "accept-encoding", "access-control-request-headers",
+        "access-control-request-method", "proxy-", "sec-"
+    };
+    for (size_t i = 0; i < sizeof(forbidden) / sizeof(forbidden[0]); ++i) {
+        if (forbidden[i][strlen(forbidden[i]) - 1] == '-') {
+            if (d_starts(lower, forbidden[i])) { free(lower); return true; }
+        } else if (d_ieq(lower, forbidden[i])) {
+            free(lower);
+            return true;
+        }
+    }
+    free(lower);
+    return false;
+}
+
+static void append_page_header(struct curl_slist **headers, const char *name,
+                               const char *value)
+{
+    if (!name || !*name || !value || forbidden_request_header(name) ||
+        strpbrk(name, "\r\n") || strpbrk(value, "\r\n")) return;
+    DBuffer line;
+    dbuf_init(&line);
+    dbuf_printf(&line, "%s: %s", name, value);
+    struct curl_slist *updated = curl_slist_append(*headers, line.data);
+    dbuf_free(&line);
+    if (updated) *headers = updated;
+}
+
+static struct curl_slist *page_headers_from_js(JSContext *ctx, JSValueConst value)
+{
+    const char *source =
+        "(function(h){if(h==null)return [];"
+        "if(Array.isArray(h))return h.map(p=>[p[0],p[1]]);"
+        "if(typeof h.forEach==='function'){var a=[];h.forEach((v,k)=>a.push([k,v]));return a;}"
+        "return Object.keys(h).map(k=>[k,h[k]]);})";
+    JSValue converter = JS_Eval(ctx, source, strlen(source), "distill-fetch-headers.js",
+                                JS_EVAL_TYPE_GLOBAL);
+    if (JS_IsException(converter)) {
+        JS_FreeValue(ctx, converter);
+        return NULL;
+    }
+    JSValue pairs = JS_Call(ctx, converter, JS_UNDEFINED, 1, &value);
+    JS_FreeValue(ctx, converter);
+    if (JS_IsException(pairs)) {
+        JS_FreeValue(ctx, pairs);
+        return NULL;
+    }
+    int64_t length = 0;
+    JS_GetLength(ctx, pairs, &length);
+    struct curl_slist *headers = NULL;
+    for (int64_t i = 0; i < length; ++i) {
+        JSValue pair = JS_GetPropertyUint32(ctx, pairs, (uint32_t)i);
+        JSValue name_value = JS_GetPropertyUint32(ctx, pair, 0);
+        JSValue header_value = JS_GetPropertyUint32(ctx, pair, 1);
+        char *name = js_string(ctx, name_value);
+        char *text = js_string(ctx, header_value);
+        append_page_header(&headers, name, text);
+        free(name); free(text);
+        JS_FreeValue(ctx, name_value);
+        JS_FreeValue(ctx, header_value);
+        JS_FreeValue(ctx, pair);
+    }
+    JS_FreeValue(ctx, pairs);
+    return headers;
 }
 
 static JSValue make_response(Engine *engine, Request *request)
 {
     JSContext *ctx = engine->context;
     JSValue response = JS_NewObject(ctx);
+    const char *response_url = request->effective_url && *request->effective_url
+                                   ? request->effective_url : request->url;
     JS_SetPropertyStr(ctx, response, "ok", JS_NewBool(ctx, request->status >= 200 && request->status < 300));
     JS_SetPropertyStr(ctx, response, "status", JS_NewInt32(ctx, (int32_t)request->status));
-    JS_SetPropertyStr(ctx, response, "url", js_str(ctx, request->url));
+    JS_SetPropertyStr(ctx, response, "url", js_str(ctx, response_url));
     JS_SetPropertyStr(ctx, response, "_body", js_strn(ctx, request->body.data, request->body.length));
     JS_SetPropertyStr(ctx, response, "text", JS_NewCFunction(ctx, response_text, "text", 0));
     JS_SetPropertyStr(ctx, response, "json", JS_NewCFunction(ctx, response_json, "json", 0));
-    JS_SetPropertyStr(ctx, response, "redirected", JS_NewBool(ctx, false));
+    JS_SetPropertyStr(ctx, response, "redirected", JS_NewBool(ctx, !d_eq(response_url, request->url)));
     JS_SetPropertyStr(ctx, response, "type", js_str(ctx, "basic"));
     JSValue headers = JS_NewObject(ctx);
+    JSValue items = JS_NewArray(ctx);
+    for (size_t i = 0; i < request->response_headers.length; ++i) {
+        JSValue item = JS_NewObject(ctx);
+        JS_SetPropertyStr(ctx, item, "name", js_str(ctx, request->response_headers.items[i].name));
+        JS_SetPropertyStr(ctx, item, "value", js_str(ctx, request->response_headers.items[i].value));
+        JS_SetPropertyUint32(ctx, items, (uint32_t)i, item);
+    }
+    JS_SetPropertyStr(ctx, headers, "_items", items);
     JS_SetPropertyStr(ctx, headers, "get", JS_NewCFunction(ctx, response_header_get, "get", 1));
     JS_SetPropertyStr(ctx, headers, "has", JS_NewCFunction(ctx, response_header_has, "has", 1));
     JS_SetPropertyStr(ctx, headers, "forEach", JS_NewCFunction(ctx, response_header_for_each, "forEach", 1));
+    JS_SetPropertyStr(ctx, headers, "entries", JS_NewCFunction(ctx, response_header_entries, "entries", 0));
+    JS_SetPropertyStr(ctx, headers, "keys", JS_NewCFunction(ctx, response_header_keys, "keys", 0));
+    JS_SetPropertyStr(ctx, headers, "values", JS_NewCFunction(ctx, response_header_values, "values", 0));
     JS_SetPropertyStr(ctx, response, "headers", headers);
     return response;
 }
@@ -596,17 +1150,24 @@ static JSValue fetch_callback(JSContext *ctx, JSValueConst this_val, int argc, J
     JSValue promise = JS_NewPromiseCapability(ctx, functions);
     char *method = d_strdup("GET");
     char *request_data = NULL;
+    struct curl_slist *headers = NULL;
     if (argc > 1 && JS_IsObject(argv[1])) {
         JSValue method_value = JS_GetPropertyStr(ctx, argv[1], "method");
         JSValue body_value = JS_GetPropertyStr(ctx, argv[1], "body");
+        JSValue headers_value = JS_GetPropertyStr(ctx, argv[1], "headers");
         free(method);
-        method = js_string(ctx, method_value);
+        method = (JS_IsUndefined(method_value) || JS_IsNull(method_value))
+                     ? d_strdup("GET") : js_string(ctx, method_value);
         if (!*method) { free(method); method = d_strdup("GET"); }
         if (!JS_IsUndefined(body_value) && !JS_IsNull(body_value)) request_data = js_string(ctx, body_value);
+        if (!JS_IsUndefined(headers_value) && !JS_IsNull(headers_value)) {
+            headers = page_headers_from_js(ctx, headers_value);
+        }
         JS_FreeValue(ctx, method_value);
         JS_FreeValue(ctx, body_value);
+        JS_FreeValue(ctx, headers_value);
     }
-    Request *request = start_request(engine, REQUEST_FETCH, url, method, request_data);
+    Request *request = start_request(engine, REQUEST_FETCH, url, method, request_data, headers);
     free(method);
     free(request_data);
     if (!request) {
@@ -770,6 +1331,10 @@ static void process_network(Engine *engine)
         curl_easy_getinfo(message->easy_handle, CURLINFO_PRIVATE, &request);
         if (!request) continue;
         curl_easy_getinfo(message->easy_handle, CURLINFO_RESPONSE_CODE, &request->status);
+        char *effective_url = NULL;
+        curl_easy_getinfo(message->easy_handle, CURLINFO_EFFECTIVE_URL, &effective_url);
+        free(request->effective_url);
+        request->effective_url = effective_url ? d_strdup(effective_url) : d_strdup(request->url);
         curl_multi_remove_handle(engine->multi, message->easy_handle);
         CURLcode result = message->data.result;
         curl_easy_cleanup(request->easy);
@@ -849,7 +1414,7 @@ static const char *HOST_JS =
 "Object.defineProperty(document, 'dispatchEvent', {value:event => __dispatch('document', event.type), configurable:true});"
 "document.readyState = 'loading';"
 "document.visibilityState = 'visible';"
-"Object.defineProperty(document, 'cookie', {get() { return this.__distillCookie || ''; }, set(value) { const pair = String(value).split(';', 1)[0]; const name = pair.slice(0, pair.indexOf('=')); const old = (this.__distillCookie || '').split(';').filter(item => item.trim() && item.trim().split('=')[0] !== name); if (pair.indexOf('=') >= 0) old.push(pair); this.__distillCookie = old.join('; '); }, configurable:true});"
+"Object.defineProperty(document, 'cookie', {get() { return __distillCookieGet(); }, set(value) { __distillCookieSet(String(value)); }, configurable:true});"
 "globalThis.localStorage = {__data: Object.create(null), getItem(k) { return this.__data[k] === undefined ? null : this.__data[k]; }, setItem(k,v) { this.__data[k] = String(v); }, removeItem(k) { delete this.__data[k]; }, clear() { this.__data = Object.create(null); }, key(i) { return Object.keys(this.__data)[i] ?? null; }};"
 "Object.defineProperty(localStorage, 'length', {get() { return Object.keys(this.__data).length; }});"
 "globalThis.sessionStorage = {__data: Object.create(null), getItem(k) { return this.__data[k] === undefined ? null : this.__data[k]; }, setItem(k,v) { this.__data[k] = String(v); }, removeItem(k) { delete this.__data[k]; }, clear() { this.__data = Object.create(null); }, key(i) { return Object.keys(this.__data)[i] ?? null; }};"
@@ -875,6 +1440,7 @@ static const char *HOST_JS =
 "if (document.createRange) { const __createRange=document.createRange.bind(document); document.createRange=() => { const range=__createRange(); range.getBoundingClientRect=() => ({x:0,y:0,top:0,left:0,width:800,height:20,right:800,bottom:20}); range.getClientRects=() => [range.getBoundingClientRect()]; return range; }; }"
 "globalThis.__resolveURL = function(value, baseValue) { const raw = String(value || ''); const fallback = (document.querySelector('base') && document.querySelector('base').getAttribute('href')) || location.href; const base = String(baseValue || fallback); const schemeAt = base.indexOf('://'); const baseOrigin = schemeAt < 0 ? '' : base.slice(0, schemeAt + 3) + base.slice(schemeAt + 3).split(/[/?#]/)[0]; if (/^[a-z]+:/i.test(raw)) return raw; if (raw.startsWith('//')) return (location.protocol || 'https:') + raw; if (raw.startsWith('/')) return baseOrigin + raw; const basePathEnd = base.search(/[?#]/); const basePath = basePathEnd < 0 ? base : base.slice(0, basePathEnd); const prefix = basePath.endsWith('/') ? basePath : basePath.slice(0, basePath.lastIndexOf('/') + 1); const pieces = (prefix + raw).split('/'); const clean = []; for (const piece of pieces) { if (!piece || piece === '.') continue; if (piece === '..') clean.pop(); else clean.push(piece); } return baseOrigin + '/' + clean.join('/'); };"
 "globalThis.URLSearchParams = class { constructor(value='') { this.__pairs=[]; const source=String(value).replace(/^\\?/, ''); for (const part of source ? source.split('&') : []) { const at=part.indexOf('='); const key=decodeURIComponent((at < 0 ? part : part.slice(0, at)).replace(/\\+/g, ' ')); const val=decodeURIComponent((at < 0 ? '' : part.slice(at + 1)).replace(/\\+/g, ' ')); this.__pairs.push([key, val]); } } append(key, value) { this.__pairs.push([String(key), String(value)]); } set(key, value) { this.delete(key); this.append(key, value); } get(key) { const item=this.__pairs.find(pair => pair[0] === String(key)); return item ? item[1] : null; } getAll(key) { return this.__pairs.filter(pair => pair[0] === String(key)).map(pair => pair[1]); } has(key) { return this.__pairs.some(pair => pair[0] === String(key)); } delete(key) { this.__pairs=this.__pairs.filter(pair => pair[0] !== String(key)); } forEach(callback, thisArg) { this.__pairs.forEach(pair => callback.call(thisArg, pair[1], pair[0], this)); } entries() { return this.__pairs[Symbol.iterator](); } keys() { return this.__pairs.map(pair => pair[0])[Symbol.iterator](); } values() { return this.__pairs.map(pair => pair[1])[Symbol.iterator](); } toString() { return this.__pairs.map(pair => encodeURIComponent(pair[0]) + '=' + encodeURIComponent(pair[1])).join('&'); } [Symbol.iterator]() { return this.entries(); } };"
+"globalThis.Headers = class { constructor(init) { this.__items=Object.create(null); if (init) { if (typeof init.forEach === 'function') init.forEach((v,k) => this.append(k,v)); else if (Array.isArray(init)) init.forEach(pair => this.append(pair[0], pair[1])); else Object.keys(init).forEach(k => this.append(k, init[k])); } } append(name,value) { const key=String(name).toLowerCase(); this.__items[key]=this.__items[key] ? this.__items[key]+', '+String(value) : String(value); } set(name,value) { this.__items[String(name).toLowerCase()]=String(value); } get(name) { const value=this.__items[String(name).toLowerCase()]; return value === undefined ? null : value; } has(name) { return Object.prototype.hasOwnProperty.call(this.__items, String(name).toLowerCase()); } delete(name) { delete this.__items[String(name).toLowerCase()]; } forEach(callback,thisArg) { Object.keys(this.__items).forEach(k => callback.call(thisArg,this.__items[k],k,this)); } entries() { return Object.keys(this.__items).map(k => [k,this.__items[k]]); } keys() { return Object.keys(this.__items); } values() { return Object.keys(this.__items).map(k => this.__items[k]); } [Symbol.iterator]() { return this.entries()[Symbol.iterator](); } }; __setWindow('Headers', Headers);"
 "globalThis.URL = class { constructor(value, base) { const href=__resolveURL(value, base); const scheme=href.indexOf('://'); const authorityStart=scheme < 0 ? 0 : scheme + 3; const tail=href.slice(authorityStart); const authorityEnd=tail.search(/[/?#]/); const authority=authorityEnd < 0 ? tail : tail.slice(0, authorityEnd); const rest=authorityEnd < 0 ? '' : tail.slice(authorityEnd); const pathEnd=rest.search(/[?#]/); this.protocol=scheme < 0 ? '' : href.slice(0, scheme + 1); this.origin=scheme < 0 ? '' : href.slice(0, authorityStart) + authority; this.host=authority; this.hostname=authority.replace(/^.*@/, '').replace(/:\\d+$/, ''); this.port=(this.hostname === authority ? '' : authority.slice(authority.lastIndexOf(':') + 1)); this.pathname=pathEnd < 0 ? (rest || '/') : (rest.slice(0, pathEnd) || '/'); const query=rest.indexOf('?'); const hash=rest.indexOf('#'); this.search=query < 0 ? '' : rest.slice(query, hash < 0 ? rest.length : hash); this.hash=hash < 0 ? '' : rest.slice(hash); this.username=''; this.password=''; this.href=this.origin + this.pathname + this.search + this.hash; this.searchParams=new URLSearchParams(this.search); } toString() { return this.href; } toJSON() { return this.href; } static canParse(value, base) { try { new URL(value, base); return true; } catch (e) { return false; } } }; globalThis.URL.createObjectURL = () => 'blob:distill'; globalThis.URL.revokeObjectURL = () => {}; __setWindow('URL', URL); __setWindow('URLSearchParams', URLSearchParams);"
 "globalThis.__anchorPart = function(node, part) { const href = __resolveURL(node.getAttribute('href') || ''); const scheme = href.indexOf('://'); if (scheme < 0) return part === 'href' ? href : ''; const authority = scheme + 3; const tail = href.slice(authority); const end = tail.search(/[/?#]/); const host = end < 0 ? tail : tail.slice(0, end); const rest = end < 0 ? '' : tail.slice(end); const pathEnd = rest.search(/[?#]/); const pathname = pathEnd < 0 ? (rest || '/') : (rest.slice(0, pathEnd) || '/'); const query = rest.indexOf('?'); const hash = rest.indexOf('#'); const search = query < 0 ? '' : rest.slice(query, hash < 0 ? rest.length : hash); const fragment = hash < 0 ? '' : rest.slice(hash); const portAt = host.lastIndexOf(':'); const hasPort = portAt > -1 && host.indexOf(']') < portAt; const hostname = hasPort ? host.slice(0, portAt) : host; const port = hasPort ? host.slice(portAt + 1) : ''; if (part === 'href') return href; if (part === 'protocol') return href.slice(0, scheme + 1); if (part === 'host') return host; if (part === 'hostname') return hostname; if (part === 'port') return port; if (part === 'pathname') return pathname; if (part === 'search') return search; if (part === 'hash') return fragment; return ''; };"
 "try { Object.defineProperty(HTMLAnchorElement.prototype, 'href', {get() { return __anchorPart(this, 'href'); }, set(value) { this.setAttribute('href', value); }, configurable:true}); Object.defineProperty(HTMLAnchorElement.prototype, 'protocol', {get() { return __anchorPart(this, 'protocol'); }, configurable:true}); Object.defineProperty(HTMLAnchorElement.prototype, 'host', {get() { return __anchorPart(this, 'host'); }, configurable:true}); Object.defineProperty(HTMLAnchorElement.prototype, 'hostname', {get() { return __anchorPart(this, 'hostname'); }, configurable:true}); Object.defineProperty(HTMLAnchorElement.prototype, 'port', {get() { return __anchorPart(this, 'port'); }, configurable:true}); Object.defineProperty(HTMLAnchorElement.prototype, 'pathname', {get() { return __anchorPart(this, 'pathname'); }, configurable:true}); Object.defineProperty(HTMLAnchorElement.prototype, 'search', {get() { return __anchorPart(this, 'search'); }, configurable:true}); Object.defineProperty(HTMLAnchorElement.prototype, 'hash', {get() { return __anchorPart(this, 'hash'); }, configurable:true}); } catch (e) {}"
@@ -887,7 +1453,7 @@ static const char *HOST_JS =
 "globalThis.IntersectionObserver = class { constructor(callback) { this.callback = callback; } observe(target) { this.callback([{target, isIntersecting:true, intersectionRatio:1, intersectionRect:{top:0,left:0,width:1280,height:1024,right:1280,bottom:1024}}], this); } unobserve() {} disconnect() {} };"
 "globalThis.ResizeObserver = class { constructor(callback) { this.callback=callback; } observe(target) { this.callback([{target, contentRect:{x:0,y:0,top:0,left:0,width:800,height:20,right:800,bottom:20}, borderBoxSize:[{inlineSize:800,blockSize:20},], contentBoxSize:[{inlineSize:800,blockSize:20}]}], this); } unobserve() {} disconnect() {} }; __setWindow('ResizeObserver', ResizeObserver);"
 "globalThis.MutationObserver = class { constructor(callback) { this.callback = callback; } observe() { this.callback([{}], this); } disconnect() {} };"
-"globalThis.XMLHttpRequest = class { constructor() { this.readyState=0; this.status=0; this.responseText=''; this.onreadystatechange=null; this.onload=null; this.onerror=null; } open(method,url,async=true) { this._method=method || 'GET'; this._url=url; this._async=async; this.readyState=1; } send(body) { fetch(this._url,{method:this._method,body}).then(r => r.text().then(t => { this.status=r.status; this.responseText=t; this.readyState=4; if (this.onreadystatechange) this.onreadystatechange(); if (this.onload) this.onload(); })).catch(error => { if (this.onerror) this.onerror(error); }); } };"
+"globalThis.XMLHttpRequest = class { constructor() { this.readyState=0; this.status=0; this.responseText=''; this.responseURL=''; this.onreadystatechange=null; this.onload=null; this.onerror=null; this._headers=Object.create(null); this._responseHeaders=Object.create(null); } open(method,url,async=true) { this._method=method || 'GET'; this._url=url; this._async=async; this.readyState=1; } setRequestHeader(name,value) { const key=String(name).toLowerCase(); this._headers[key]=this._headers[key] ? this._headers[key]+', '+String(value) : String(value); } getResponseHeader(name) { return this._responseHeaders[String(name).toLowerCase()] || null; } getAllResponseHeaders() { return Object.keys(this._responseHeaders).map(k=>k+': '+this._responseHeaders[k]).join('\\r\\n'); } send(body) { fetch(this._url,{method:this._method,body,headers:this._headers}).then(r => { this.status=r.status; this.responseURL=r.url || this._url; r.headers.forEach((v,k)=>{this._responseHeaders[k.toLowerCase()]=v;}); return r.text(); }).then(t => { this.responseText=t; this.readyState=4; if (this.onreadystatechange) this.onreadystatechange(); if (this.onload) this.onload(); }).catch(error => { if (this.onerror) this.onerror(error); }); } };"
 "__setWindow('XMLHttpRequest', XMLHttpRequest); __setWindow('IntersectionObserver', IntersectionObserver); __setWindow('MutationObserver', MutationObserver);"
 "__setWindow('Node', globalThis.Node || {ELEMENT_NODE:1,TEXT_NODE:3,DOCUMENT_NODE:9,DOCUMENT_FRAGMENT_NODE:11});";
 
@@ -1014,6 +1580,10 @@ static bool install_host(Engine *engine)
     JS_SetPropertyStr(ctx, engine->window, "location", JS_GetPropertyStr(ctx, engine->global, "location"));
     JS_SetPropertyStr(ctx, engine->document, "location", JS_GetPropertyStr(ctx, engine->global, "location"));
     JS_SetPropertyStr(ctx, engine->global, "fetch", JS_NewCFunction(ctx, fetch_callback, "fetch", 1));
+    JS_SetPropertyStr(ctx, engine->global, "__distillCookieGet",
+                      JS_NewCFunction(ctx, cookie_get_callback, "__distillCookieGet", 0));
+    JS_SetPropertyStr(ctx, engine->global, "__distillCookieSet",
+                      JS_NewCFunction(ctx, cookie_set_callback, "__distillCookieSet", 1));
     JS_SetPropertyStr(ctx, engine->global, "setTimeout", JS_NewCFunctionMagic(ctx, timer_callback, "setTimeout", 2, JS_CFUNC_generic_magic, 0));
     JS_SetPropertyStr(ctx, engine->global, "setInterval", JS_NewCFunctionMagic(ctx, timer_callback, "setInterval", 2, JS_CFUNC_generic_magic, 1));
     JS_SetPropertyStr(ctx, engine->global, "clearTimeout", JS_NewCFunctionMagic(ctx, clear_timer_callback, "clearTimeout", 1, JS_CFUNC_generic_magic, 0));
@@ -1057,7 +1627,7 @@ static bool discover_scripts(Engine *engine)
         char *url = src[0] ? resolve_url(engine->base_url, src) : NULL;
         if (is_async && url) {
             ++engine->async_pending;
-            Request *request = start_request(engine, REQUEST_ASYNC_SCRIPT, url, "GET", NULL);
+            Request *request = start_request(engine, REQUEST_ASYNC_SCRIPT, url, "GET", NULL, NULL);
             if (!request) {
                 --engine->async_pending;
             } else {
@@ -1768,8 +2338,41 @@ static void engine_cleanup(Engine *engine)
     }
     if (engine->runtime) JS_FreeRuntime(engine->runtime);
     if (engine->multi) curl_multi_cleanup(engine->multi);
+    if (engine->share) curl_share_cleanup(engine->share);
+    if (engine->cookie_jar_path) unlink(engine->cookie_jar_path);
+    free(engine->cookie_jar_path);
+    free(engine->script_cookies);
     free(engine->source_url); free(engine->base_url);
     *engine = (Engine){0};
+}
+
+static bool init_network(Engine *engine)
+{
+    char cookie_template[] = "/tmp/distill-cookies-XXXXXX";
+    int cookie_fd = mkstemp(cookie_template);
+    if (cookie_fd < 0) return false;
+    close(cookie_fd);
+    engine->cookie_jar_path = d_strdup(cookie_template);
+    engine->share = curl_share_init();
+    if (!engine->share ||
+        curl_share_setopt(engine->share, CURLSHOPT_SHARE, CURL_LOCK_DATA_COOKIE) != CURLSHE_OK) {
+        if (engine->share) curl_share_cleanup(engine->share);
+        engine->share = NULL;
+        unlink(engine->cookie_jar_path);
+        free(engine->cookie_jar_path);
+        engine->cookie_jar_path = NULL;
+        return false;
+    }
+    engine->multi = curl_multi_init();
+    if (!engine->multi) {
+        curl_share_cleanup(engine->share);
+        engine->share = NULL;
+        unlink(engine->cookie_jar_path);
+        free(engine->cookie_jar_path);
+        engine->cookie_jar_path = NULL;
+        return false;
+    }
+    return true;
 }
 
 static bool set_document_base(Engine *engine)
@@ -1810,6 +2413,14 @@ static int run_page(const char *input, uint64_t cap_ms, uint64_t memory_mb,
     engine.source_url = absolute_input(input);
     engine.base_url = d_strdup(engine.source_url);
     engine.started = clock_ms();
+    if (!init_network(&engine)) {
+        fprintf(stderr, "unable to initialize network state\n");
+#ifdef DISTILL_RENDER
+        free(owned_font_dir);
+#endif
+        free(engine.source_url); free(engine.base_url);
+        return 2;
+    }
 
     DBuffer html;
     long status = 0;
@@ -1817,10 +2428,12 @@ static int run_page(const char *input, uint64_t cap_ms, uint64_t memory_mb,
     if (!fetch_sync_request(&engine, engine.source_url, &html, &status, &effective_url,
                             request_method, request_data)) {
         fprintf(stderr, "unable to load %s (status %ld)\n", engine.source_url, status);
+        dbuf_free(&html);
+        engine_cleanup(&engine);
 #ifdef DISTILL_RENDER
         free(owned_font_dir);
 #endif
-        free(effective_url); free(engine.source_url); free(engine.base_url);
+        free(effective_url);
         return 2;
     }
     if (effective_url && *effective_url) { free(engine.source_url); engine.source_url = effective_url; }
@@ -1829,7 +2442,7 @@ static int run_page(const char *input, uint64_t cap_ms, uint64_t memory_mb,
 
     engine.runtime = JS_NewRuntime();
     if (!engine.runtime) {
-        dbuf_free(&html); free(engine.source_url); free(engine.base_url);
+        dbuf_free(&html); engine_cleanup(&engine);
 #ifdef DISTILL_RENDER
         free(owned_font_dir);
 #endif
@@ -1850,7 +2463,6 @@ static int run_page(const char *input, uint64_t cap_ms, uint64_t memory_mb,
     JS_SetContextOpaque(engine.context, &engine);
     JS_SetModuleLoaderFunc(engine.runtime, module_normalize, module_loader, &engine);
     engine.global = JS_GetGlobalObject(engine.context);
-    engine.multi = curl_multi_init();
     if (!engine.multi || !load_linkedom(&engine, &html) || !install_host(&engine)) {
         dbuf_free(&html); engine_cleanup(&engine);
 #ifdef DISTILL_RENDER

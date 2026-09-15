@@ -38,6 +38,17 @@ class CorpusHandler(SimpleHTTPRequestHandler):
     def do_GET(self):
         route = urlparse(self.path)
 
+        if route.path == "/network-contract":
+            self._request_contract("")
+            return
+
+        if route.path == "/network-redirect":
+            self.send_response(302)
+            self.send_header("Location", "/network-contract")
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+            return
+
         if route.path == "/slow":
             qs = parse_qs(route.query)
             try:
@@ -68,6 +79,39 @@ class CorpusHandler(SimpleHTTPRequestHandler):
             return
 
         super().do_GET()
+
+    def do_POST(self):
+        route = urlparse(self.path)
+        if route.path == "/network-contract":
+            try:
+                length = max(0, int(self.headers.get("Content-Length", "0")))
+            except ValueError:
+                length = 0
+            body = self.rfile.read(length).decode("utf-8", errors="replace")
+            self._request_contract(body)
+            return
+        self.send_error(405)
+
+    def _request_contract(self, body):
+        payload = {
+            "method": self.command,
+            "body": body,
+            "content_type": self.headers.get("Content-Type", ""),
+            "x_contract": self.headers.get("X-Contract", ""),
+            "accept": self.headers.get("Accept", ""),
+            "language": self.headers.get("Accept-Language", ""),
+            "referer": self.headers.get("Referer", ""),
+            "cookie": self.headers.get("Cookie", ""),
+        }
+        response = json.dumps(payload).encode("utf-8")
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("X-Contract-Response", "response-ok")
+        self.send_header("Set-Cookie", "server_cookie=server; Path=/")
+        self.send_header("Content-Length", str(len(response)))
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+        self.wfile.write(response)
 
     def _json(self, payload):
         body = json.dumps(payload).encode("utf-8")

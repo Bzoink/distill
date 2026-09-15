@@ -1,0 +1,54 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>Network contract</title>
+<main><p id="content">NETWORK-PENDING</p></main>
+<script>
+(async () => {
+  document.cookie = 'client_cookie=client; path=/';
+  const fetchHeaders = new Headers();
+  fetchHeaders.set('X-Contract', 'fetch');
+  const first = await fetch('/network-contract', {
+    headers: fetchHeaders
+  });
+  const firstData = await first.json();
+
+  const second = await fetch('/network-contract', {
+    method: 'POST',
+    headers: {
+      'X-Contract': 'post',
+      'Content-Type': 'application/x-www-form-urlencoded'
+    },
+    body: 'alpha=beta'
+  });
+  const secondData = await second.json();
+
+  const redirected = await fetch('/network-redirect');
+  const redirect = redirected.redirected && redirected.url.includes('/network-contract');
+
+  const xhr = new XMLHttpRequest();
+  xhr.open('GET', '/network-contract');
+  xhr.setRequestHeader('X-Contract', 'xhr');
+  xhr.onload = () => {
+    const xhrHeaders = xhr.getResponseHeader('x-contract-response') === 'response-ok';
+    const xhrData = JSON.parse(xhr.responseText);
+    const xhrRequest = xhrData.x_contract === 'xhr';
+    const headers = first.headers.get('x-contract-response') === 'response-ok' &&
+                    first.headers.has('content-type');
+    const requestDefaults = firstData.accept === '*/*' &&
+                            firstData.language.includes('en-US') &&
+                            firstData.referer.includes('18-network-contract.html');
+    const cookies = firstData.cookie.includes('client_cookie=client') &&
+                    secondData.cookie.includes('server_cookie=server');
+    const post = secondData.method === 'POST' &&
+                 secondData.body === 'alpha=beta' &&
+                 secondData.content_type === 'application/x-www-form-urlencoded' &&
+                 secondData.x_contract === 'post';
+    document.querySelector('#content').textContent =
+      headers && requestDefaults && cookies && post && redirect && xhrHeaders && xhrRequest
+        ? 'NETWORK-CONTRACT-OK'
+        : 'NETWORK-CONTRACT-FAIL';
+  };
+  xhr.onerror = () => { document.querySelector('#content').textContent = 'NETWORK-CONTRACT-FAIL'; };
+  xhr.send();
+})();
+</script>
