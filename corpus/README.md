@@ -130,6 +130,7 @@ exists to test.
 | `26-complex-script` | Thai with no word delimiter; Devanagari cluster reordering | Writing systems |
 | `27-login-session` | A login performed in one process and used by another | Sessions |
 | `28-link-index` | A front page: document title, links on blocks, render sized to content | Phase 1 extraction breadth |
+| `29-main-content` | A permalink into a stream: the requested item is found, deduplicated, and read in document order | Phase 1 extraction breadth |
 
 `00` is the control: it has no scripts, so a failure there is never a binding
 bug. `07` is where a raw-pointer binding over Lexbor's arena-allocated nodes
@@ -182,6 +183,57 @@ A page may declare `render_fit` to be rendered that way and
 recognises its dense linked-heading stream and applies index typography, so
 the fixture is deliberately shorter than the old article-heading layout while
 still asserting that the full page was rendered.
+
+## Permalinks into a stream
+
+`29-main-content` is a liveblog: seven posts in one document, reached by the
+permalink of one of them. Nothing in the isolating corpus had that shape, and
+the shape breaks the assumption every extractor here rests on — that the
+document *is* the thing the reader asked for.
+
+On a DN Direkt permalink the requested post was 851 characters out of 34,401,
+and the reader showed all of it: the site navigation, fifty other headlines,
+the footer, and the bodies of forty-nine posts the reader had not asked for.
+Readability cannot separate them and it is not a defect in Readability: it
+scores the densest container, and the densest container is the stream.
+
+What settles it is that the page says so itself. schema.org has a vocabulary
+for this — a `LiveBlogPosting` whose `liveBlogUpdate` entries each carry a
+`mainEntityOfPage` and a `hasPart` naming the region:
+
+```json
+"mainEntityOfPage": { "@id": "https://www.dn.se/direkt/2026-09-15/sheeran-.../" },
+"hasPart": [{ "cssSelector": ".direkt-post[data-id=\"dn.ifragasatt.39868f81-...\"]" }]
+```
+
+Match the `@id` against the URL that was requested and the page hands over the
+answer. Extraction reports it as `main_content`, the reader shows it first, and
+the rest of the page follows under a divider.
+
+Three details the fixture exists to hold down, each of which was wrong in a
+first version:
+
+- **The item commonly appears twice** — pinned at the top of the stream and
+  again in its chronological place, with the same `data-id`, so one selector
+  matches both. Every match counts as main content, which is also what removes
+  the duplicate from the remainder. The fixture asserts `matches` is 2.
+- **The page-level block list is grouped by tag**, which is harmless for a
+  stream of headlines and wrong for one item: it would print the headline, then
+  the sub-heading, then all the paragraphs. `main_content.blocks` is walked in
+  document order instead, and the fixture asserts a `h3` in third position to
+  say so.
+- **Promotion is for an item inside something larger**, which is a question of
+  proportion, not of whether a locator matched. Publishers mark the free part
+  of a paywalled article with the same `hasPart` selector, so without a guard
+  an ordinary article would arrive here as often as a stream does and would
+  lose Readability's cleanup for a raw block walk. A region holding more than
+  half the page's prose is treated as being the page. That is why the fixture
+  is a stream of seven and not of three: with three posts the requested one is
+  most of the document, and refusing to promote it is the correct answer.
+
+Without a selector there is a second route — an `og:title` that matches the
+heading of one `<article>` among several. It is a fallback, and the same
+proportion guard applies to it.
 
 ## Sessions
 

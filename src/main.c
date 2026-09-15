@@ -1968,11 +1968,27 @@ static void append_json_attr(DBuffer *output, const char *name, const char *valu
     dbuf_puts(output, "\"");
 }
 
-static void append_json_blocks(Engine *engine, JSValueConst blocks, DBuffer *output)
+static bool json_block_is_main(Engine *engine, JSValueConst block)
+{
+    JSValue flag = JS_GetPropertyStr(engine->context, block, "main");
+    bool promoted = JS_ToBool(engine->context, flag);
+    JS_FreeValue(engine->context, flag);
+    return promoted;
+}
+
+/* skip_main leaves out the blocks the reader has already shown at the top of
+   the page. The extraction list stays complete on purpose, so the decision not
+   to repeat them belongs here rather than in the engine. */
+static void append_json_blocks(Engine *engine, JSValueConst blocks, DBuffer *output,
+                               bool skip_main)
 {
     int64_t length = json_array_length(engine, blocks);
     for (int64_t i = 0; i < length; ++i) {
         JSValue block = JS_GetPropertyUint32(engine->context, blocks, (uint32_t)i);
+        if (skip_main && json_block_is_main(engine, block)) {
+            JS_FreeValue(engine->context, block);
+            continue;
+        }
         char *type = json_property_string(engine, block, "type");
         char *text = json_property_string(engine, block, "text");
         char *href = json_property_string(engine, block, "href");
@@ -2049,6 +2065,44 @@ static bool json_is_dense_link_index(Engine *engine, JSValueConst blocks)
     }
     return heading_count >= 3 && linked_heading_count * 2 >= heading_count &&
            linked_count * 2 >= block_count;
+}
+
+/* How much of the page is left once the promoted item is taken out. Nothing
+   left means no divider: a heading announcing an empty remainder is worse than
+   no heading at all. */
+static int64_t json_blocks_outside_main(Engine *engine, JSValueConst blocks)
+{
+    int64_t length = json_array_length(engine, blocks);
+    int64_t outside = 0;
+    for (int64_t i = 0; i < length; ++i) {
+        JSValue block = JS_GetPropertyUint32(engine->context, blocks, (uint32_t)i);
+        if (!json_block_is_main(engine, block)) ++outside;
+        JS_FreeValue(engine->context, block);
+    }
+    return outside;
+}
+
+/* The promoted item's own headline. It is preferred to the record's headline
+   because a publisher writes the section into that -- "DN Direkt - Sheeran:
+   ..." - while the item's <h1> is the words a reader came for. */
+static char *json_main_heading(Engine *engine, JSValueConst blocks)
+{
+    int64_t length = json_array_length(engine, blocks);
+    for (int64_t i = 0; i < length; ++i) {
+        JSValue block = JS_GetPropertyUint32(engine->context, blocks, (uint32_t)i);
+        char *type = json_property_string(engine, block, "type");
+        bool heading = d_eq(type, "h1");
+        free(type);
+        if (heading) {
+            char *text = json_property_string(engine, block, "text");
+            JS_FreeValue(engine->context, block);
+            if (*text) return text;
+            free(text);
+            continue;
+        }
+        JS_FreeValue(engine->context, block);
+    }
+    return d_strdup("");
 }
 
 static int count_literal(const char *text, const char *literal)
@@ -2275,6 +2329,8 @@ static char *reader_template(Engine *engine, const char *json, const char *theme
     JSValue videos = JS_GetPropertyStr(engine->context, parsed, "videos");
     JSValue media = JS_GetPropertyStr(engine->context, parsed, "media");
     JSValue links = JS_GetPropertyStr(engine->context, parsed, "links");
+    JSValue main_content = JS_GetPropertyStr(engine->context, parsed, "main_content");
+    JSValue main_blocks = JS_GetPropertyStr(engine->context, main_content, "blocks");
     char *shape_kind = json_property_string(engine, shape, "kind");
     char *title = json_property_string(engine, parsed, "title");
     char *content = d_strdup("");
@@ -2292,6 +2348,22 @@ static char *reader_template(Engine *engine, const char *json, const char *theme
        directionality has to be carried across deliberately or a
        right-to-left article is laid out flush left. */
     bool rtl = d_ieq(text_dir, "rtl");
+    /* The page located the item the URL asked for, so that item leads and the
+       stream it came from follows. This wins over Readability, which scores the
+       densest container and on a liveblog permalink returns the whole stream
+       with the requested post somewhere inside it. */
+    bool main_found = false;
+    if (JS_IsObject(main_content)) {
+        JSValue found = JS_GetPropertyStr(engine->context, main_content, "found");
+        main_found = JS_ToBool(engine->context, found);
+        JS_FreeValue(engine->context, found);
+    }
+    char *main_heading = d_strdup("");
+    if (main_found) {
+        free(main_heading);
+        main_heading = json_main_heading(engine, main_blocks);
+        if (!*main_heading) { free(main_heading); main_heading = json_property_string(engine, main_content, "title"); }
+    }
     bool link_index = json_is_dense_link_index(engine, blocks) ||
                       html_is_dense_link_index(content);
 
@@ -2386,7 +2458,14 @@ static char *reader_template(Engine *engine, const char *json, const char *theme
         ".eyebrow,.media-url{font-size:.78em;color:var(--muted);}.media-placeholder{min-height:100px;display:flex;align-items:center;justify-content:center;background:var(--card-background);color:var(--page-text);text-align:center;padding:1em;}"
         ".media-card{margin:0 0 1em;}.media-card figcaption{margin-top:.45em;}.media-card figcaption span{float:right;color:#827a6e;font-size:.8em;}"
         ".reader-list-item{padding-left:1em;}"
-        ".distill-meta{font-size:.8em;color:var(--muted);margin-bottom:2.6em;}");
+        ".distill-meta{font-size:.8em;color:var(--muted);margin-bottom:2.6em;}"
+        /* The promoted item keeps article spacing even when the page around it
+           is a dense index, because it is being read, not scanned. */
+        ".main-content{margin:0 0 1em;}"
+        ".link-index .main-content p{line-height:1.62;margin:0 0 1.05em;}"
+        ".link-index .main-content h2{font-size:1.45em;line-height:1.2;margin:1.7em 0 .55em;font-weight:bold;}"
+        ".link-index .main-content h3{font-size:1.15em;line-height:1.25;margin:1.35em 0 .45em;font-weight:bold;}"
+        ".main-rest{border-top:1px solid var(--border);padding-top:1.1em;margin-top:2.4em;margin-bottom:1.4em;}");
     /* Mirrored rules rather than logical properties: litehtml lays out the
        reader template, and physical sides are what it reliably supports. */
     if (rtl) {
@@ -2403,12 +2482,26 @@ static char *reader_template(Engine *engine, const char *json, const char *theme
         "</style></head><body><main");
     if (link_index) dbuf_puts(&output, " class=\"link-index\"");
     dbuf_puts(&output, "><h1>");
-    append_html_escaped(&output, *title ? title : "Untitled page");
+    const char *heading = *main_heading ? main_heading : (*title ? title : "Untitled page");
+    append_html_escaped(&output, heading);
     dbuf_puts(&output, "</h1><p class=\"distill-meta\">Rendered by Distill</p>");
-    if (d_eq(shape_kind, "article") && *content) {
+    if (main_found) {
+        dbuf_puts(&output, "<section class=\"main-content\">");
+        append_json_blocks(engine, main_blocks, &output, false);
+        dbuf_puts(&output, "</section>");
+        if (json_blocks_outside_main(engine, blocks) > 0) {
+            dbuf_puts(&output, "<p class=\"eyebrow main-rest\">Rest of the page</p>");
+            append_json_blocks(engine, blocks, &output, true);
+            append_json_table(engine, tables, &output);
+            append_json_results(engine, results, &output);
+            append_json_forms(engine, forms, &output);
+            append_json_videos(engine, videos, &output);
+            append_json_media(engine, media, &output);
+        }
+    } else if (d_eq(shape_kind, "article") && *content) {
         dbuf_puts(&output, content);
     } else if (d_eq(shape_kind, "docs")) {
-        append_json_blocks(engine, blocks, &output);
+        append_json_blocks(engine, blocks, &output, main_found);
     } else if (d_eq(shape_kind, "table")) {
         append_json_table(engine, tables, &output);
     } else if (d_eq(shape_kind, "search-results")) {
@@ -2416,14 +2509,14 @@ static char *reader_template(Engine *engine, const char *json, const char *theme
     } else if (d_eq(shape_kind, "form")) {
         append_json_forms(engine, forms, &output);
     } else if (d_eq(shape_kind, "video")) {
-        append_json_blocks(engine, blocks, &output);
+        append_json_blocks(engine, blocks, &output, main_found);
         append_json_videos(engine, videos, &output);
         append_json_links(engine, links, &output);
     } else if (d_eq(shape_kind, "image-heavy")) {
         append_json_media(engine, media, &output);
         append_json_links(engine, links, &output);
     } else {
-        append_json_blocks(engine, blocks, &output);
+        append_json_blocks(engine, blocks, &output, main_found);
         append_json_table(engine, tables, &output);
         append_json_results(engine, results, &output);
         append_json_forms(engine, forms, &output);
@@ -2433,6 +2526,7 @@ static char *reader_template(Engine *engine, const char *json, const char *theme
     dbuf_puts(&output, "</main></body></html>");
     free(shape_kind);
     free(title);
+    free(main_heading);
     free(content);
     free(text_dir);
     free(text_lang);
@@ -2444,6 +2538,8 @@ static char *reader_template(Engine *engine, const char *json, const char *theme
     JS_FreeValue(engine->context, videos);
     JS_FreeValue(engine->context, media);
     JS_FreeValue(engine->context, links);
+    JS_FreeValue(engine->context, main_blocks);
+    JS_FreeValue(engine->context, main_content);
     JS_FreeValue(engine->context, readability);
     JS_FreeValue(engine->context, parsed);
     return dbuf_take(&output);

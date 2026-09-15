@@ -529,19 +529,343 @@ static char *block_href(Engine *engine, lxb_dom_node_t *root, lxb_dom_node_t *no
     return found;
 }
 
-static void append_blocks(Engine *engine, DBuffer *out, lxb_dom_node_t *root, size_t *rejected)
+/* The tags that carry a block of readable text. Shared so that the page-level
+   list and the main-content list cannot drift apart on what counts as one. */
+static const char *const kBlockTags[] = {
+    "h1", "h2", "h3", "h4", "h5", "h6", "p", "pre", "blockquote", "li", "dt", "dd"
+};
+
+static bool block_tag(const char *tag)
 {
-    const char *tags[] = {"h1","h2","h3","h4","h5","h6","p","pre","blockquote","li","dt","dd"};
+    for (size_t i = 0; i < sizeof(kBlockTags) / sizeof(kBlockTags[0]); ++i)
+        if (d_eq(tag, kBlockTags[i])) return true;
+    return false;
+}
+
+/* The page's own statement about which part of itself the request asked for.
+
+   A liveblog permalink, a forum thread anchored on one post, an item inside a
+   catalogue: the URL names one thing and the document ships the whole stream
+   around it. Readability is no help, because it scores the densest container
+   and the densest container is the stream -- a DN Direkt permalink extracts
+   all fifty posts, of which the requested one is 2.5% of the text. schema.org
+   has a vocabulary for exactly this case and publishers that use it hand over
+   a CSS selector for the requested item, so read that first. */
+typedef struct {
+    NodeVec nodes;    /* every element the locator matched, in document order */
+    char *source;     /* how it was located */
+    char *selector;   /* the selector that matched, when there was one */
+    char *title;      /* the item's own headline */
+} MainContent;
+
+static void free_main_content(MainContent *item)
+{
+    free(item->nodes.items); free(item->source); free(item->selector); free(item->title);
+    *item = (MainContent){0};
+}
+
+static const char *after_scheme(const char *url)
+{
+    if (d_starts(url, "https://")) return url + 8;
+    if (d_starts(url, "http://")) return url + 7;
+    return url;
+}
+
+static bool equal_ignoring_case(const char *a, size_t la, const char *b, size_t lb)
+{
+    if (la != lb) return false;
+    for (size_t i = 0; i < la; ++i) {
+        char ca = a[i], cb = b[i];
+        if (ca >= 'A' && ca <= 'Z') ca = (char)(ca - 'A' + 'a');
+        if (cb >= 'A' && cb <= 'Z') cb = (char)(cb - 'A' + 'a');
+        if (ca != cb) return false;
+    }
+    return true;
+}
+
+/* Two spellings of one document. The record carries the canonical URL and the
+   reader may have arrived by any equivalent spelling, so the scheme and a
+   trailing slash are ignored: a record written http: for a page served https:
+   is not a different page.
+
+   The fragment counts only when the record uses one. A stream that gives each
+   of its items an anchor is naming different items and the anchor is the whole
+   difference between them; a request that merely arrived at some anchor of a
+   record which claims no fragment is still at that record. */
+static bool same_document_url(const char *record, const char *request)
+{
+    if (!record || !request) return false;
+    const char *a = after_scheme(record), *b = after_scheme(request);
+    size_t path_a = strcspn(a, "#"), path_b = strcspn(b, "#");
+    size_t trimmed_a = path_a, trimmed_b = path_b;
+    while (trimmed_a && a[trimmed_a - 1] == '/') --trimmed_a;
+    while (trimmed_b && b[trimmed_b - 1] == '/') --trimmed_b;
+    if (!trimmed_a || !equal_ignoring_case(a, trimmed_a, b, trimmed_b)) return false;
+    if (!a[path_a]) return true;
+    return equal_ignoring_case(a + path_a, strlen(a + path_a), b + path_b, strlen(b + path_b));
+}
+
+static char *json_ld_string(Engine *engine, JSValueConst object, const char *name)
+{
+    JSValue value = JS_GetPropertyStr(engine->context, object, name);
+    char *out = JS_IsString(value) ? js_string(engine->context, value) : d_strdup("");
+    JS_FreeValue(engine->context, value);
+    return out;
+}
+
+/* mainEntityOfPage is written either as a bare URL or as a WebPage object
+   carrying @id; url is the older spelling of the same claim. */
+static char *json_ld_page_url(Engine *engine, JSValueConst record)
+{
+    JSValue value = JS_GetPropertyStr(engine->context, record, "mainEntityOfPage");
+    char *out = d_strdup("");
+    if (JS_IsString(value)) { free(out); out = js_string(engine->context, value); }
+    else if (JS_IsObject(value)) { free(out); out = json_ld_string(engine, value, "@id"); }
+    JS_FreeValue(engine->context, value);
+    if (!*out) { free(out); out = json_ld_string(engine, record, "url"); }
+    return out;
+}
+
+/* hasPart names the region of the page a record occupies, as one object or an
+   array of them. It is the same field publishers use to mark which part of a
+   page is outside a paywall, so both uses arrive here. */
+static char *json_ld_selector(Engine *engine, JSValueConst record)
+{
+    JSValue parts = JS_GetPropertyStr(engine->context, record, "hasPart");
+    char *out = d_strdup("");
+    if (JS_IsArray(parts)) {
+        int64_t count = json_array_length_for_context(engine->context, parts);
+        for (int64_t i = 0; i < count && !*out; ++i) {
+            JSValue part = JS_GetPropertyUint32(engine->context, parts, (uint32_t)i);
+            if (JS_IsObject(part)) { free(out); out = json_ld_string(engine, part, "cssSelector"); }
+            JS_FreeValue(engine->context, part);
+        }
+    } else if (JS_IsObject(parts)) {
+        free(out); out = json_ld_string(engine, parts, "cssSelector");
+    }
+    JS_FreeValue(engine->context, parts);
+    return out;
+}
+
+static bool json_ld_record_matches(Engine *engine, JSValueConst record,
+                                   char **selector, char **title)
+{
+    char *page = json_ld_page_url(engine, record);
+    bool match = *page && (same_document_url(page, engine->base_url) ||
+                           same_document_url(page, engine->source_url));
+    free(page);
+    if (!match) return false;
+    char *found = json_ld_selector(engine, record);
+    if (!*found) { free(found); return false; }
+    free(*selector); *selector = found;
+    free(*title); *title = json_ld_string(engine, record, "headline");
+    if (!**title) { free(*title); *title = json_ld_string(engine, record, "name"); }
+    return true;
+}
+
+/* Records nest: a @graph holds them, a LiveBlogPosting holds its updates, an
+   ItemList holds its entries. Descend through the containers that are known to
+   hold records rather than over every key, and cap the depth -- the block is
+   page-controlled text. */
+static bool json_ld_find_selector(Engine *engine, JSValueConst value,
+                                  char **selector, char **title, int depth)
+{
+    if (depth > 4 || !JS_IsObject(value)) return false;
+    if (JS_IsArray(value)) {
+        int64_t count = json_array_length_for_context(engine->context, value);
+        for (int64_t i = 0; i < count; ++i) {
+            JSValue item = JS_GetPropertyUint32(engine->context, value, (uint32_t)i);
+            bool found = json_ld_find_selector(engine, item, selector, title, depth + 1);
+            JS_FreeValue(engine->context, item);
+            if (found) return true;
+        }
+        return false;
+    }
+    if (json_ld_record_matches(engine, value, selector, title)) return true;
+    const char *containers[] = {"@graph", "liveBlogUpdate", "itemListElement", "mainEntity"};
+    for (size_t c = 0; c < sizeof(containers) / sizeof(containers[0]); ++c) {
+        JSValue child = JS_GetPropertyStr(engine->context, value, containers[c]);
+        bool found = json_ld_find_selector(engine, child, selector, title, depth + 1);
+        JS_FreeValue(engine->context, child);
+        if (found) return true;
+    }
+    return false;
+}
+
+/* Without a selector the page still says what it is about. og:title names the
+   requested item and a stream marks each item with <article>, so an article
+   whose own heading is that title is the item. A document holding a single
+   article is simply an article: hoisting it would move nothing, and claiming
+   to have found a needle in a haystack of one is worse than saying nothing. */
+static MainContent main_content_by_article(lxb_dom_node_t *root)
+{
+    MainContent item = {0};
+    NodeVec articles = find_selector(root, "article");
+    char *wanted = meta_value(root, "og:title");
+    if (articles.length >= 2 && *wanted) {
+        const char *headings[] = {"h1", "h2", "h3"};
+        for (size_t a = 0; a < articles.length; ++a) {
+            if (hidden_node(root, articles.items[a])) continue;
+            bool match = false;
+            for (size_t h = 0; h < 3 && !match; ++h) {
+                NodeVec found = find_selector(articles.items[a], headings[h]);
+                for (size_t i = 0; i < found.length && !match; ++i) {
+                    char *text = compact_text(found.items[i]);
+                    match = *text && d_eq(text, wanted);
+                    free(text);
+                }
+                free(found.items);
+            }
+            if (match) node_vec_push(&item.nodes, articles.items[a]);
+        }
+    }
+    free(articles.items);
+    if (!item.nodes.length) { free(wanted); return item; }
+    item.source = d_strdup("article-headline");
+    item.selector = d_strdup("");
+    item.title = wanted;
+    return item;
+}
+
+static MainContent find_main_content(Engine *engine, lxb_dom_node_t *root)
+{
+    MainContent item = {0};
+    char *selector = d_strdup(""), *title = d_strdup("");
+    NodeVec scripts = find_selector(root, "script");
+    for (size_t i = 0; i < scripts.length && !*selector; ++i) {
+        lxb_dom_element_t *element = lxb_dom_interface_element(scripts.items[i]);
+        char *type_raw = attr_value(element, "type");
+        char *type = d_lower(type_raw);
+        free(type_raw);
+        bool ld = d_contains(type, "ld+json");
+        free(type);
+        if (!ld) continue;
+        char *text = node_text(scripts.items[i]);
+        char *body = d_trim(text);
+        free(text);
+        if (*body) {
+            JSValue parsed = JS_ParseJSON(engine->context, body, strlen(body), "distill-ld.json");
+            if (JS_IsException(parsed)) JS_FreeValue(engine->context, JS_GetException(engine->context));
+            else json_ld_find_selector(engine, parsed, &selector, &title, 0);
+            JS_FreeValue(engine->context, parsed);
+        }
+        free(body);
+    }
+    free(scripts.items);
+    /* The selector is page-controlled and may name a region this document does
+       not have, or use syntax the matcher does not implement. Either way the
+       result is no match, and the article fallback still gets its turn. */
+    if (*selector) {
+        NodeVec matched = find_selector(root, selector);
+        for (size_t i = 0; i < matched.length; ++i)
+            if (!hidden_node(root, matched.items[i])) node_vec_push(&item.nodes, matched.items[i]);
+        free(matched.items);
+        if (item.nodes.length) {
+            item.source = d_strdup("json-ld-haspart");
+            item.selector = selector;
+            item.title = title;
+            return item;
+        }
+        free(item.nodes.items);
+        item.nodes = (NodeVec){0};
+    }
+    free(selector); free(title);
+    return main_content_by_article(root);
+}
+
+/* A permalinked item commonly appears twice -- pinned at the top of the stream
+   and again in its chronological place -- so the locator keeps every match and
+   the whole set counts as the main content. That also settles the duplicate:
+   both copies leave the remainder together. */
+static bool main_content_holds(const MainContent *item, lxb_dom_node_t *node)
+{
+    if (!item) return false;
+    for (lxb_dom_node_t *up = node; up; up = up->parent)
+        for (size_t i = 0; i < item->nodes.length; ++i)
+            if (item->nodes.items[i] == up) return true;
+    return false;
+}
+
+/* The page-level block list is grouped by tag, which is harmless for a stream
+   of headlines but would separate this item's headline from its paragraphs.
+   Walk the subtree in document order instead, and stop at the first block
+   element on each branch so that a list item containing a paragraph is one
+   block rather than the same words twice. Returns the characters emitted. */
+static size_t append_main_blocks(Engine *engine, DBuffer *out, lxb_dom_node_t *root,
+                                 lxb_dom_node_t *node, size_t *rejected, bool *first)
+{
+    if (!node) return 0;
+    if (is_element(node)) {
+        if (hidden_node(root, node)) return 0;
+        char *tag = node_tag(node);
+        if (block_tag(tag)) {
+            size_t chars = 0;
+            char *text = compact_text(node);
+            if (*text) {
+                char *href = block_href(engine, root, node, rejected);
+                if (!*first) dbuf_puts(out, ",");
+                *first = false;
+                char *qt = json_quote(tag), *qx = json_quote(text), *qh = json_quote(href);
+                dbuf_printf(out, "{\"type\":%s,\"text\":%s,\"href\":%s}", qt, qx, qh);
+                free(qt); free(qx); free(qh); free(href);
+                chars = strlen(text);
+            }
+            free(text); free(tag);
+            return chars;
+        }
+        free(tag);
+    }
+    size_t chars = 0;
+    for (lxb_dom_node_t *child = node->first_child; child; child = child->next)
+        chars += append_main_blocks(engine, out, root, child, rejected, first);
+    return chars;
+}
+
+/* Enough text that the located region is worth promoting. A selector that
+   matched a share button or an empty wrapper is a selector we misread, and
+   hoisting it would bury the page under a heading with nothing beneath it. */
+#define DISTILL_MAIN_CONTENT_FLOOR 160
+
+/* Promotion is for an item inside something larger, and that is a question of
+   proportion rather than of whether a locator matched. A region holding most
+   of the page's prose IS the page: there is nothing to lift it above, and
+   lifting it would take an ordinary article away from Readability, which
+   cleans up a body far better than walking its blocks does. Publishers mark
+   the free part of a paywalled article with the same hasPart selector, so
+   without this an article page would arrive here as often as a stream does. */
+static bool main_content_is_a_minority(lxb_dom_node_t *root, const MainContent *item)
+{
+    if (!item->nodes.length) return false;
+    size_t page_prose = visible_text_chars(root, "p");
+    size_t item_prose = visible_text_chars(item->nodes.items[0], "p");
+    /* The item's repeat appearances are the same item, so they are taken out
+       of the page total rather than counted against it. A post that is pinned
+       at the top and shown again in place would otherwise look twice as large
+       a share of its own stream as it is. */
+    for (size_t i = 1; i < item->nodes.length; ++i) {
+        size_t copy = visible_text_chars(item->nodes.items[i], "p");
+        page_prose = copy < page_prose ? page_prose - copy : 0;
+    }
+    return item_prose && item_prose * 2 <= page_prose;
+}
+
+static void append_blocks(Engine *engine, DBuffer *out, lxb_dom_node_t *root,
+                          const MainContent *item, size_t *rejected)
+{
     bool first = true; dbuf_puts(out, "[");
-    for (size_t t = 0; t < sizeof(tags) / sizeof(tags[0]); ++t) {
-        NodeVec nodes = find_selector(root, tags[t]);
+    for (size_t t = 0; t < sizeof(kBlockTags) / sizeof(kBlockTags[0]); ++t) {
+        NodeVec nodes = find_selector(root, kBlockTags[t]);
         for (size_t i = 0; i < nodes.length; ++i) {
             if (hidden_node(root, nodes.items[i])) continue;
             char *text = compact_text(nodes.items[i]); if (!*text) { free(text); continue; }
             char *href = block_href(engine, root, nodes.items[i], rejected);
             if (!first) dbuf_puts(out, ","); first = false;
-            char *qt = json_quote(tags[t]), *qx = json_quote(text), *qh = json_quote(href);
-            dbuf_printf(out, "{\"type\":%s,\"text\":%s,\"href\":%s}", qt, qx, qh);
+            char *qt = json_quote(kBlockTags[t]), *qx = json_quote(text), *qh = json_quote(href);
+            /* The page list stays complete -- the shell walks it for keyboard
+               navigation -- so a block that was promoted is marked rather than
+               removed, and the reader is what decides not to show it twice. */
+            dbuf_printf(out, "{\"type\":%s,\"text\":%s,\"href\":%s,\"main\":%s}", qt, qx, qh,
+                        main_content_holds(item, nodes.items[i]) ? "true" : "false");
             free(qt); free(qx); free(qh); free(text); free(href);
         }
         free(nodes.items);
@@ -746,12 +1070,30 @@ static char *run_extraction(Engine *engine, const char *serialized)
     lxb_html_serialize_tree_str(root, &filtered);
     const char *readability_input = filtered.data ? (const char *)filtered.data : serialized;
     ExtractShape shape = shape_for(root); ReadabilityFields readability = run_readability(engine, readability_input); size_t rejected = 0;
+    /* Locate the requested item before anything renders, so the block list can
+       say which of its entries have already been shown at the top. */
+    MainContent item = find_main_content(engine, root);
+    DBuffer main_blocks; dbuf_init(&main_blocks); dbuf_puts(&main_blocks, "[");
+    bool main_first = true; size_t main_chars = 0;
+    if (item.nodes.length)
+        main_chars = append_main_blocks(engine, &main_blocks, root, item.nodes.items[0], &rejected, &main_first);
+    dbuf_puts(&main_blocks, "]");
+    char *main_blocks_json = dbuf_take(&main_blocks);
+    bool main_found = item.nodes.length && main_chars >= DISTILL_MAIN_CONTENT_FLOOR &&
+                      main_content_is_a_minority(root, &item);
     char *content = sanitize_content(readability.content); char *tables = table_json(root); char *search = search_json(engine, root, &rejected); char *forms = forms_json(engine, root, &rejected); char *videos = videos_json(engine, root, &rejected); char *media = media_json(engine, root, &rejected); char *links = links_json(engine, root, &rejected); char *structured = structured_data_json(engine, root);
     const char *selected = "structured-text"; if (d_eq(shape.kind, "article")) selected = readability.ok ? "readability" : "structured-text"; else if (d_eq(shape.kind, "table")) selected = "table"; else if (d_eq(shape.kind, "search-results")) selected = "search-results"; else if (d_eq(shape.kind, "form")) selected = "form"; else if (d_eq(shape.kind, "video")) selected = "video-metadata"; else if (d_eq(shape.kind, "image-heavy")) selected = "media-reference";
     DBuffer out; dbuf_init(&out); char *page_title = document_title(root);
     char *qurl = json_quote(engine->source_url), *qbase = json_quote(engine->base_url), *qkind = json_quote(shape.kind), *qevidence = json_quote(shape.evidence), *qselected = json_quote(selected), *qtitle = json_quote(page_title);
     dbuf_printf(&out, "{\"schema\":1,\"url\":%s,\"base_url\":%s,\"title\":%s,\"shape\":{\"kind\":%s,\"confidence\":%.2f,\"evidence\":%s},\"extractor\":%s,\"extractor_registry\":[\"readability\",\"structured-text\",\"table\",\"search-results\",\"form\",\"video-metadata\",\"media-reference\"],\"readability\":", qurl, qbase, qtitle, qkind, shape.confidence, qevidence, qselected);
     if (!readability.ok) dbuf_puts(&out, "null"); else { char *qt = json_quote(readability.title), *qb = json_quote(readability.byline), *qd = json_quote(readability.dir), *ql = json_quote(readability.lang), *qc = json_quote(content), *qtc = json_quote(readability.text_content), *qe = json_quote(readability.excerpt), *qs = json_quote(readability.site_name), *qp = json_quote(readability.published_time); dbuf_printf(&out, "{\"title\":%s,\"byline\":%s,\"dir\":%s,\"lang\":%s,\"content\":%s,\"textContent\":%s,\"excerpt\":%s,\"siteName\":%s,\"publishedTime\":%s}", qt, readability.byline_null ? "null" : qb, readability.dir_null ? "null" : qd, readability.lang_null ? "null" : ql, qc, qtc, readability.excerpt_null ? "null" : qe, readability.site_name_null ? "null" : qs, readability.published_time_null ? "null" : qp); free(qt); free(qb); free(qd); free(ql); free(qc); free(qtc); free(qe); free(qs); free(qp); }
-    dbuf_puts(&out, ",\"blocks\":"); append_blocks(engine, &out, root, &rejected); dbuf_printf(&out, ",\"tables\":%s,\"search_results\":%s,\"forms\":%s,\"videos\":%s,\"media\":%s,\"links\":%s,\"structured_data\":%s,\"sanitization\":{\"allowed_schemes\":[\"http\",\"https\",\"mailto\",\"tel\"],\"rejected_uris\":%zu}}", tables, search, forms, videos, media, links, structured, rejected);
-    free(qurl); free(qbase); free(qtitle); free(page_title); free(qkind); free(qevidence); free(qselected); free(content); free(tables); free(search); free(forms); free(videos); free(media); free(links); free(structured); free(shape.kind); free(shape.evidence); free_readability(&readability); lxb_html_document_destroy(document); return dbuf_take(&out);
+    char *qsource = json_quote(main_found ? item.source : "");
+    char *qselector = json_quote(main_found ? item.selector : "");
+    char *qmain_title = json_quote(main_found ? item.title : "");
+    dbuf_printf(&out, ",\"main_content\":{\"found\":%s,\"source\":%s,\"selector\":%s,\"title\":%s,\"matches\":%zu,\"blocks\":%s}",
+                main_found ? "true" : "false", qsource, qselector, qmain_title,
+                main_found ? item.nodes.length : (size_t)0, main_found ? main_blocks_json : "[]");
+    free(qsource); free(qselector); free(qmain_title);
+    dbuf_puts(&out, ",\"blocks\":"); append_blocks(engine, &out, root, main_found ? &item : NULL, &rejected); dbuf_printf(&out, ",\"tables\":%s,\"search_results\":%s,\"forms\":%s,\"videos\":%s,\"media\":%s,\"links\":%s,\"structured_data\":%s,\"sanitization\":{\"allowed_schemes\":[\"http\",\"https\",\"mailto\",\"tel\"],\"rejected_uris\":%zu}}", tables, search, forms, videos, media, links, structured, rejected);
+    free(qurl); free(qbase); free(qtitle); free(page_title); free(qkind); free(qevidence); free(qselected); free(content); free(tables); free(search); free(forms); free(videos); free(media); free(links); free(structured); free(shape.kind); free(shape.evidence); free(main_blocks_json); free_main_content(&item); free_readability(&readability); lxb_html_document_destroy(document); return dbuf_take(&out);
 }

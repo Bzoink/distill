@@ -1,0 +1,96 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>Harbour Wire &ndash; live</title>
+<main class="stream">
+
+  <article class="post post--linked" data-id="post-2">
+    <h2>Tug boats return to the inner harbour</h2>
+    <p>The two tugs that were withdrawn from the inner harbour in June went back
+       into service on Tuesday morning, the port authority said in a statement.</p>
+    <h3>What changed</h3>
+    <p>Dredging in the eastern channel finished a fortnight ahead of schedule,
+       which restores the draught the larger tugs need at low water.</p>
+    <p>A third tug remains laid up pending an engine survey.</p>
+  </article>
+
+  <article class="post" data-id="post-1">
+    <h2>Ferry timetable consultation closes on Friday</h2>
+    <p>Responses to the winter timetable consultation must reach the operator by
+       Friday afternoon. Two of the three proposed options drop the late sailing.</p>
+  </article>
+
+  <article class="post post--linked-in-feed" data-id="post-2">
+    <h2>Tug boats return to the inner harbour</h2>
+    <p>The two tugs that were withdrawn from the inner harbour in June went back
+       into service on Tuesday morning, the port authority said in a statement.</p>
+    <h3>What changed</h3>
+    <p>Dredging in the eastern channel finished a fortnight ahead of schedule,
+       which restores the draught the larger tugs need at low water.</p>
+    <p>A third tug remains laid up pending an engine survey.</p>
+  </article>
+
+  <article class="post" data-id="post-3">
+    <h2>Harbour master reports a quiet weekend</h2>
+    <p>No incidents were logged over the weekend despite the swell warning that
+       was in force from Saturday evening until Sunday lunchtime.</p>
+  </article>
+
+  <article class="post" data-id="post-4">
+    <h2>Crane hire costs rise for the second quarter running</h2>
+    <p>The mobile crane tariff goes up by four percent from October, the second
+       rise this year, which the operator attributes to insurance and fuel.</p>
+  </article>
+
+  <article class="post" data-id="post-5">
+    <h2>Pilot boat crew training moves to the new simulator</h2>
+    <p>Refresher training for the pilot boat crews moves to the simulator at the
+       maritime college from next month, ending the arrangement with the yard.</p>
+  </article>
+
+  <article class="post" data-id="post-6">
+    <h2>Fishing co-operative signs a new landing agreement</h2>
+    <p>The inshore fishing co-operative has signed a three-year agreement for
+       landing rights at the west quay, replacing the annual renewal it had.</p>
+  </article>
+
+  <article class="post" data-id="post-7">
+    <h2>Two berths closed for pontoon replacement</h2>
+    <p>Berths eleven and twelve are out of use while the pontoon is replaced.
+       The work is expected to take a fortnight if the weather holds.</p>
+  </article>
+
+</main>
+<p id="content">pending</p>
+<script>
+  /* The record is written at runtime because it has to name the URL this page
+     was actually served from, which is not known when the file is authored.
+     Nothing in this fixture can be extracted correctly without running it. */
+  var record = {
+    "@context": "https://schema.org",
+    "@type": "LiveBlogPosting",
+    "headline": "Harbour Wire – live",
+    "liveBlogUpdate": [
+      {
+        "@type": "BlogPosting",
+        "headline": "Harbour Wire – Tug boats return to the inner harbour",
+        "mainEntityOfPage": {"@type": "WebPage", "@id": location.href},
+        "hasPart": [
+          {"@type": "WebPageElement", "cssSelector": ".post[data-id=\"post-2\"]"}
+        ]
+      },
+      {
+        "@type": "BlogPosting",
+        "headline": "Harbour Wire – Ferry timetable consultation closes on Friday",
+        "mainEntityOfPage": {"@type": "WebPage", "@id": location.href + "#post-1"},
+        "hasPart": [
+          {"@type": "WebPageElement", "cssSelector": ".post[data-id=\"post-1\"]"}
+        ]
+      }
+    ]
+  };
+  var script = document.createElement("script");
+  script.type = "application/ld+json";
+  script.textContent = JSON.stringify(record);
+  document.head.appendChild(script);
+  document.getElementById("content").textContent = "MAIN-CONTENT-OK";
+</script>

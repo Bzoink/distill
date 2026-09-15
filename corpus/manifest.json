@@ -644,6 +644,63 @@
         {"stage": "extract", "path": "blocks[3].text", "expect": "Weather"},
         {"stage": "extract", "path": "blocks[3].href", "expect_absent": ["/2026/", "http"]}
       ]
+    },
+    {
+      "id": "29-main-content",
+      "path": "29-main-content.html",
+      "gate": true,
+      "plan_section": "Phase 1 extraction breadth, main content",
+      "exercises": [
+        "main-content",
+        "json-ld-haspart",
+        "document-order"
+      ],
+      "why": "A permalink into a stream names one item and ships the whole stream around it, so the item the reader asked for was 2.5% of what the reader rendered. Readability cannot separate them -- it scores the densest container, which is the stream. schema.org hasPart names the region, the item commonly appears twice (pinned and in place), and the page-level block list is grouped by tag, which would split the headline from its paragraphs.",
+      "assertions": [
+        {
+          "stage": "dom",
+          "selector": "#content",
+          "expect": "MAIN-CONTENT-OK"
+        },
+        {
+          "stage": "extract",
+          "path": "main_content.found",
+          "expect": "true"
+        },
+        {
+          "stage": "extract",
+          "path": "main_content.source",
+          "expect": "json-ld-haspart"
+        },
+        {
+          "stage": "extract",
+          "path": "main_content.matches",
+          "expect": "2"
+        },
+        {
+          "stage": "extract",
+          "path": "main_content.blocks[0].text",
+          "expect": "Tug boats return to the inner harbour"
+        },
+        {
+          "stage": "extract",
+          "path": "main_content.blocks[2].type",
+          "expect": "h3"
+        },
+        {
+          "stage": "extract",
+          "path": "main_content.blocks",
+          "expect_absent": [
+            "Ferry timetable",
+            "quiet weekend"
+          ]
+        },
+        {
+          "stage": "extract",
+          "path": "blocks",
+          "expect": "Ferry timetable"
+        }
+      ]
     }
   ],
   "live": [
