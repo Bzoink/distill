@@ -108,7 +108,10 @@ When a site is supplied for investigation:
    fixture and regression assertion.
 5. If it is a missing capability or a real bug, modify Distill and rerun the
    same comparison.
-6. Preserve the before/after report when the result is useful; never promote
+6. If both clients are stopped by an anti-bot, CAPTCHA, access-denied, or
+   equivalent protection page, mark the site `antibot`, preserve the evidence,
+   and continue with the next site. Do not treat that state as a Distill bug.
+7. Preserve the before/after report when the result is useful; never promote
    an unstable live URL directly into a CI gate.
 
 The reference run uses a fresh temporary Chromium profile for each site. It
@@ -144,6 +147,11 @@ The first comparison has been completed:
 | Hacker News (`05-hacker-news`) | checked and working | Same 30 ranked stories, metadata, and navigation links; table presentation intentionally reduced to reader content |
 | BBC News (`06-bbc-news`) | checked and working | Same headlines, summaries, sections, and links; cookie consent and other decorative UI omitted |
 | DEV Community (`07-dev-community`) | checked and working | Same article feed, titles, descriptions, tags, and surrounding content; navigation and ad UI omitted |
-| Medium (`08-medium`) | stopped — anti-bot state differs | Chromium receives a hard Cloudflare block and Distill receives a Cloudflare challenge; neither reaches Medium content |
+| Medium (`08-medium`) | antibot | Chromium receives a hard Cloudflare block and Distill receives a Cloudflare challenge; neither reaches Medium content; continue with site 09 |
+| Wikipedia Random Article (`09-wikipedia-random`) | checked and working | Chromium's randomly selected article URL is reused for Distill through the page canonical URL; same article information preserved, with reader-mode reductions in decorative links, images, and forms |
+| Stack Overflow (`10-stack-overflow`) | antibot | Chromium receives the site, but Distill receives Cloudflare's `Just a moment...` page; no meaningful content comparison is possible |
+| React Official Website (`11-react`) | checked and working | Same rendered documentation content, headings, links, images, and forms; reader extraction omits only a small amount of surrounding UI/code context |
+| Twitter / X (`12-x`) | antibot | Chromium reports `Access to x.com was denied` and Distill receives only the unauthenticated login shell; the supplied URL has no concrete public profile |
+| Airbnb (`13-airbnb`) | stopped — unsupported runtime mismatch | Chromium exposes the homepage content; Distill settles on its navigation shell and `0 of 0 items showing`. Missing browser APIs and HTTP request semantics were addressed, but the substantive content still does not render. |
 
-Testing stopped at site 8; sites 09-25 were not started.
+Testing stopped at site 13 because the remaining Airbnb mismatch could not be fixed. Sites 14-25 were not started.

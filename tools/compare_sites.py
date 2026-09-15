@@ -24,7 +24,7 @@ import tempfile
 import time
 from html.parser import HTMLParser
 from pathlib import Path
-from urllib.parse import urlparse
+from urllib.parse import urljoin, urlparse
 
 
 HERE = Path(__file__).resolve().parent
@@ -34,6 +34,10 @@ DEFAULT_OUT = ROOT / "reports" / "site-comparison"
 BROWSERS = ("chromium", "chromium-browser", "google-chrome", "google-chrome-stable")
 SKIP_TAGS = {"script", "style", "template", "noscript", "svg"}
 HEADING_TAGS = {"h1", "h2", "h3", "h4", "h5", "h6"}
+VOID_TAGS = {
+    "area", "base", "br", "col", "embed", "hr", "img", "input", "link",
+    "meta", "param", "source", "track", "wbr",
+}
 
 
 def fail(message):
@@ -113,7 +117,6 @@ class VisibleSummary(HTMLParser):
         )
         skip = parent_skip or tag in SKIP_TAGS
         hidden = parent_hidden or hidden
-        self.frames.append((skip, hidden))
         if not skip and not hidden:
             if tag == "a":
                 link = {"href": attrs.get("href", ""), "text": []}
@@ -125,6 +128,8 @@ class VisibleSummary(HTMLParser):
                 self.forms.append({"action": attrs.get("action", ""), "method": attrs.get("method", "get")})
             if tag in HEADING_TAGS:
                 self._heading = [tag, []]
+        if tag not in VOID_TAGS:
+            self.frames.append((skip, hidden))
 
     def handle_endtag(self, tag):
         tag = tag.lower()
@@ -190,6 +195,22 @@ class TextSummary(HTMLParser):
             self.parts.append(data)
 
 
+class CanonicalParser(HTMLParser):
+    """Find a document's canonical URL for nondeterministic redirects."""
+
+    def __init__(self):
+        super().__init__(convert_charrefs=True)
+        self.url = ""
+
+    def handle_starttag(self, tag, attrs):
+        if self.url or tag.lower() != "link":
+            return
+        attributes = dict(attrs)
+        rel = (attributes.get("rel") or "").casefold().split()
+        if "canonical" in rel:
+            self.url = attributes.get("href", "")
+
+
 def clean_text(value):
     return " ".join(str(value).split())
 
@@ -208,6 +229,12 @@ def summarize_html(html):
     for link in summary["links"]:
         link["text"] = clean_text(" ".join(link["text"]))
     return summary
+
+
+def canonical_url(html, base_url):
+    parser = CanonicalParser()
+    parser.feed(html)
+    return urljoin(base_url, parser.url) if parser.url else ""
 
 
 def fragment_text(value):
@@ -355,14 +382,18 @@ def site_report(site, browser, engine, output, timeout, budget, cap_ms, screensh
         else:
             reference_screenshot = None
 
+    comparison_url = url
+    if "Special:Random" in url:
+        comparison_url = canonical_url(reference_result["stdout"], url) or url
+
     distill_dom_result = run_command(
-        [engine, "--url", url, "--dump-dom", "--script-cap-ms", str(cap_ms)], timeout
+        [engine, "--url", comparison_url, "--dump-dom", "--script-cap-ms", str(cap_ms)], timeout
     )
     write_text(output / "distill.dom.html", distill_dom_result["stdout"])
     write_text(output / "distill-dom.stderr.txt", distill_dom_result["stderr"])
 
     extract_result = run_command(
-        [engine, "--url", url, "--extract", "--script-cap-ms", str(cap_ms)], timeout
+        [engine, "--url", comparison_url, "--extract", "--script-cap-ms", str(cap_ms)], timeout
     )
     write_text(output / "distill-extract.stderr.txt", extract_result["stderr"])
     extraction = None
@@ -376,7 +407,7 @@ def site_report(site, browser, engine, output, timeout, budget, cap_ms, screensh
             write_text(output / "distill.extract.stdout.txt", extract_result["stdout"])
     if screenshots:
         render_result = run_command(
-            [engine, "--url", url, "--render", str(output / "distill.png"),
+            [engine, "--url", comparison_url, "--render", str(output / "distill.png"),
              "--script-cap-ms", str(cap_ms)], timeout
         )
     else:
@@ -389,6 +420,7 @@ def site_report(site, browser, engine, output, timeout, budget, cap_ms, screensh
         "schema": 1,
         "site": site,
         "requested_url": url,
+        "comparison_url": comparison_url,
         "reference": {
             "driver": browser,
             "capture": {key: value for key, value in reference_result.items() if key not in {"stdout", "stderr"}},
@@ -428,6 +460,7 @@ def write_report(path, report):
         "Diagnostic live-site comparison; not a CI verdict.",
         "",
         f"- Requested URL: `{report['requested_url']}`",
+        f"- Comparison URL: `{report['comparison_url']}`",
         f"- Tier: {site.get('tier', '?')} / {site.get('class', 'unspecified')}",
         f"- Focus: {site.get('focus', '')}",
         f"- Chromium capture: `{ref['capture']['status']}`",

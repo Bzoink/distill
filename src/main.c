@@ -47,6 +47,9 @@ typedef struct Request {
     Engine *engine;
     CURL *easy;
     char *url;
+    char *method;
+    char *request_data;
+    struct curl_slist *headers;
     DBuffer body;
     long status;
     JSValue resolve;
@@ -336,7 +339,7 @@ static bool fetch_sync_request(Engine *engine, const char *url, DBuffer *body,
     curl_easy_setopt(easy, CURLOPT_FOLLOWLOCATION, 1L);
     curl_easy_setopt(easy, CURLOPT_WRITEFUNCTION, curl_write);
     curl_easy_setopt(easy, CURLOPT_WRITEDATA, body);
-    curl_easy_setopt(easy, CURLOPT_USERAGENT, "distill/0.1");
+    curl_easy_setopt(easy, CURLOPT_USERAGENT, "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/152.0.0.0 Safari/537.36");
     curl_easy_setopt(easy, CURLOPT_CONNECTTIMEOUT_MS, connection_timeout_ms(engine));
     curl_easy_setopt(easy, CURLOPT_TIMEOUT_MS, (long)engine->cap_ms);
     if (request_method && d_ieq(request_method, "post")) {
@@ -396,6 +399,11 @@ static void note_exception(Engine *engine, const char *where)
     JSValue exception = JS_GetException(engine->context);
     char *message = js_string(engine->context, exception);
     fprintf(stderr, "script error [%s]: %s\n", where, message);
+    JSValue stack_value = JS_GetPropertyStr(engine->context, exception, "stack");
+    char *stack = js_string(engine->context, stack_value);
+    if (*stack && !d_eq(stack, message)) fprintf(stderr, "script stack [%s]: %s\n", where, stack);
+    free(stack);
+    JS_FreeValue(engine->context, stack_value);
     free(message);
     JS_FreeValue(engine->context, exception);
 }
@@ -435,7 +443,10 @@ static void free_request(Engine *engine, Request *request)
         curl_multi_remove_handle(engine->multi, request->easy);
         curl_easy_cleanup(request->easy);
     }
+    curl_slist_free_all(request->headers);
     free(request->url);
+    free(request->method);
+    free(request->request_data);
     dbuf_free(&request->body);
     if (!JS_IsUndefined(request->resolve)) JS_FreeValue(engine->context, request->resolve);
     if (!JS_IsUndefined(request->reject)) JS_FreeValue(engine->context, request->reject);
@@ -451,8 +462,24 @@ static bool attach_request_handle(Engine *engine, Request *request)
     curl_easy_setopt(request->easy, CURLOPT_WRITEFUNCTION, curl_write);
     curl_easy_setopt(request->easy, CURLOPT_WRITEDATA, &request->body);
     curl_easy_setopt(request->easy, CURLOPT_PRIVATE, request);
-    curl_easy_setopt(request->easy, CURLOPT_USERAGENT, "distill/0.1");
+    curl_easy_setopt(request->easy, CURLOPT_USERAGENT, "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/152.0.0.0 Safari/537.36");
     curl_easy_setopt(request->easy, CURLOPT_CONNECTTIMEOUT_MS, connection_timeout_ms(engine));
+    if (request->method && !d_ieq(request->method, "GET")) {
+        if (d_ieq(request->method, "POST")) {
+            curl_easy_setopt(request->easy, CURLOPT_POST, 1L);
+            curl_easy_setopt(request->easy, CURLOPT_POSTFIELDS, request->request_data ? request->request_data : "");
+        } else {
+            curl_easy_setopt(request->easy, CURLOPT_CUSTOMREQUEST, request->method);
+            if (request->request_data) curl_easy_setopt(request->easy, CURLOPT_POSTFIELDS, request->request_data);
+        }
+    }
+    if (request->request_data) {
+        struct curl_slist *headers = NULL;
+        curl_slist_free_all(request->headers);
+        headers = curl_slist_append(headers, "Content-Type: application/json");
+        curl_easy_setopt(request->easy, CURLOPT_HTTPHEADER, headers);
+        request->headers = headers;
+    }
     if (curl_multi_add_handle(engine->multi, request->easy) != CURLM_OK) {
         curl_easy_cleanup(request->easy);
         request->easy = NULL;
@@ -461,12 +488,15 @@ static bool attach_request_handle(Engine *engine, Request *request)
     return true;
 }
 
-static Request *start_request(Engine *engine, RequestKind kind, const char *url)
+static Request *start_request(Engine *engine, RequestKind kind, const char *url,
+                              const char *method, const char *request_data)
 {
     Request *request = d_xcalloc(1, sizeof(*request));
     request->kind = kind;
     request->engine = engine;
     request->url = d_strdup(url);
+    request->method = d_strdup(method && *method ? method : "GET");
+    request->request_data = request_data ? d_strdup(request_data) : NULL;
     request->resolve = JS_UNDEFINED;
     request->reject = JS_UNDEFINED;
     dbuf_init(&request->body);
@@ -514,6 +544,27 @@ static JSValue response_json(JSContext *ctx, JSValueConst self, int argc, JSValu
     return promise;
 }
 
+static JSValue response_header_get(JSContext *ctx, JSValueConst this_val, int argc,
+                                    JSValueConst *argv)
+{
+    (void)ctx; (void)this_val; (void)argc; (void)argv;
+    return JS_NULL;
+}
+
+static JSValue response_header_has(JSContext *ctx, JSValueConst this_val, int argc,
+                                   JSValueConst *argv)
+{
+    (void)ctx; (void)this_val; (void)argc; (void)argv;
+    return JS_FALSE;
+}
+
+static JSValue response_header_for_each(JSContext *ctx, JSValueConst this_val, int argc,
+                                        JSValueConst *argv)
+{
+    (void)ctx; (void)this_val; (void)argc; (void)argv;
+    return JS_UNDEFINED;
+}
+
 static JSValue make_response(Engine *engine, Request *request)
 {
     JSContext *ctx = engine->context;
@@ -524,6 +575,13 @@ static JSValue make_response(Engine *engine, Request *request)
     JS_SetPropertyStr(ctx, response, "_body", js_strn(ctx, request->body.data, request->body.length));
     JS_SetPropertyStr(ctx, response, "text", JS_NewCFunction(ctx, response_text, "text", 0));
     JS_SetPropertyStr(ctx, response, "json", JS_NewCFunction(ctx, response_json, "json", 0));
+    JS_SetPropertyStr(ctx, response, "redirected", JS_NewBool(ctx, false));
+    JS_SetPropertyStr(ctx, response, "type", js_str(ctx, "basic"));
+    JSValue headers = JS_NewObject(ctx);
+    JS_SetPropertyStr(ctx, headers, "get", JS_NewCFunction(ctx, response_header_get, "get", 1));
+    JS_SetPropertyStr(ctx, headers, "has", JS_NewCFunction(ctx, response_header_has, "has", 1));
+    JS_SetPropertyStr(ctx, headers, "forEach", JS_NewCFunction(ctx, response_header_for_each, "forEach", 1));
+    JS_SetPropertyStr(ctx, response, "headers", headers);
     return response;
 }
 
@@ -536,7 +594,21 @@ static JSValue fetch_callback(JSContext *ctx, JSValueConst this_val, int argc, J
     free(relative);
     JSValue functions[2] = {JS_UNDEFINED, JS_UNDEFINED};
     JSValue promise = JS_NewPromiseCapability(ctx, functions);
-    Request *request = start_request(engine, REQUEST_FETCH, url);
+    char *method = d_strdup("GET");
+    char *request_data = NULL;
+    if (argc > 1 && JS_IsObject(argv[1])) {
+        JSValue method_value = JS_GetPropertyStr(ctx, argv[1], "method");
+        JSValue body_value = JS_GetPropertyStr(ctx, argv[1], "body");
+        free(method);
+        method = js_string(ctx, method_value);
+        if (!*method) { free(method); method = d_strdup("GET"); }
+        if (!JS_IsUndefined(body_value) && !JS_IsNull(body_value)) request_data = js_string(ctx, body_value);
+        JS_FreeValue(ctx, method_value);
+        JS_FreeValue(ctx, body_value);
+    }
+    Request *request = start_request(engine, REQUEST_FETCH, url, method, request_data);
+    free(method);
+    free(request_data);
     if (!request) {
         JS_FreeValue(ctx, functions[0]);
         JS_FreeValue(ctx, functions[1]);
@@ -613,6 +685,13 @@ static JSValue console_callback(JSContext *ctx, JSValueConst this_val, int argc,
     for (int i = 0; i < argc; ++i) {
         char *arg = js_string(ctx, argv[i]);
         fprintf(stderr, " %s", arg);
+        if (JS_IsObject(argv[i])) {
+            JSValue stack_value = JS_GetPropertyStr(ctx, argv[i], "stack");
+            char *stack = js_string(ctx, stack_value);
+            if (*stack) fprintf(stderr, "\n  stack: %s", stack);
+            free(stack);
+            JS_FreeValue(ctx, stack_value);
+        }
         free(arg);
     }
     fputc('\n', stderr);
@@ -763,11 +842,13 @@ static const char *HOST_JS =
 "__setWindow('setTimeout', setTimeout); __setWindow('clearTimeout', clearTimeout); __setWindow('setInterval', setInterval); __setWindow('clearInterval', clearInterval);"
 "globalThis.requestIdleCallback = callback => setTimeout(() => callback({didTimeout:false, timeRemaining:() => 50}), 1); globalThis.cancelIdleCallback = id => clearTimeout(id); __setWindow('requestIdleCallback', requestIdleCallback); __setWindow('cancelIdleCallback', cancelIdleCallback);"
 "__setWindow('requestAnimationFrame', requestAnimationFrame); __setWindow('fetch', fetch); __setWindow('console', console);"
+"if (typeof requestAnimationFrame !== 'function') globalThis.requestAnimationFrame = callback => setTimeout(callback, 16); __setWindow('requestAnimationFrame', requestAnimationFrame);"
 "__setWindow('scrollTo', () => {}); __setWindow('scrollBy', () => {});"
 "Object.defineProperty(document, 'addEventListener', {value:(type, callback) => __add('document', type, callback), configurable:true});"
 "Object.defineProperty(document, 'removeEventListener', {value:() => {}, configurable:true});"
 "Object.defineProperty(document, 'dispatchEvent', {value:event => __dispatch('document', event.type), configurable:true});"
 "document.readyState = 'loading';"
+"document.visibilityState = 'visible';"
 "Object.defineProperty(document, 'cookie', {get() { return this.__distillCookie || ''; }, set(value) { const pair = String(value).split(';', 1)[0]; const name = pair.slice(0, pair.indexOf('=')); const old = (this.__distillCookie || '').split(';').filter(item => item.trim() && item.trim().split('=')[0] !== name); if (pair.indexOf('=') >= 0) old.push(pair); this.__distillCookie = old.join('; '); }, configurable:true});"
 "globalThis.localStorage = {__data: Object.create(null), getItem(k) { return this.__data[k] === undefined ? null : this.__data[k]; }, setItem(k,v) { this.__data[k] = String(v); }, removeItem(k) { delete this.__data[k]; }, clear() { this.__data = Object.create(null); }, key(i) { return Object.keys(this.__data)[i] ?? null; }};"
 "Object.defineProperty(localStorage, 'length', {get() { return Object.keys(this.__data).length; }});"
@@ -775,15 +856,26 @@ static const char *HOST_JS =
 "Object.defineProperty(sessionStorage, 'length', {get() { return Object.keys(this.__data).length; }});"
 "__setWindow('localStorage', localStorage); __setWindow('sessionStorage', sessionStorage);"
 "globalThis.navigator = window.navigator || {userAgent: 'Mozilla/5.0 Distill', language: 'en-US', platform: 'Linux'};"
-"if (!navigator.userAgent) navigator.userAgent = 'Mozilla/5.0 Distill'; if (!navigator.language) navigator.language = 'en-US'; __setWindow('navigator', navigator);"
+"Object.defineProperty(navigator, 'userAgent', {value:'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/152.0.0.0 Safari/537.36', configurable:true}); if (!navigator.language) navigator.language = 'en-US'; __setWindow('navigator', navigator);"
 "globalThis.screen = {width: 1280, height: 1024}; __setWindow('screen', screen);"
+"globalThis.visualViewport = {width:1280, height:1024, offsetLeft:0, offsetTop:0, pageLeft:0, pageTop:0, scale:1, addEventListener() {}, removeEventListener() {}}; __setWindow('visualViewport', visualViewport);"
 "globalThis.crypto = {getRandomValues(a) { for (let i=0;i<a.length;i++) a[i] = (i * 73 + 41) & 255; return a; }}; __setWindow('crypto', crypto);"
+"globalThis.CSS = {escape(value) { return String(value).replace(/[^a-zA-Z0-9_-]/g, ch => '\\\\' + ch); }, supports() { return false; }}; __setWindow('CSS', CSS);"
+"globalThis.AbortSignal = class { constructor() { this.aborted=false; this.reason=undefined; this.__listeners=[]; } addEventListener(type, callback) { if (type === 'abort' && typeof callback === 'function') this.__listeners.push(callback); } removeEventListener(type, callback) { if (type === 'abort') this.__listeners=this.__listeners.filter(item => item !== callback); } dispatchEvent(event) { for (const callback of this.__listeners.slice()) callback.call(this, event); return true; } throwIfAborted() { if (this.aborted) throw this.reason || new Error('The operation was aborted'); } };"
+"globalThis.AbortController = class { constructor() { this.signal=new AbortSignal(); } abort(reason) { if (this.signal.aborted) return; this.signal.aborted=true; this.signal.reason=reason || new Error('The operation was aborted'); this.signal.dispatchEvent({type:'abort', target:this.signal}); } }; __setWindow('AbortSignal', AbortSignal); __setWindow('AbortController', AbortController);"
+"globalThis.CustomEvent = class extends Event { constructor(type, init={}) { super(type, init); this.detail=init.detail; } }; __setWindow('CustomEvent', CustomEvent);"
+"globalThis.Intl = { getCanonicalLocales(locales) { if (locales == null) return []; return (Array.isArray(locales) ? locales : [locales]).map(String); }, Locale: class { constructor(locale) { this.baseName=String(locale || 'en-US'); this.language=this.baseName.split('-')[0]; } toString() { return this.baseName; } maximize() { return this; } }, NumberFormat: class { constructor(locales, options) { this.locales=locales; this.options=options || {}; } format(value) { return String(value); } formatToParts(value) { return [{type:'integer', value:String(value)}]; } resolvedOptions() { return {locale:'en-US', numberingSystem:'latn'}; } }, DateTimeFormat: class { constructor(locales, options) { this.locales=locales; this.options=options || {}; } format(value) { return new Date(value == null ? Date.now() : value).toISOString(); } formatToParts(value) { return [{type:'literal', value:this.format(value)}]; } resolvedOptions() { return {locale:'en-US', calendar:'gregory', numberingSystem:'latn', timeZone:'UTC'}; } }, PluralRules: class { select(value) { return Number(value) === 1 ? 'one' : 'other'; } resolvedOptions() { return {locale:'en-US', type:'cardinal', pluralCategories:['one','other']}; } }, RelativeTimeFormat: class { format(value, unit) { return String(value) + ' ' + String(unit); } resolvedOptions() { return {locale:'en-US', numeric:'always', style:'long'}; } }, ListFormat: class { format(values) { return Array.from(values || []).join(', '); } }, Collator: class { compare(a, b) { return String(a).localeCompare(String(b)); } }, Segmenter: class { segment(value) { return Array.from(String(value), segment => ({segment})); } }, DisplayNames: class { of(value) { return String(value); } } }; __setWindow('Intl', Intl);"
 "globalThis.matchMedia = q => ({matches: false, media: q, addListener() {}, removeListener() {}, addEventListener() {}, removeEventListener() {}}); __setWindow('matchMedia', matchMedia);"
-"globalThis.performance = {now: () => Date.now()}; __setWindow('performance', performance);"
+"globalThis.performance = {now: () => Date.now(), mark() {}, measure() {}, getEntries() { return []; }, getEntriesByName() { return []; }, getEntriesByType() { return []; }, clearMarks() {}, clearMeasures() {}}; __setWindow('performance', performance);"
+"globalThis.PerformanceObserver = class { constructor(callback) { this.callback=callback; } observe() {} disconnect() {} takeRecords() { return []; } }; PerformanceObserver.supportedEntryTypes=[]; __setWindow('PerformanceObserver', PerformanceObserver);"
+"globalThis.NodeFilter = {SHOW_ALL:4294967295, SHOW_ELEMENT:1, SHOW_TEXT:4, SHOW_COMMENT:128, FILTER_ACCEPT:1, FILTER_REJECT:2, FILTER_SKIP:3}; __setWindow('NodeFilter', NodeFilter);"
 "globalThis.history = {pushState(s,t,u) { const suffix = String(u); location.search = suffix[0] === '?' ? suffix : ''; location.href = location.href.split('?')[0] + location.search; }, replaceState(s,t,u) { this.pushState(s,t,u); }}; __setWindow('history', history);"
 "if (typeof Element !== 'undefined') Element.prototype.getBoundingClientRect = function() { return {x:0,y:0,top:0,left:0,width:800,height:20,right:800,bottom:20}; };"
 "if (typeof Element !== 'undefined') { Object.defineProperty(Element.prototype, 'offsetHeight', {get() { return 20; }}); Object.defineProperty(Element.prototype, 'offsetWidth', {get() { return 800; }}); }"
-"globalThis.__resolveURL = function(value) { const raw = String(value || ''); if (/^[a-z]+:/i.test(raw) || raw.startsWith('//')) return raw; const base = (document.querySelector('base') && document.querySelector('base').getAttribute('href')) || location.href; const origin = location.href.slice(0, location.href.indexOf('/', location.href.indexOf('://') + 3)); if (raw.startsWith('/')) return origin + raw; const prefix = base.endsWith('/') ? base : base.slice(0, base.lastIndexOf('/') + 1); const pieces = (prefix + raw).split('/'); const clean = []; for (const piece of pieces) { if (!piece || piece === '.') continue; if (piece === '..') clean.pop(); else clean.push(piece); } return origin + '/' + clean.join('/'); };"
+"if (document.createRange) { const __createRange=document.createRange.bind(document); document.createRange=() => { const range=__createRange(); range.getBoundingClientRect=() => ({x:0,y:0,top:0,left:0,width:800,height:20,right:800,bottom:20}); range.getClientRects=() => [range.getBoundingClientRect()]; return range; }; }"
+"globalThis.__resolveURL = function(value, baseValue) { const raw = String(value || ''); const fallback = (document.querySelector('base') && document.querySelector('base').getAttribute('href')) || location.href; const base = String(baseValue || fallback); const schemeAt = base.indexOf('://'); const baseOrigin = schemeAt < 0 ? '' : base.slice(0, schemeAt + 3) + base.slice(schemeAt + 3).split(/[/?#]/)[0]; if (/^[a-z]+:/i.test(raw)) return raw; if (raw.startsWith('//')) return (location.protocol || 'https:') + raw; if (raw.startsWith('/')) return baseOrigin + raw; const basePathEnd = base.search(/[?#]/); const basePath = basePathEnd < 0 ? base : base.slice(0, basePathEnd); const prefix = basePath.endsWith('/') ? basePath : basePath.slice(0, basePath.lastIndexOf('/') + 1); const pieces = (prefix + raw).split('/'); const clean = []; for (const piece of pieces) { if (!piece || piece === '.') continue; if (piece === '..') clean.pop(); else clean.push(piece); } return baseOrigin + '/' + clean.join('/'); };"
+"globalThis.URLSearchParams = class { constructor(value='') { this.__pairs=[]; const source=String(value).replace(/^\\?/, ''); for (const part of source ? source.split('&') : []) { const at=part.indexOf('='); const key=decodeURIComponent((at < 0 ? part : part.slice(0, at)).replace(/\\+/g, ' ')); const val=decodeURIComponent((at < 0 ? '' : part.slice(at + 1)).replace(/\\+/g, ' ')); this.__pairs.push([key, val]); } } append(key, value) { this.__pairs.push([String(key), String(value)]); } set(key, value) { this.delete(key); this.append(key, value); } get(key) { const item=this.__pairs.find(pair => pair[0] === String(key)); return item ? item[1] : null; } getAll(key) { return this.__pairs.filter(pair => pair[0] === String(key)).map(pair => pair[1]); } has(key) { return this.__pairs.some(pair => pair[0] === String(key)); } delete(key) { this.__pairs=this.__pairs.filter(pair => pair[0] !== String(key)); } forEach(callback, thisArg) { this.__pairs.forEach(pair => callback.call(thisArg, pair[1], pair[0], this)); } entries() { return this.__pairs[Symbol.iterator](); } keys() { return this.__pairs.map(pair => pair[0])[Symbol.iterator](); } values() { return this.__pairs.map(pair => pair[1])[Symbol.iterator](); } toString() { return this.__pairs.map(pair => encodeURIComponent(pair[0]) + '=' + encodeURIComponent(pair[1])).join('&'); } [Symbol.iterator]() { return this.entries(); } };"
+"globalThis.URL = class { constructor(value, base) { const href=__resolveURL(value, base); const scheme=href.indexOf('://'); const authorityStart=scheme < 0 ? 0 : scheme + 3; const tail=href.slice(authorityStart); const authorityEnd=tail.search(/[/?#]/); const authority=authorityEnd < 0 ? tail : tail.slice(0, authorityEnd); const rest=authorityEnd < 0 ? '' : tail.slice(authorityEnd); const pathEnd=rest.search(/[?#]/); this.protocol=scheme < 0 ? '' : href.slice(0, scheme + 1); this.origin=scheme < 0 ? '' : href.slice(0, authorityStart) + authority; this.host=authority; this.hostname=authority.replace(/^.*@/, '').replace(/:\\d+$/, ''); this.port=(this.hostname === authority ? '' : authority.slice(authority.lastIndexOf(':') + 1)); this.pathname=pathEnd < 0 ? (rest || '/') : (rest.slice(0, pathEnd) || '/'); const query=rest.indexOf('?'); const hash=rest.indexOf('#'); this.search=query < 0 ? '' : rest.slice(query, hash < 0 ? rest.length : hash); this.hash=hash < 0 ? '' : rest.slice(hash); this.username=''; this.password=''; this.href=this.origin + this.pathname + this.search + this.hash; this.searchParams=new URLSearchParams(this.search); } toString() { return this.href; } toJSON() { return this.href; } static canParse(value, base) { try { new URL(value, base); return true; } catch (e) { return false; } } }; globalThis.URL.createObjectURL = () => 'blob:distill'; globalThis.URL.revokeObjectURL = () => {}; __setWindow('URL', URL); __setWindow('URLSearchParams', URLSearchParams);"
 "globalThis.__anchorPart = function(node, part) { const href = __resolveURL(node.getAttribute('href') || ''); const scheme = href.indexOf('://'); if (scheme < 0) return part === 'href' ? href : ''; const authority = scheme + 3; const tail = href.slice(authority); const end = tail.search(/[/?#]/); const host = end < 0 ? tail : tail.slice(0, end); const rest = end < 0 ? '' : tail.slice(end); const pathEnd = rest.search(/[?#]/); const pathname = pathEnd < 0 ? (rest || '/') : (rest.slice(0, pathEnd) || '/'); const query = rest.indexOf('?'); const hash = rest.indexOf('#'); const search = query < 0 ? '' : rest.slice(query, hash < 0 ? rest.length : hash); const fragment = hash < 0 ? '' : rest.slice(hash); const portAt = host.lastIndexOf(':'); const hasPort = portAt > -1 && host.indexOf(']') < portAt; const hostname = hasPort ? host.slice(0, portAt) : host; const port = hasPort ? host.slice(portAt + 1) : ''; if (part === 'href') return href; if (part === 'protocol') return href.slice(0, scheme + 1); if (part === 'host') return host; if (part === 'hostname') return hostname; if (part === 'port') return port; if (part === 'pathname') return pathname; if (part === 'search') return search; if (part === 'hash') return fragment; return ''; };"
 "try { Object.defineProperty(HTMLAnchorElement.prototype, 'href', {get() { return __anchorPart(this, 'href'); }, set(value) { this.setAttribute('href', value); }, configurable:true}); Object.defineProperty(HTMLAnchorElement.prototype, 'protocol', {get() { return __anchorPart(this, 'protocol'); }, configurable:true}); Object.defineProperty(HTMLAnchorElement.prototype, 'host', {get() { return __anchorPart(this, 'host'); }, configurable:true}); Object.defineProperty(HTMLAnchorElement.prototype, 'hostname', {get() { return __anchorPart(this, 'hostname'); }, configurable:true}); Object.defineProperty(HTMLAnchorElement.prototype, 'port', {get() { return __anchorPart(this, 'port'); }, configurable:true}); Object.defineProperty(HTMLAnchorElement.prototype, 'pathname', {get() { return __anchorPart(this, 'pathname'); }, configurable:true}); Object.defineProperty(HTMLAnchorElement.prototype, 'search', {get() { return __anchorPart(this, 'search'); }, configurable:true}); Object.defineProperty(HTMLAnchorElement.prototype, 'hash', {get() { return __anchorPart(this, 'hash'); }, configurable:true}); } catch (e) {}"
 "try { Object.defineProperty(HTMLImageElement.prototype, 'src', {get() { return __resolveURL(this.getAttribute('src')); }, configurable:true}); } catch (e) {}"
@@ -792,9 +884,10 @@ static const char *HOST_JS =
 "for (const node of document.querySelectorAll('img')) try { Object.defineProperty(node, 'src', {get() { return __resolveURL(this.getAttribute('src')); }, configurable:true}); } catch (e) {}"
 "for (const node of document.querySelectorAll('form')) try { Object.defineProperty(node, 'action', {get() { return __resolveURL(this.getAttribute('action')); }, configurable:true}); } catch (e) {}"
 "globalThis.getComputedStyle = node => ({display: node.id === 'genuinely-hidden' ? 'none' : ((node.getAttribute && node.getAttribute('hidden') !== null) ? 'none' : 'block'), visibility: 'visible', marginLeft: '0px', marginRight: '0px', getPropertyValue(name) { return this[name] || ''; }}); __setWindow('getComputedStyle', getComputedStyle);"
-"globalThis.IntersectionObserver = class { constructor(callback) { this.callback = callback; } observe(target) { this.callback([{target, isIntersecting:true, intersectionRatio:1}], this); } unobserve() {} disconnect() {} };"
+"globalThis.IntersectionObserver = class { constructor(callback) { this.callback = callback; } observe(target) { this.callback([{target, isIntersecting:true, intersectionRatio:1, intersectionRect:{top:0,left:0,width:1280,height:1024,right:1280,bottom:1024}}], this); } unobserve() {} disconnect() {} };"
+"globalThis.ResizeObserver = class { constructor(callback) { this.callback=callback; } observe(target) { this.callback([{target, contentRect:{x:0,y:0,top:0,left:0,width:800,height:20,right:800,bottom:20}, borderBoxSize:[{inlineSize:800,blockSize:20},], contentBoxSize:[{inlineSize:800,blockSize:20}]}], this); } unobserve() {} disconnect() {} }; __setWindow('ResizeObserver', ResizeObserver);"
 "globalThis.MutationObserver = class { constructor(callback) { this.callback = callback; } observe() { this.callback([{}], this); } disconnect() {} };"
-"globalThis.XMLHttpRequest = class { constructor() { this.readyState=0; this.status=0; this.responseText=''; this.onreadystatechange=null; } open(method,url,async=true) { this._url=url; this.readyState=1; } send() { fetch(this._url).then(r => r.text().then(t => { this.status=r.status; this.responseText=t; this.readyState=4; if (this.onreadystatechange) this.onreadystatechange(); })); } };"
+"globalThis.XMLHttpRequest = class { constructor() { this.readyState=0; this.status=0; this.responseText=''; this.onreadystatechange=null; this.onload=null; this.onerror=null; } open(method,url,async=true) { this._method=method || 'GET'; this._url=url; this._async=async; this.readyState=1; } send(body) { fetch(this._url,{method:this._method,body}).then(r => r.text().then(t => { this.status=r.status; this.responseText=t; this.readyState=4; if (this.onreadystatechange) this.onreadystatechange(); if (this.onload) this.onload(); })).catch(error => { if (this.onerror) this.onerror(error); }); } };"
 "__setWindow('XMLHttpRequest', XMLHttpRequest); __setWindow('IntersectionObserver', IntersectionObserver); __setWindow('MutationObserver', MutationObserver);"
 "__setWindow('Node', globalThis.Node || {ELEMENT_NODE:1,TEXT_NODE:3,DOCUMENT_NODE:9,DOCUMENT_FRAGMENT_NODE:11});";
 
@@ -964,7 +1057,7 @@ static bool discover_scripts(Engine *engine)
         char *url = src[0] ? resolve_url(engine->base_url, src) : NULL;
         if (is_async && url) {
             ++engine->async_pending;
-            Request *request = start_request(engine, REQUEST_ASYNC_SCRIPT, url);
+            Request *request = start_request(engine, REQUEST_ASYNC_SCRIPT, url, "GET", NULL);
             if (!request) {
                 --engine->async_pending;
             } else {
