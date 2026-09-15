@@ -42,10 +42,39 @@ enum {
     DISPLAY_URL_BUDGET = 58
 };
 
-/* Two internal destinations. They are not URLs to fetch, they are things for
+enum {
+    PAGE_SECTION_TOP,
+    PAGE_SECTION_IMAGES,
+    PAGE_SECTION_TABLES,
+    PAGE_SECTION_FORMS,
+    PAGE_SECTION_VIDEOS,
+    PAGE_SECTION_RESULTS,
+    PAGE_SECTION_LINKS,
+    PAGE_SECTION_COUNT
+};
+
+typedef struct {
+    const char *id;
+    const char *label;
+    const char *shortcut;
+    guint keyval;
+} PageSection;
+
+static const PageSection page_sections[PAGE_SECTION_COUNT] = {
+    [PAGE_SECTION_TOP] = {"top", "Top", "Alt+0", GDK_KEY_0},
+    [PAGE_SECTION_IMAGES] = {"images", "Images", "Alt+1", GDK_KEY_1},
+    [PAGE_SECTION_TABLES] = {"tables", "Tables", "Alt+2", GDK_KEY_2},
+    [PAGE_SECTION_FORMS] = {"forms", "Forms", "Alt+3", GDK_KEY_3},
+    [PAGE_SECTION_VIDEOS] = {"videos", "Videos", "Alt+4", GDK_KEY_4},
+    [PAGE_SECTION_RESULTS] = {"results", "Results", "Alt+5", GDK_KEY_5},
+    [PAGE_SECTION_LINKS] = {"links", "Links", "Alt+6", GDK_KEY_6}
+};
+
+/* Internal destinations. They are not URLs to fetch, they are things for
    the shell to do, so they never reach the navigation path. */
 #define MEDIA_SCHEME "distill-media:"
 #define CLOSE_URI "distill-close:"
+#define SECTION_SCHEME "distill-section:"
 
 typedef struct App App;
 
@@ -79,7 +108,8 @@ struct App {
     GtkWidget *url_entry;
     GtkWidget *back_button;
     GtkWidget *forward_button;
-    GtkWidget *list_button;
+    GtkWidget *section_button;
+    GtkWidget *section_items[PAGE_SECTION_COUNT];
     GtkWidget *settings_button;
     GtkWidget *theme_items[3];
     GtkWidget *status;
@@ -97,7 +127,6 @@ struct App {
     DLinkBox *link_boxes;
     size_t link_count;
     DAppHistory history;
-    GPtrArray *reading_list;
     /* The images this page offers, in document order, captured while the page
        document exists -- viewer mode replaces that document, so the list has
        to outlive it for Previous and Next to mean anything. */
@@ -495,19 +524,68 @@ static void clear_controls(App *app)
     app->link_count = 0;
 }
 
-static void update_list_button(App *app)
+static int section_y(const App *app, size_t index)
 {
-    const DAppPage *page = d_app_history_current(&app->history);
-    bool saved = false;
-    if (page) {
-        for (guint i = 0; i < app->reading_list->len; ++i) {
-            if (strcmp(g_ptr_array_index(app->reading_list, i), page->url) == 0) {
-                saved = true;
-                break;
-            }
+    if (!app || index >= PAGE_SECTION_COUNT || !app->document) return -1;
+    if (index == PAGE_SECTION_TOP) return 0;
+    const char *id = page_sections[index].id;
+    size_t prefix_length = strlen(SECTION_SCHEME);
+    for (size_t i = 0; i < app->link_count; ++i) {
+        const char *href = app->link_boxes[i].href;
+        if (strncmp(href, SECTION_SCHEME, prefix_length) == 0 &&
+            strcmp(href + prefix_length, id) == 0)
+            return app->link_boxes[i].y;
+    }
+    return -1;
+}
+
+static void update_section_menu(App *app)
+{
+    if (!app) return;
+    for (size_t i = 0; i < PAGE_SECTION_COUNT; ++i) {
+        if (app->section_items[i]) {
+            bool available = !app->viewer_active && section_y(app, i) >= 0;
+            gtk_widget_set_sensitive(app->section_items[i], available);
         }
     }
-    gtk_button_set_label(GTK_BUTTON(app->list_button), saved ? "★" : "☆");
+    if (app->section_button)
+        gtk_widget_set_tooltip_text(app->section_button, "Page sections · Alt+0–6");
+}
+
+static void jump_to_section(App *app, size_t index)
+{
+    if (!app || index >= PAGE_SECTION_COUNT || app->viewer_active || app->loading) return;
+    int y = section_y(app, index);
+    if (y < 0) {
+        set_status(app, "That section is not available on this page");
+        return;
+    }
+    if (app->vertical_adjustment)
+        gtk_adjustment_set_value(app->vertical_adjustment, y);
+    set_status(app, page_sections[index].label);
+}
+
+static void section_item_activate(GtkMenuItem *item, gpointer opaque)
+{
+    App *app = opaque;
+    int index = GPOINTER_TO_INT(g_object_get_data(G_OBJECT(item), "distill-section-index"));
+    if (index >= 0 && index < PAGE_SECTION_COUNT)
+        jump_to_section(app, (size_t)index);
+}
+
+static int section_index_for_key(guint keyval)
+{
+    for (size_t i = 0; i < PAGE_SECTION_COUNT; ++i)
+        if (page_sections[i].keyval == keyval) return (int)i;
+    return -1;
+}
+
+static int section_index_for_id(const char *id)
+{
+    if (!id) return -1;
+    for (size_t i = 0; i < PAGE_SECTION_COUNT; ++i)
+        if (strcmp(page_sections[i].id, id) == 0) return (int)i;
+    return -1;
 }
 
 static gboolean draw_page(GtkWidget *widget, cairo_t *cairo, gpointer opaque)
@@ -867,7 +945,17 @@ static gboolean window_key_press(GtkWidget *widget, GdkEventKey *event, gpointer
 {
     (void)widget;
     App *app = opaque;
-    if (!app->viewer_active) return FALSE;
+    if (!app->viewer_active) {
+        GdkModifierType modifiers = event->state & gtk_accelerator_get_default_mod_mask();
+        if (modifiers == GDK_MOD1_MASK) {
+            int index = section_index_for_key(event->keyval);
+            if (index >= 0) {
+                jump_to_section(app, (size_t)index);
+                return TRUE;
+            }
+        }
+        return FALSE;
+    }
     /* Escape closes wherever the focus is. The address bar keeps the keys it
        needs -- typing, and the arrows that move the caret -- but Escape means
        nothing to a text field here, and "the cursor happens to be in the URL
@@ -920,6 +1008,11 @@ static void open_link(App *app, const char *uri)
         return;
     }
     if (strcmp(uri, CLOSE_URI) == 0) { leave_viewer(app); return; }
+    if (strncmp(uri, SECTION_SCHEME, strlen(SECTION_SCHEME)) == 0) {
+        int index = section_index_for_id(uri + strlen(SECTION_SCHEME));
+        if (index >= 0) jump_to_section(app, (size_t)index);
+        return;
+    }
     if (has_scheme(uri, "mailto") || has_scheme(uri, "tel")) {
         open_external(app, uri);
     } else if (page_uri_allowed(uri)) {
@@ -1146,6 +1239,7 @@ static void build_document(App *app, const char *template)
     gtk_widget_set_size_request(app->form_layer, PAGE_WIDTH, page_height);
     if (app->vertical_adjustment) gtk_adjustment_set_value(app->vertical_adjustment, 0.0);
     render_visible_band(app);
+    update_section_menu(app);
 }
 
 /* The images the reader may open, taken from the media links in the template.
@@ -1179,7 +1273,6 @@ static void load_surface(App *app, const DAppPage *page)
     select_theme_id(app, page->theme);
     gtk_widget_set_sensitive(app->back_button, d_app_history_can_back(&app->history));
     gtk_widget_set_sensitive(app->forward_button, d_app_history_can_forward(&app->history));
-    update_list_button(app);
 }
 
 static void load_done(GObject *source_object, GAsyncResult *result, gpointer opaque)
@@ -1417,38 +1510,6 @@ static void external_clicked(GtkWidget *widget, gpointer opaque)
     if (page) open_external(app, page->url);
 }
 
-static void update_list_tooltip(App *app)
-{
-    GString *text = g_string_new("Reading list");
-    for (guint i = 0; i < app->reading_list->len; ++i) {
-        g_string_append(text, "\n");
-        g_string_append(text, g_ptr_array_index(app->reading_list, i));
-    }
-    gtk_widget_set_tooltip_text(app->list_button, text->str);
-    g_string_free(text, TRUE);
-}
-
-static void list_clicked(GtkWidget *widget, gpointer opaque)
-{
-    App *app = opaque;
-    const DAppPage *page = d_app_history_current(&app->history);
-    if (!page) return;
-    for (guint i = 0; i < app->reading_list->len; ++i) {
-        const char *saved = g_ptr_array_index(app->reading_list, i);
-        if (strcmp(saved, page->url) == 0) {
-            g_ptr_array_remove_index(app->reading_list, i);
-            gtk_button_set_label(GTK_BUTTON(widget), "☆");
-            set_status(app, "Removed from reading list");
-            update_list_tooltip(app);
-            return;
-        }
-    }
-    g_ptr_array_add(app->reading_list, g_strdup(page->url));
-    gtk_button_set_label(GTK_BUTTON(widget), "★");
-    set_status(app, "Added to reading list");
-    update_list_tooltip(app);
-}
-
 static void theme_changed(GtkCheckMenuItem *item, gpointer opaque)
 {
     if (!gtk_check_menu_item_get_active(item)) return;
@@ -1458,6 +1519,33 @@ static void theme_changed(GtkCheckMenuItem *item, gpointer opaque)
     const char *theme = g_object_get_data(G_OBJECT(item), "distill-theme-id");
     if (!theme || !page || strcmp(theme, page->theme) == 0) return;
     app_begin_load(app, page->url, NULL, NULL, true);
+}
+
+static GtkWidget *make_sections_button(App *app)
+{
+    GtkWidget *menu = gtk_menu_new();
+    for (size_t i = 0; i < PAGE_SECTION_COUNT; ++i) {
+        char *label = g_strdup_printf("%s    %s", page_sections[i].label,
+                                      page_sections[i].shortcut);
+        GtkWidget *item = gtk_menu_item_new_with_label(label);
+        g_free(label);
+        g_object_set_data(G_OBJECT(item), "distill-section-index",
+                          GINT_TO_POINTER((gint)i));
+        gtk_widget_set_sensitive(item, FALSE);
+        g_signal_connect(item, "activate", G_CALLBACK(section_item_activate), app);
+        app->section_items[i] = item;
+        gtk_menu_shell_append(GTK_MENU_SHELL(menu), item);
+    }
+
+    GtkWidget *button = gtk_menu_button_new();
+    GtkWidget *icon = gtk_image_new_from_icon_name("view-list-symbolic",
+                                                   GTK_ICON_SIZE_BUTTON);
+    gtk_button_set_image(GTK_BUTTON(button), icon);
+    gtk_button_set_relief(GTK_BUTTON(button), GTK_RELIEF_NONE);
+    gtk_widget_set_tooltip_text(button, "Page sections · Alt+0–6");
+    gtk_menu_button_set_popup(GTK_MENU_BUTTON(button), menu);
+    gtk_widget_show_all(menu);
+    return button;
 }
 
 static GtkWidget *make_settings_button(App *app)
@@ -1514,7 +1602,6 @@ static void app_destroy(GtkWidget *widget, gpointer opaque)
     app->surface = NULL;
     clear_controls(app);
     d_app_history_clear(&app->history, page_dispose);
-    g_ptr_array_free(app->reading_list, TRUE);
     if (app->page_media) g_ptr_array_free(app->page_media, TRUE);
     if (app->viewer_file) { unlink(app->viewer_file); g_free(app->viewer_file); }
     g_application_quit(app->application);
@@ -1528,7 +1615,6 @@ static void app_activate(GtkApplication *application, gpointer opaque)
     app->application = G_APPLICATION(application);
     app->references = 1;
     d_app_history_init(&app->history);
-    app->reading_list = g_ptr_array_new_with_free_func(g_free);
 
     app->window = gtk_application_window_new(application);
     gtk_window_set_default_size(GTK_WINDOW(app->window), 1080, 800);
@@ -1556,8 +1642,8 @@ static void app_activate(GtkApplication *application, gpointer opaque)
     gtk_widget_set_hexpand(app->url_entry, TRUE);
     g_signal_connect(app->url_entry, "activate", G_CALLBACK(url_activate), app);
     gtk_box_pack_start(GTK_BOX(toolbar), app->url_entry, TRUE, TRUE, 0);
-    app->list_button = make_button("☆", G_CALLBACK(list_clicked), app);
-    gtk_box_pack_start(GTK_BOX(toolbar), app->list_button, FALSE, FALSE, 0);
+    app->section_button = make_sections_button(app);
+    gtk_box_pack_start(GTK_BOX(toolbar), app->section_button, FALSE, FALSE, 0);
     app->settings_button = make_settings_button(app);
     gtk_box_pack_start(GTK_BOX(toolbar), app->settings_button, FALSE, FALSE, 0);
 
@@ -1600,7 +1686,6 @@ static void app_activate(GtkApplication *application, gpointer opaque)
     gtk_widget_set_margin_top(app->status, 5);
     gtk_widget_set_margin_bottom(app->status, 5);
     gtk_box_pack_start(GTK_BOX(root), app->status, FALSE, FALSE, 0);
-    update_list_tooltip(app);
     gtk_widget_show_all(app->window);
     if (initial_url && *initial_url) app_begin_load(app, initial_url, NULL, NULL, false);
 }

@@ -169,6 +169,28 @@ int main(void)
     assert(found_gap);
     distill_litehtml_document_destroy(link_document);
 
+    /* Section markers are intentionally empty, but their one-pixel layout box
+       is what lets the desktop shell locate the section without a second
+       layout implementation. */
+    const char *marker_page =
+        "<!doctype html><html><head><style>html,body{margin:0}"
+        ".section-anchor{display:block;width:1px;height:1px;}</style></head><body>"
+        "<main><p style=\"height:100px\">intro</p>"
+        "<a class=\"section-anchor\" href=\"distill-section:images\"></a>"
+        "<section id=\"images\"><h2>Images</h2></section></main></body></html>";
+    DLiteHtmlDocument *marker_document =
+        distill_litehtml_document_create(marker_page, 760, 800, NULL);
+    assert(marker_document);
+    size_t marker_count =
+        distill_litehtml_document_link_boxes(marker_document, NULL, 0);
+    assert(marker_count == 1);
+    DLinkBox marker_box = {0};
+    assert(distill_litehtml_document_link_boxes(marker_document, &marker_box, 1) == 1);
+    assert(strcmp(marker_box.href, "distill-section:images") == 0);
+    assert(marker_box.width == 1 && marker_box.height == 1);
+    assert(marker_box.y > 0);
+    distill_litehtml_document_destroy(marker_document);
+
     const char *long_page =
         "<!doctype html><style>body{font-size:18px}p{margin:0 0 120px}</style>"
         "<main><p>top</p><p>middle</p><p>bottom</p></main>";

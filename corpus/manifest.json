@@ -479,6 +479,10 @@
         },
         {
           "stage": "template",
+          "expect": "distill-section:images"
+        },
+        {
+          "stage": "template",
           "expect": "images/harbour.jpg"
         },
         {

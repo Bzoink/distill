@@ -2129,6 +2129,17 @@ static bool html_is_dense_link_index(const char *html)
     return headings >= 3 && linked_headings * 2 >= headings && links * 2 >= headings;
 }
 
+/* The GTK shell reads these tiny internal links from the laid-out link boxes
+   to jump to the same document position the reader paints. They carry no text
+   and are only one pixel high, so they do not add another visible control to
+   the page. */
+static void append_section_marker(DBuffer *output, const char *id)
+{
+    dbuf_puts(output, "<a class=\"section-anchor\" aria-hidden=\"true\" href=\"distill-section:");
+    append_html_escaped(output, id);
+    dbuf_puts(output, "\"></a>");
+}
+
 static void append_json_table(Engine *engine, JSValueConst tables, DBuffer *output)
 {
     int64_t table_count = json_array_length(engine, tables);
@@ -2137,7 +2148,10 @@ static void append_json_table(Engine *engine, JSValueConst tables, DBuffer *outp
         char *caption = json_property_string(engine, table, "caption");
         JSValue rows = JS_GetPropertyStr(engine->context, table, "rows");
         int64_t row_count = json_array_length(engine, rows);
-        dbuf_puts(output, "<section class=\"table-card\">");
+        if (table_index == 0) append_section_marker(output, "tables");
+        dbuf_puts(output, table_index == 0
+                         ? "<section id=\"tables\" class=\"table-card\">"
+                         : "<section class=\"table-card\">");
         if (*caption) {
             dbuf_puts(output, "<h2>");
             append_html_escaped(output, caption);
@@ -2171,7 +2185,8 @@ static void append_json_results(Engine *engine, JSValueConst results, DBuffer *o
 {
     int64_t count = json_array_length(engine, results);
     if (!count) return;
-    dbuf_puts(output, "<section class=\"result-list\"><h2>Results</h2>");
+    append_section_marker(output, "results");
+    dbuf_puts(output, "<section id=\"results\" class=\"result-list\"><h2>Results</h2>");
     for (int64_t i = 0; i < count; ++i) {
         JSValue result = JS_GetPropertyUint32(engine->context, results, (uint32_t)i);
         char *title = json_property_string(engine, result, "title");
@@ -2207,7 +2222,10 @@ static void append_json_forms(Engine *engine, JSValueConst forms, DBuffer *outpu
         char *action = json_property_string(engine, form, "action");
         char *method = json_property_string(engine, form, "method");
         JSValue fields = JS_GetPropertyStr(engine->context, form, "fields");
-        dbuf_puts(output, "<section class=\"form-card\"><h2>Form</h2><form");
+        if (form_index == 0) append_section_marker(output, "forms");
+        dbuf_puts(output, form_index == 0
+                         ? "<section id=\"forms\" class=\"form-card\"><h2>Form</h2><form"
+                         : "<section class=\"form-card\"><h2>Form</h2><form");
         append_json_attr(output, "method", *method ? method : "get");
         append_json_attr(output, "action", action);
         dbuf_puts(output, ">");
@@ -2290,7 +2308,10 @@ static void append_json_videos(Engine *engine, JSValueConst videos, DBuffer *out
         char *title = json_property_string(engine, video, "title");
         char *url = json_property_string(engine, video, "url");
         char *poster = json_property_string(engine, video, "poster");
-        dbuf_puts(output, "<section class=\"video-card\"><p class=\"eyebrow\">Video reference</p><h2>");
+        if (i == 0) append_section_marker(output, "videos");
+        dbuf_puts(output, i == 0
+                         ? "<section id=\"videos\" class=\"video-card\"><p class=\"eyebrow\">Video reference</p><h2>"
+                         : "<section class=\"video-card\"><p class=\"eyebrow\">Video reference</p><h2>");
         append_html_escaped(output, *title ? title : "External video");
         dbuf_puts(output, "</h2><p>This reader keeps playback outside the page.</p><a class=\"button\"");
         if (*url) append_json_attr(output, "href", url);
@@ -2310,7 +2331,8 @@ static void append_json_media(Engine *engine, JSValueConst media, DBuffer *outpu
 {
     int64_t count = json_array_length(engine, media);
     if (!count) return;
-    dbuf_puts(output, "<section class=\"media-gallery\"><h2>Images</h2>");
+    append_section_marker(output, "images");
+    dbuf_puts(output, "<section id=\"images\" class=\"media-gallery\"><h2>Images</h2>");
     for (int64_t i = 0; i < count; ++i) {
         JSValue item = JS_GetPropertyUint32(engine->context, media, (uint32_t)i);
         char *url = json_property_string(engine, item, "url");
@@ -2339,7 +2361,8 @@ static void append_json_links(Engine *engine, JSValueConst links, DBuffer *outpu
 {
     int64_t count = json_array_length(engine, links);
     if (!count) return;
-    dbuf_puts(output, "<section class=\"link-list\"><h2>Links</h2>");
+    append_section_marker(output, "links");
+    dbuf_puts(output, "<section id=\"links\" class=\"link-list\"><h2>Links</h2>");
     for (int64_t i = 0; i < count; ++i) {
         JSValue item = JS_GetPropertyUint32(engine->context, links, (uint32_t)i);
         char *text = json_property_string(engine, item, "text");
@@ -2500,6 +2523,7 @@ static char *reader_template(Engine *engine, const char *json, const char *theme
         "button,.button{display:inline-block;padding:.55em .85em;border:0;border-radius:3px;background:var(--link);color:white;text-decoration:none;font:inherit;}"
         ".video-card h2,.table-card h2,.form-card h2,.media-gallery h2,.result-list h2{margin-top:0;}"
         ".eyebrow,.media-url{font-size:.78em;color:var(--muted);}"
+        ".section-anchor{display:block;width:1px;height:1px;overflow:hidden;}"
         ".media-item{margin:0 0 .75em;}"
         ".reader-list-item{padding-left:1em;}"
         ".distill-meta{font-size:.8em;color:var(--muted);margin-bottom:2.6em;}"
@@ -2522,7 +2546,7 @@ static char *reader_template(Engine *engine, const char *json, const char *theme
             "pre{text-align:left;}");
     }
     dbuf_puts(&output,
-        "</style></head><body><main");
+        "</style></head><body><main id=\"top\"");
     if (link_index) dbuf_puts(&output, " class=\"link-index\"");
     dbuf_puts(&output, "><h1>");
     const char *heading = *main_heading ? main_heading : (*title ? title : "Untitled page");
