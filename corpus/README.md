@@ -97,6 +97,7 @@ exists to test.
 | `14-video` | Embed and OpenGraph video metadata | Phase 1 extraction breadth |
 | `15-gallery` | Decorative/content image classification | Phase 1 extraction breadth |
 | `16-redirect` | Effective URL after redirect and base resolution | Phase 1 extraction breadth |
+| `17-empty-async` | Empty async script response must not crash evaluation | Browser globals and document lifecycle |
 
 `00` is the control: it has no scripts, so a failure there is never a binding
 bug. `07` is where a raw-pointer binding over Lexbor's arena-allocated nodes

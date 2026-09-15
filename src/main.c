@@ -41,6 +41,9 @@ typedef struct {
 
 typedef struct Request {
     RequestKind kind;
+    bool module_script;
+    bool async_evaluated;
+    size_t async_order;
     Engine *engine;
     CURL *easy;
     char *url;
@@ -49,6 +52,7 @@ typedef struct Request {
     JSValue resolve;
     JSValue reject;
     bool completed;
+    unsigned attempts;
 } Request;
 
 typedef struct {
@@ -89,6 +93,8 @@ struct Engine {
     uint64_t memory_limit;
     uint64_t max_scripts;
     uint64_t scripts_run;
+    size_t async_sequence;
+    size_t async_next_order;
     uint64_t next_timer;
     int async_pending;
     bool load_sent;
@@ -295,6 +301,12 @@ static size_t curl_write(void *ptr, size_t size, size_t count, void *opaque)
     return length;
 }
 
+static long connection_timeout_ms(const Engine *engine)
+{
+    uint64_t timeout = engine->cap_ms < 5000 ? engine->cap_ms : 5000;
+    return (long)(timeout ? timeout : 1);
+}
+
 static bool fetch_sync_request(Engine *engine, const char *url, DBuffer *body,
                                long *status, char **effective_url,
                                const char *request_method, const char *request_data)
@@ -325,7 +337,7 @@ static bool fetch_sync_request(Engine *engine, const char *url, DBuffer *body,
     curl_easy_setopt(easy, CURLOPT_WRITEFUNCTION, curl_write);
     curl_easy_setopt(easy, CURLOPT_WRITEDATA, body);
     curl_easy_setopt(easy, CURLOPT_USERAGENT, "distill/0.1");
-    curl_easy_setopt(easy, CURLOPT_CONNECTTIMEOUT_MS, 1000L);
+    curl_easy_setopt(easy, CURLOPT_CONNECTTIMEOUT_MS, connection_timeout_ms(engine));
     curl_easy_setopt(easy, CURLOPT_TIMEOUT_MS, (long)engine->cap_ms);
     if (request_method && d_ieq(request_method, "post")) {
         curl_easy_setopt(easy, CURLOPT_POST, 1L);
@@ -430,6 +442,25 @@ static void free_request(Engine *engine, Request *request)
     free(request);
 }
 
+static bool attach_request_handle(Engine *engine, Request *request)
+{
+    request->easy = curl_easy_init();
+    if (!request->easy) return false;
+    curl_easy_setopt(request->easy, CURLOPT_URL, request->url);
+    curl_easy_setopt(request->easy, CURLOPT_FOLLOWLOCATION, 1L);
+    curl_easy_setopt(request->easy, CURLOPT_WRITEFUNCTION, curl_write);
+    curl_easy_setopt(request->easy, CURLOPT_WRITEDATA, &request->body);
+    curl_easy_setopt(request->easy, CURLOPT_PRIVATE, request);
+    curl_easy_setopt(request->easy, CURLOPT_USERAGENT, "distill/0.1");
+    curl_easy_setopt(request->easy, CURLOPT_CONNECTTIMEOUT_MS, connection_timeout_ms(engine));
+    if (curl_multi_add_handle(engine->multi, request->easy) != CURLM_OK) {
+        curl_easy_cleanup(request->easy);
+        request->easy = NULL;
+        return false;
+    }
+    return true;
+}
+
 static Request *start_request(Engine *engine, RequestKind kind, const char *url)
 {
     Request *request = d_xcalloc(1, sizeof(*request));
@@ -439,21 +470,8 @@ static Request *start_request(Engine *engine, RequestKind kind, const char *url)
     request->resolve = JS_UNDEFINED;
     request->reject = JS_UNDEFINED;
     dbuf_init(&request->body);
-    request->easy = curl_easy_init();
-    if (!request->easy) { free_request(engine, request); return NULL; }
-    curl_easy_setopt(request->easy, CURLOPT_URL, request->url);
-    curl_easy_setopt(request->easy, CURLOPT_FOLLOWLOCATION, 1L);
-    curl_easy_setopt(request->easy, CURLOPT_WRITEFUNCTION, curl_write);
-    curl_easy_setopt(request->easy, CURLOPT_WRITEDATA, &request->body);
-    curl_easy_setopt(request->easy, CURLOPT_PRIVATE, request);
-    curl_easy_setopt(request->easy, CURLOPT_USERAGENT, "distill/0.1");
-    curl_easy_setopt(request->easy, CURLOPT_CONNECTTIMEOUT_MS, 1000L);
+    if (!attach_request_handle(engine, request)) { free_request(engine, request); return NULL; }
     request_vec_push(&engine->requests, request);
-    if (curl_multi_add_handle(engine->multi, request->easy) != CURLM_OK) {
-        request->completed = true;
-        free_request(engine, request);
-        return NULL;
-    }
     return request;
 }
 
@@ -642,10 +660,6 @@ static void run_timers(Engine *engine)
 static void finish_request(Engine *engine, Request *request)
 {
     if (request->kind == REQUEST_ASYNC_SCRIPT) {
-        JSValue result = JS_Eval(engine->context, request->body.data, request->body.length,
-                                 request->url, JS_EVAL_TYPE_GLOBAL);
-        if (JS_IsException(result)) note_exception(engine, request->url);
-        JS_FreeValue(engine->context, result);
         if (engine->async_pending > 0) --engine->async_pending;
     } else if (!JS_IsUndefined(request->resolve)) {
         JSValue response = make_response(engine, request);
@@ -678,6 +692,16 @@ static void process_network(Engine *engine)
         if (!request) continue;
         curl_easy_getinfo(message->easy_handle, CURLINFO_RESPONSE_CODE, &request->status);
         curl_multi_remove_handle(engine->multi, message->easy_handle);
+        CURLcode result = message->data.result;
+        curl_easy_cleanup(request->easy);
+        request->easy = NULL;
+        if ((result != CURLE_OK || request->status == 0) && request->attempts < 2) {
+            ++request->attempts;
+            dbuf_free(&request->body);
+            dbuf_init(&request->body);
+            request->status = 0;
+            if (attach_request_handle(engine, request)) continue;
+        }
         request->completed = true;
         finish_request(engine, request);
     }
@@ -734,14 +758,17 @@ static const char *HOST_JS =
 "__setWindow('addEventListener', (type, callback) => __add('window', type, callback));"
 "__setWindow('removeEventListener', () => {}); __setWindow('dispatchEvent', event => __dispatch('window', event.type));"
 "__setWindow('window', window); __setWindow('document', document);"
+"__setWindow('self', window); globalThis.self = window;"
 "__setWindow('innerWidth', 1280); __setWindow('innerHeight', 1024);"
 "__setWindow('setTimeout', setTimeout); __setWindow('clearTimeout', clearTimeout); __setWindow('setInterval', setInterval); __setWindow('clearInterval', clearInterval);"
+"globalThis.requestIdleCallback = callback => setTimeout(() => callback({didTimeout:false, timeRemaining:() => 50}), 1); globalThis.cancelIdleCallback = id => clearTimeout(id); __setWindow('requestIdleCallback', requestIdleCallback); __setWindow('cancelIdleCallback', cancelIdleCallback);"
 "__setWindow('requestAnimationFrame', requestAnimationFrame); __setWindow('fetch', fetch); __setWindow('console', console);"
 "__setWindow('scrollTo', () => {}); __setWindow('scrollBy', () => {});"
 "Object.defineProperty(document, 'addEventListener', {value:(type, callback) => __add('document', type, callback), configurable:true});"
 "Object.defineProperty(document, 'removeEventListener', {value:() => {}, configurable:true});"
 "Object.defineProperty(document, 'dispatchEvent', {value:event => __dispatch('document', event.type), configurable:true});"
 "document.readyState = 'loading';"
+"Object.defineProperty(document, 'cookie', {get() { return this.__distillCookie || ''; }, set(value) { const pair = String(value).split(';', 1)[0]; const name = pair.slice(0, pair.indexOf('=')); const old = (this.__distillCookie || '').split(';').filter(item => item.trim() && item.trim().split('=')[0] !== name); if (pair.indexOf('=') >= 0) old.push(pair); this.__distillCookie = old.join('; '); }, configurable:true});"
 "globalThis.localStorage = {__data: Object.create(null), getItem(k) { return this.__data[k] === undefined ? null : this.__data[k]; }, setItem(k,v) { this.__data[k] = String(v); }, removeItem(k) { delete this.__data[k]; }, clear() { this.__data = Object.create(null); }, key(i) { return Object.keys(this.__data)[i] ?? null; }};"
 "Object.defineProperty(localStorage, 'length', {get() { return Object.keys(this.__data).length; }});"
 "globalThis.sessionStorage = {__data: Object.create(null), getItem(k) { return this.__data[k] === undefined ? null : this.__data[k]; }, setItem(k,v) { this.__data[k] = String(v); }, removeItem(k) { delete this.__data[k]; }, clear() { this.__data = Object.create(null); }, key(i) { return Object.keys(this.__data)[i] ?? null; }};"
@@ -751,20 +778,21 @@ static const char *HOST_JS =
 "if (!navigator.userAgent) navigator.userAgent = 'Mozilla/5.0 Distill'; if (!navigator.language) navigator.language = 'en-US'; __setWindow('navigator', navigator);"
 "globalThis.screen = {width: 1280, height: 1024}; __setWindow('screen', screen);"
 "globalThis.crypto = {getRandomValues(a) { for (let i=0;i<a.length;i++) a[i] = (i * 73 + 41) & 255; return a; }}; __setWindow('crypto', crypto);"
-"globalThis.matchMedia = q => ({matches: false, media: q}); __setWindow('matchMedia', matchMedia);"
+"globalThis.matchMedia = q => ({matches: false, media: q, addListener() {}, removeListener() {}, addEventListener() {}, removeEventListener() {}}); __setWindow('matchMedia', matchMedia);"
 "globalThis.performance = {now: () => Date.now()}; __setWindow('performance', performance);"
 "globalThis.history = {pushState(s,t,u) { const suffix = String(u); location.search = suffix[0] === '?' ? suffix : ''; location.href = location.href.split('?')[0] + location.search; }, replaceState(s,t,u) { this.pushState(s,t,u); }}; __setWindow('history', history);"
 "if (typeof Element !== 'undefined') Element.prototype.getBoundingClientRect = function() { return {x:0,y:0,top:0,left:0,width:800,height:20,right:800,bottom:20}; };"
 "if (typeof Element !== 'undefined') { Object.defineProperty(Element.prototype, 'offsetHeight', {get() { return 20; }}); Object.defineProperty(Element.prototype, 'offsetWidth', {get() { return 800; }}); }"
 "globalThis.__resolveURL = function(value) { const raw = String(value || ''); if (/^[a-z]+:/i.test(raw) || raw.startsWith('//')) return raw; const base = (document.querySelector('base') && document.querySelector('base').getAttribute('href')) || location.href; const origin = location.href.slice(0, location.href.indexOf('/', location.href.indexOf('://') + 3)); if (raw.startsWith('/')) return origin + raw; const prefix = base.endsWith('/') ? base : base.slice(0, base.lastIndexOf('/') + 1); const pieces = (prefix + raw).split('/'); const clean = []; for (const piece of pieces) { if (!piece || piece === '.') continue; if (piece === '..') clean.pop(); else clean.push(piece); } return origin + '/' + clean.join('/'); };"
-"try { Object.defineProperty(HTMLAnchorElement.prototype, 'href', {get() { return __resolveURL(this.getAttribute('href')); }, configurable:true}); } catch (e) {}"
+"globalThis.__anchorPart = function(node, part) { const href = __resolveURL(node.getAttribute('href') || ''); const scheme = href.indexOf('://'); if (scheme < 0) return part === 'href' ? href : ''; const authority = scheme + 3; const tail = href.slice(authority); const end = tail.search(/[/?#]/); const host = end < 0 ? tail : tail.slice(0, end); const rest = end < 0 ? '' : tail.slice(end); const pathEnd = rest.search(/[?#]/); const pathname = pathEnd < 0 ? (rest || '/') : (rest.slice(0, pathEnd) || '/'); const query = rest.indexOf('?'); const hash = rest.indexOf('#'); const search = query < 0 ? '' : rest.slice(query, hash < 0 ? rest.length : hash); const fragment = hash < 0 ? '' : rest.slice(hash); const portAt = host.lastIndexOf(':'); const hasPort = portAt > -1 && host.indexOf(']') < portAt; const hostname = hasPort ? host.slice(0, portAt) : host; const port = hasPort ? host.slice(portAt + 1) : ''; if (part === 'href') return href; if (part === 'protocol') return href.slice(0, scheme + 1); if (part === 'host') return host; if (part === 'hostname') return hostname; if (part === 'port') return port; if (part === 'pathname') return pathname; if (part === 'search') return search; if (part === 'hash') return fragment; return ''; };"
+"try { Object.defineProperty(HTMLAnchorElement.prototype, 'href', {get() { return __anchorPart(this, 'href'); }, set(value) { this.setAttribute('href', value); }, configurable:true}); Object.defineProperty(HTMLAnchorElement.prototype, 'protocol', {get() { return __anchorPart(this, 'protocol'); }, configurable:true}); Object.defineProperty(HTMLAnchorElement.prototype, 'host', {get() { return __anchorPart(this, 'host'); }, configurable:true}); Object.defineProperty(HTMLAnchorElement.prototype, 'hostname', {get() { return __anchorPart(this, 'hostname'); }, configurable:true}); Object.defineProperty(HTMLAnchorElement.prototype, 'port', {get() { return __anchorPart(this, 'port'); }, configurable:true}); Object.defineProperty(HTMLAnchorElement.prototype, 'pathname', {get() { return __anchorPart(this, 'pathname'); }, configurable:true}); Object.defineProperty(HTMLAnchorElement.prototype, 'search', {get() { return __anchorPart(this, 'search'); }, configurable:true}); Object.defineProperty(HTMLAnchorElement.prototype, 'hash', {get() { return __anchorPart(this, 'hash'); }, configurable:true}); } catch (e) {}"
 "try { Object.defineProperty(HTMLImageElement.prototype, 'src', {get() { return __resolveURL(this.getAttribute('src')); }, configurable:true}); } catch (e) {}"
 "try { Object.defineProperty(HTMLFormElement.prototype, 'action', {get() { return __resolveURL(this.getAttribute('action')); }, configurable:true}); } catch (e) {}"
 "for (const node of document.querySelectorAll('a')) try { Object.defineProperty(node, 'href', {get() { return __resolveURL(this.getAttribute('href')); }, configurable:true}); } catch (e) {}"
 "for (const node of document.querySelectorAll('img')) try { Object.defineProperty(node, 'src', {get() { return __resolveURL(this.getAttribute('src')); }, configurable:true}); } catch (e) {}"
 "for (const node of document.querySelectorAll('form')) try { Object.defineProperty(node, 'action', {get() { return __resolveURL(this.getAttribute('action')); }, configurable:true}); } catch (e) {}"
-"globalThis.getComputedStyle = node => ({display: node.id === 'genuinely-hidden' ? 'none' : ((node.getAttribute && node.getAttribute('hidden') !== null) ? 'none' : 'block'), visibility: 'visible'}); __setWindow('getComputedStyle', getComputedStyle);"
-"globalThis.IntersectionObserver = class { constructor(callback) { this.callback = callback; } observe(target) { this.callback([{target, isIntersecting:true, intersectionRatio:1}], this); } unobserve() {} };"
+"globalThis.getComputedStyle = node => ({display: node.id === 'genuinely-hidden' ? 'none' : ((node.getAttribute && node.getAttribute('hidden') !== null) ? 'none' : 'block'), visibility: 'visible', marginLeft: '0px', marginRight: '0px', getPropertyValue(name) { return this[name] || ''; }}); __setWindow('getComputedStyle', getComputedStyle);"
+"globalThis.IntersectionObserver = class { constructor(callback) { this.callback = callback; } observe(target) { this.callback([{target, isIntersecting:true, intersectionRatio:1}], this); } unobserve() {} disconnect() {} };"
 "globalThis.MutationObserver = class { constructor(callback) { this.callback = callback; } observe() { this.callback([{}], this); } disconnect() {} };"
 "globalThis.XMLHttpRequest = class { constructor() { this.readyState=0; this.status=0; this.responseText=''; this.onreadystatechange=null; } open(method,url,async=true) { this._url=url; this.readyState=1; } send() { fetch(this._url).then(r => r.text().then(t => { this.status=r.status; this.responseText=t; this.readyState=4; if (this.onreadystatechange) this.onreadystatechange(); })); } };"
 "__setWindow('XMLHttpRequest', XMLHttpRequest); __setWindow('IntersectionObserver', IntersectionObserver); __setWindow('MutationObserver', MutationObserver);"
@@ -780,6 +808,28 @@ static bool evaluate(Engine *engine, const char *source, size_t length,
     JS_FreeValue(engine->context, result);
     execute_jobs(engine);
     return ok;
+}
+
+static void process_async_scripts(Engine *engine)
+{
+    for (;;) {
+        Request *next = NULL;
+        for (size_t i = 0; i < engine->requests.length; ++i) {
+            Request *request = engine->requests.items[i];
+            if (request->kind == REQUEST_ASYNC_SCRIPT && !request->async_evaluated &&
+                request->async_order == engine->async_next_order) {
+                next = request;
+                break;
+            }
+        }
+        if (!next || !next->completed) return;
+        next->async_evaluated = true;
+        ++engine->async_next_order;
+        if (next->body.length && next->body.data) {
+            int flags = next->module_script ? JS_EVAL_TYPE_MODULE : JS_EVAL_TYPE_GLOBAL;
+            evaluate(engine, next->body.data, next->body.length, next->url, flags);
+        }
+    }
 }
 
 static bool load_linkedom(Engine *engine, const DBuffer *html)
@@ -817,10 +867,13 @@ static bool load_linkedom(Engine *engine, const DBuffer *html)
     JS_FreeValue(engine->context, module_value);
     if (JS_IsException(dom_window)) { note_exception(engine, "linkedom parseHTML"); return false; }
     engine->document = JS_GetPropertyStr(engine->context, dom_window, "document");
-    engine->window = JS_NewObject(engine->context);
+    /* In a browser Window is also the JavaScript global object. Keeping a
+       separate object makes globals installed by bundles invisible through
+       window/self, which breaks common application bootstraps. */
+    engine->window = JS_DupValue(engine->context, engine->global);
     const char *constructors[] = {
         "Element", "Node", "Event", "HTMLElement", "HTMLDocument",
-        "HTMLAnchorElement", "HTMLImageElement", "HTMLFormElement"
+        "HTMLAnchorElement", "HTMLImageElement", "HTMLFormElement", "HTMLIFrameElement"
     };
     for (size_t i = 0; i < sizeof(constructors) / sizeof(constructors[0]); ++i) {
         JSValue value = JS_GetPropertyStr(engine->context, dom_window, constructors[i]);
@@ -866,6 +919,7 @@ static bool install_host(Engine *engine)
     JSContext *ctx = engine->context;
     JS_SetPropertyStr(ctx, engine->global, "location", make_location(engine));
     JS_SetPropertyStr(ctx, engine->window, "location", JS_GetPropertyStr(ctx, engine->global, "location"));
+    JS_SetPropertyStr(ctx, engine->document, "location", JS_GetPropertyStr(ctx, engine->global, "location"));
     JS_SetPropertyStr(ctx, engine->global, "fetch", JS_NewCFunction(ctx, fetch_callback, "fetch", 1));
     JS_SetPropertyStr(ctx, engine->global, "setTimeout", JS_NewCFunctionMagic(ctx, timer_callback, "setTimeout", 2, JS_CFUNC_generic_magic, 0));
     JS_SetPropertyStr(ctx, engine->global, "setInterval", JS_NewCFunctionMagic(ctx, timer_callback, "setInterval", 2, JS_CFUNC_generic_magic, 1));
@@ -882,7 +936,7 @@ static bool install_host(Engine *engine)
 static bool discover_scripts(Engine *engine)
 {
     const char *source =
-        "Array.from(document.querySelectorAll('script')).map(s => ({src:s.getAttribute('src') || '', async:s.hasAttribute('async'), defer:s.hasAttribute('defer'), text:s.textContent || '', type:s.getAttribute('type') || ''}))";
+        "Array.from(document.querySelectorAll('script')).map(s => ({node:s, src:s.getAttribute('src') || '', async:s.hasAttribute('async'), defer:s.hasAttribute('defer'), text:s.textContent || '', type:s.getAttribute('type') || ''}))";
     JSValue scripts = JS_Eval(engine->context, source, strlen(source), "distill-scripts.js", JS_EVAL_TYPE_GLOBAL);
     if (JS_IsException(scripts)) { note_exception(engine, "script discovery"); return false; }
     JSValue deferred = JS_NewArray(engine->context);
@@ -891,6 +945,8 @@ static bool discover_scripts(Engine *engine)
     JS_GetLength(engine->context, scripts, &length);
     for (int64_t i = 0; i < length; ++i) {
         JSValue spec = JS_GetPropertyUint32(engine->context, scripts, (uint32_t)i);
+        JSValue node = JS_GetPropertyStr(engine->context, spec, "node");
+        JS_SetPropertyStr(engine->context, node, "__distillProcessed", JS_NewBool(engine->context, true));
         JSValue src_value = JS_GetPropertyStr(engine->context, spec, "src");
         JSValue async_value = JS_GetPropertyStr(engine->context, spec, "async");
         JSValue defer_value = JS_GetPropertyStr(engine->context, spec, "defer");
@@ -901,14 +957,20 @@ static bool discover_scripts(Engine *engine)
         char *type = js_string(engine->context, type_value);
         bool is_async = JS_ToBool(engine->context, async_value);
         bool is_defer = JS_ToBool(engine->context, defer_value);
-        JS_FreeValue(engine->context, src_value); JS_FreeValue(engine->context, async_value);
+        JS_FreeValue(engine->context, node); JS_FreeValue(engine->context, src_value); JS_FreeValue(engine->context, async_value);
         JS_FreeValue(engine->context, defer_value); JS_FreeValue(engine->context, text_value);
         JS_FreeValue(engine->context, type_value); JS_FreeValue(engine->context, spec);
         if (d_contains(type, "json")) { free(src); free(code); free(type); continue; }
         char *url = src[0] ? resolve_url(engine->base_url, src) : NULL;
         if (is_async && url) {
             ++engine->async_pending;
-            if (!start_request(engine, REQUEST_ASYNC_SCRIPT, url)) --engine->async_pending;
+            Request *request = start_request(engine, REQUEST_ASYNC_SCRIPT, url);
+            if (!request) {
+                --engine->async_pending;
+            } else {
+                request->module_script = d_eq(type, "module") || d_eq(type, "text/javascript;module");
+                request->async_order = engine->async_sequence++;
+            }
         } else if (is_defer) {
             if (url) {
                 DBuffer body; long status = 0;
@@ -937,6 +999,61 @@ static bool discover_scripts(Engine *engine)
     }
     JS_FreeValue(engine->context, deferred);
     JS_FreeValue(engine->context, scripts);
+
+    for (size_t pass = 0; pass < 64; ++pass) {
+        const char *dynamic_source =
+            "Array.from(document.querySelectorAll('script')).filter(s => !s.__distillProcessed).map(s => ({node:s, src:s.getAttribute('src') || '', text:s.textContent || '', type:s.getAttribute('type') || ''}))";
+        JSValue dynamic = JS_Eval(engine->context, dynamic_source, strlen(dynamic_source),
+                                  "distill-dynamic-scripts.js", JS_EVAL_TYPE_GLOBAL);
+        if (JS_IsException(dynamic)) {
+            note_exception(engine, "dynamic script discovery");
+            JS_FreeValue(engine->context, dynamic);
+            return false;
+        }
+        int64_t dynamic_length = 0;
+        JS_GetLength(engine->context, dynamic, &dynamic_length);
+        if (!dynamic_length) {
+            JS_FreeValue(engine->context, dynamic);
+            break;
+        }
+        for (int64_t i = 0; i < dynamic_length; ++i) {
+            JSValue spec = JS_GetPropertyUint32(engine->context, dynamic, (uint32_t)i);
+            JSValue node = JS_GetPropertyStr(engine->context, spec, "node");
+            JS_SetPropertyStr(engine->context, node, "__distillProcessed", JS_NewBool(engine->context, true));
+            JSValue src_value = JS_GetPropertyStr(engine->context, spec, "src");
+            JSValue text_value = JS_GetPropertyStr(engine->context, spec, "text");
+            JSValue type_value = JS_GetPropertyStr(engine->context, spec, "type");
+            char *src = js_string(engine->context, src_value);
+            char *code = js_string(engine->context, text_value);
+            char *type = js_string(engine->context, type_value);
+            JS_FreeValue(engine->context, src_value);
+            JS_FreeValue(engine->context, text_value); JS_FreeValue(engine->context, type_value);
+            JS_FreeValue(engine->context, spec);
+            char *url = src[0] ? resolve_url(engine->base_url, src) : NULL;
+            if (url) {
+                DBuffer body; long status = 0;
+                if (fetch_sync(engine, url, &body, &status, NULL)) {
+                    free(code); code = d_strndup(body.data, body.length); dbuf_free(&body);
+                }
+            }
+            bool ok = true;
+            if (!d_contains(type, "json") && *code) {
+                int flags = d_eq(type, "module") || d_eq(type, "text/javascript;module")
+                    ? JS_EVAL_TYPE_MODULE : JS_EVAL_TYPE_GLOBAL;
+                ok = evaluate(engine, code, strlen(code), url ? url : "distill-dynamic.js", flags);
+            }
+            JSValue onload = JS_GetPropertyStr(engine->context, node, "onload");
+            if (ok && JS_IsFunction(engine->context, onload)) {
+                JSValue result = JS_Call(engine->context, onload, node, 0, NULL);
+                if (JS_IsException(result)) note_exception(engine, url ? url : "dynamic script load");
+                JS_FreeValue(engine->context, result);
+            }
+            JS_FreeValue(engine->context, onload);
+            JS_FreeValue(engine->context, node);
+            free(src); free(code); free(type); free(url);
+        }
+        JS_FreeValue(engine->context, dynamic);
+    }
     JS_SetPropertyStr(engine->context, engine->document, "readyState", js_str(engine->context, "interactive"));
     dispatch_host_event(engine, "document", "readystatechange");
     dispatch_host_event(engine, "document", "DOMContentLoaded");
@@ -975,6 +1092,7 @@ static void settle(Engine *engine)
 {
     for (;;) {
         process_network(engine);
+        process_async_scripts(engine);
         execute_jobs(engine);
         run_timers(engine);
         execute_jobs(engine);
@@ -1631,6 +1749,9 @@ static int run_page(const char *input, uint64_t cap_ms, uint64_t memory_mb,
         return 2;
     }
     settle(&engine);
+    /* The settle cap stops page activity; it must not interrupt our own
+       final DOM snapshot or extraction pass. */
+    JS_SetInterruptHandler(engine.runtime, NULL, NULL);
     char *serialized = serialize_document(&engine);
     int result = 0;
     if (viewer_path) {

@@ -1,0 +1,211 @@
+{
+  "schema": 1,
+  "description": "Live-site comparison targets. These are diagnostic inputs, not CI gates.",
+  "sites": [
+    {
+      "id": "01-example-domain",
+      "tier": 1,
+      "class": "static",
+      "name": "Example Domain",
+      "url": "https://example.com/",
+      "focus": "minimal HTML, HTTP fetch, and basic DOM parsing"
+    },
+    {
+      "id": "02-info-cern",
+      "tier": 1,
+      "class": "static",
+      "name": "Info.cern.ch",
+      "url": "http://info.cern.ch/",
+      "focus": "old-style HTML and unstyled document structure"
+    },
+    {
+      "id": "03-markdown-nice",
+      "tier": 1,
+      "class": "static-app",
+      "name": "Markdown Nice",
+      "url": "https://mdnice.com/",
+      "focus": "static content alongside a modest application shell"
+    },
+    {
+      "id": "04-w3schools-html",
+      "tier": 1,
+      "class": "documentation",
+      "name": "W3Schools HTML Tutorial",
+      "url": "https://www.w3schools.com/html/",
+      "focus": "content-heavy documentation, navigation, and code examples"
+    },
+    {
+      "id": "05-hacker-news",
+      "tier": 2,
+      "class": "content-feed",
+      "name": "Hacker News",
+      "url": "https://news.ycombinator.com/",
+      "focus": "dense links, tables, rankings, and compact text extraction"
+    },
+    {
+      "id": "06-bbc-news",
+      "tier": 2,
+      "class": "news",
+      "name": "BBC News",
+      "url": "https://www.bbc.com/news",
+      "focus": "news hierarchy, media references, grids, and dynamic advertising"
+    },
+    {
+      "id": "07-dev-community",
+      "tier": 2,
+      "class": "blog-platform",
+      "name": "DEV Community",
+      "url": "https://dev.to/",
+      "focus": "server-rendered content with client hydration"
+    },
+    {
+      "id": "08-medium",
+      "tier": 2,
+      "class": "blog-platform",
+      "name": "Medium",
+      "url": "https://medium.com/",
+      "focus": "custom markup, font loading, overlays, and paywall behavior; use a concrete article URL for article testing"
+    },
+    {
+      "id": "09-wikipedia-random",
+      "tier": 2,
+      "class": "documentation",
+      "name": "Wikipedia Random Article",
+      "url": "https://en.wikipedia.org/wiki/Special:Random",
+      "focus": "deep hierarchy, infoboxes, footnotes, and math/science markup",
+      "note": "The final article is intentionally non-deterministic and must be recorded with each run."
+    },
+    {
+      "id": "10-stack-overflow",
+      "tier": 2,
+      "class": "community",
+      "name": "Stack Overflow",
+      "url": "https://stackoverflow.com/",
+      "focus": "code blocks, lists, links, profiles, and interactive navigation"
+    },
+    {
+      "id": "11-react",
+      "tier": 3,
+      "class": "spa",
+      "name": "React Official Website",
+      "url": "https://react.dev/",
+      "focus": "modern documentation framework, hydration, and client-side navigation"
+    },
+    {
+      "id": "12-x",
+      "tier": 3,
+      "class": "spa",
+      "name": "Twitter / X",
+      "url": "https://x.com/",
+      "focus": "heavy SPA behavior and virtualized content",
+      "note": "The supplied list did not include a public profile handle; replace this URL with a concrete public profile when one is provided."
+    },
+    {
+      "id": "13-airbnb",
+      "tier": 3,
+      "class": "spa",
+      "name": "Airbnb",
+      "url": "https://www.airbnb.com/",
+      "focus": "asynchronous search UI, maps, location state, and dynamic results"
+    },
+    {
+      "id": "14-notion",
+      "tier": 3,
+      "class": "spa",
+      "name": "Notion",
+      "url": "https://www.notion.so/",
+      "focus": "deeply nested dynamic blocks and application-rendered content",
+      "note": "A public template URL is required to test a specific document rather than the landing page."
+    },
+    {
+      "id": "15-github-trending",
+      "tier": 3,
+      "class": "content-feed",
+      "name": "GitHub Trending",
+      "url": "https://github.com/trending",
+      "focus": "dynamic list views, counters, badges, and links"
+    },
+    {
+      "id": "16-youtube",
+      "tier": 4,
+      "class": "media",
+      "name": "YouTube",
+      "url": "https://www.youtube.com/",
+      "focus": "custom elements, shadow DOM, media metadata, and deferred comments",
+      "note": "The supplied list names a watch page but contains only the YouTube home URL; use a concrete watch URL for video-page testing."
+    },
+    {
+      "id": "17-imgur",
+      "tier": 4,
+      "class": "media",
+      "name": "Imgur",
+      "url": "https://imgur.com/",
+      "focus": "image grids, lazy-loaded media, and media references"
+    },
+    {
+      "id": "18-reddit",
+      "tier": 4,
+      "class": "community",
+      "name": "Reddit",
+      "url": "https://www.reddit.com/",
+      "focus": "infinite scroll, nested threads, and dynamic content expansion"
+    },
+    {
+      "id": "19-codepen-trending",
+      "tier": 4,
+      "class": "media-app",
+      "name": "CodePen Trending",
+      "url": "https://codepen.io/trending",
+      "focus": "embedded frames and user-generated HTML/CSS/JavaScript"
+    },
+    {
+      "id": "20-product-hunt",
+      "tier": 4,
+      "class": "spa",
+      "name": "Product Hunt",
+      "url": "https://www.producthunt.com/",
+      "focus": "client-side state, modal UI, voting controls, and asynchronous data"
+    },
+    {
+      "id": "21-cloudflare",
+      "tier": 5,
+      "class": "anti-bot",
+      "name": "Cloudflare",
+      "url": "https://www.cloudflare.com/",
+      "focus": "security headers and bot-protection behavior",
+      "note": "This is Cloudflare's public site, not a guaranteed challenge page. A protected test URL must be supplied separately."
+    },
+    {
+      "id": "22-zillow",
+      "tier": 5,
+      "class": "anti-bot",
+      "name": "Zillow",
+      "url": "https://www.zillow.com/",
+      "focus": "location state, consent, rate limiting, and anti-scraping behavior"
+    },
+    {
+      "id": "23-imdb",
+      "tier": 5,
+      "class": "anti-bot",
+      "name": "IMDb",
+      "url": "https://www.imdb.com/",
+      "focus": "structured media metadata, schema markup, and rate limiting"
+    },
+    {
+      "id": "24-bloomberg",
+      "tier": 5,
+      "class": "paywall",
+      "name": "Bloomberg",
+      "url": "https://www.bloomberg.com/",
+      "focus": "paywall triggers, consent, tracking, and complex news layout"
+    },
+    {
+      "id": "25-target",
+      "tier": 5,
+      "class": "ecommerce",
+      "name": "Target",
+      "url": "https://www.target.com/",
+      "focus": "e-commerce application rendering and bot mitigation"
+    }
+  ]
+}

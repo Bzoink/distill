@@ -483,6 +483,17 @@
         {"stage": "extract", "path": "readability.title", "expect": "A careful reader"}
       ],
       "golden": "golden/16-redirect.json"
+    },
+    {
+      "id": "17-empty-async",
+      "path": "17-empty-async.html",
+      "gate": true,
+      "plan_section": "Browser globals and document lifecycle",
+      "exercises": ["async-script", "empty-response"],
+      "why": "An empty asynchronously fetched script must not pass a null source pointer to the JavaScript evaluator.",
+      "assertions": [
+        {"stage": "dom", "selector": "#content", "expect": "EMPTY-ASYNC-SAFE"}
+      ]
     }
   ],
   "live": [
