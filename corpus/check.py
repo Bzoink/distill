@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """Run the corpus assertions.
 
-Starts serve.py, drives a headless browser over each page, and checks the
-'dom'-stage assertions in manifest.json against the post-JS DOM.
+Starts serve.py, drives the Phase 0 engine over each page, and checks the
+'dom'-stage assertions in manifest.json against the post-JS DOM. Use
+--baseline to validate the fixtures against a reference browser instead.
 
     ./check.py                 all local gates
     ./check.py --id 03-settle  one page
@@ -12,8 +13,8 @@ Starts serve.py, drives a headless browser over each page, and checks the
 Exit status is non-zero if any gate fails, so Phase 0's "done when" is a
 CI-able condition rather than a judgement call.
 
-Validate the fixtures with a real browser FIRST. A fixture bug and a binding
-bug look identical, and these fixtures are written to be hard.
+Validate the fixtures with --baseline FIRST. A fixture bug and a binding bug
+look identical, and these fixtures are written to be hard.
 """
 
 import argparse
@@ -98,6 +99,33 @@ def find_browser():
     sys.exit("no chromium/chrome found; install one to validate the corpus")
 
 
+def find_engine():
+    candidates = [
+        os.environ.get("DISTILL_ENGINE"),
+        os.path.join(os.path.dirname(HERE), "build", "distill"),
+        os.path.join(os.path.dirname(HERE), "build", "bin", "distill"),
+    ]
+    for candidate in candidates:
+        if candidate and os.path.isfile(candidate) and os.access(candidate, os.X_OK):
+            return candidate
+    path = shutil.which("distill")
+    if path:
+        return path
+    sys.exit("no distill engine found; build it first (cmake -S . -B build && cmake --build build)")
+
+
+def find_arm_b(pruned=False):
+    candidates = [
+        os.environ.get("DISTILL_ARM_B_PRUNED" if pruned else "DISTILL_ARM_B"),
+        os.path.join(os.path.dirname(HERE), "build", "distill-arm-b-pruned" if pruned else "distill-arm-b"),
+    ]
+    for candidate in candidates:
+        if candidate and os.path.isfile(candidate) and os.access(candidate, os.X_OK):
+            return candidate
+    label = "Arm B'" if pruned else "Arm B"
+    sys.exit(f"no {label} engine found; build it first (cmake -S . -B build && cmake --build build)")
+
+
 def dump_dom(browser, url, budget_ms, timeout_s):
     """Post-JS DOM for a URL, or (None, reason)."""
     cmd = [
@@ -113,6 +141,36 @@ def dump_dom(browser, url, budget_ms, timeout_s):
         return None, f"browser timed out after {timeout_s}s"
     if r.returncode != 0:
         return None, f"browser exit {r.returncode}: {r.stderr.strip()[:200]}"
+    return r.stdout, None
+
+
+def dump_engine(engine, url, cap_ms, timeout_s):
+    """Post-JS DOM from the Phase 0 engine, or (None, reason)."""
+    cmd = [
+        engine, "--url", url, "--dump-dom", "--script-cap-ms", str(cap_ms),
+    ]
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout_s)
+    except subprocess.TimeoutExpired:
+        return None, f"engine timed out after {timeout_s}s"
+    if r.returncode != 0:
+        return None, f"engine exit {r.returncode}: {r.stderr.strip()[:200]}"
+    if not r.stdout.strip():
+        return None, f"engine returned no DOM: {r.stderr.strip()[:200]}"
+    return r.stdout, None
+
+
+def dump_arm_b(engine, url, cap_ms, timeout_s):
+    """Post-JS DOM from the JS-side-DOM comparison arm."""
+    cmd = [engine, "--url", url, "--dump-dom", "--script-cap-ms", str(cap_ms)]
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout_s)
+    except subprocess.TimeoutExpired:
+        return None, f"Arm B timed out after {timeout_s}s"
+    if r.returncode != 0:
+        return None, f"Arm B exit {r.returncode}: {r.stderr.strip()[:200]}"
+    if not r.stdout.strip():
+        return None, f"Arm B returned no DOM: {r.stderr.strip()[:200]}"
     return r.stdout, None
 
 
@@ -159,13 +217,19 @@ def main():
     ap.add_argument("--baseline", action="store_true",
                     help="validate the fixtures against the reference browser: honour "
                          "browser_expect where we deliberately diverge from a browser")
+    ap.add_argument("--arm", choices=("a", "b", "b-pruned"), default="a",
+                    help="engine arm: a is Lexbor+C bindings (default), b is JS-side linkedom, b-pruned is the no-Lexbor baseline")
     ap.add_argument("--keep-dom", metavar="DIR", help="save each dumped DOM")
     ap.add_argument("--budget", type=int, default=6000, help="virtual time budget, ms")
     ap.add_argument("--timeout", type=int, default=45, help="real-time cap per page, s")
     args = ap.parse_args()
 
     manifest = json.load(open(MANIFEST, encoding="utf-8"))
-    browser = find_browser()
+    if args.baseline and args.arm != "a":
+        ap.error("--baseline is only valid with the default reference-browser comparison")
+    browser = find_browser() if args.baseline else None
+    engine = find_engine() if not args.baseline and args.arm == "a" else None
+    arm_b = find_arm_b(args.arm == "b-pruned") if not args.baseline and args.arm in ("b", "b-pruned") else None
     port = free_port()
 
     if args.keep_dom:
@@ -189,14 +253,20 @@ def main():
             if not pages:
                 sys.exit(f"no page with id {args.id!r}")
 
-        mode = "baseline (reference browser)" if args.baseline else "engine expectations"
-        print(f"{DIM}browser: {browser}\nserver:  http://127.0.0.1:{port}/\nmode:    {mode}{RESET}\n")
+        mode = "baseline (reference browser)" if args.baseline else ("Arm B' (no-Lexbor + litehtml)" if args.arm == "b-pruned" else ("Arm B (JS-side linkedom)" if args.arm == "b" else "Arm A (Lexbor+C bindings)"))
+        driver = browser if args.baseline else (arm_b if args.arm in ("b", "b-pruned") else engine)
+        print(f"{DIM}{'browser' if args.baseline else 'driver'}: {driver}\nserver:  http://127.0.0.1:{port}/\nmode:    {mode}{RESET}\n")
 
         total_failed, gates_failed = 0, []
         for page in pages:
             url = f"http://127.0.0.1:{port}/{page['path']}"
             t0 = time.time()
-            html, err = dump_dom(browser, url, args.budget, args.timeout)
+            if args.baseline:
+                html, err = dump_dom(browser, url, args.budget, args.timeout)
+            elif args.arm in ("b", "b-pruned"):
+                html, err = dump_arm_b(arm_b, url, manifest.get("settle_cap_ms", 5000), args.timeout)
+            else:
+                html, err = dump_engine(engine, url, manifest.get("settle_cap_ms", 5000), args.timeout)
             elapsed = time.time() - t0
 
             print(f"{page['id']}  {DIM}{page['plan_section']}{RESET}")

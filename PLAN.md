@@ -2,7 +2,7 @@
 
 *A small, C-rooted stack that runs a page's real JavaScript against a real DOM, pulls out what actually matters, and renders it back — clearly, consistently, on our own terms.*
 
-**Status:** Concept — Phase 0 corpus built, implementation not started
+**Status:** Phase 0 complete — Arm A selected; Phase 1 not started
 **Drafted:** 2026-09-14 · **Revised:** 2026-09-14 (second review pass)
 **Origin:** NetSurf JS/rendering gap analysis (see `../netsurf`)
 **Rendered version:** https://claude.ai/code/artifact/fcbd8e5f-f6dc-4abd-a2a4-e7282070cf4a *(predates this revision)*
@@ -309,6 +309,8 @@ NetSurf's libdom and `dukky` (both MIT) are prior art for exactly these question
 **Comparison criteria**, so the decision is mechanical rather than argued: DOM-assertion pass rate across the corpus; unimplemented-call volume from telemetry; peak RSS and fetch→extract wall-clock against the budget; total shared-library footprint against the size budget; and the rough size of the remaining bespoke surface.
 
 **Done when:** one arm passes the corpus assertions, meets both budgets, and has been chosen on recorded evidence — with the structural question answered explicitly rather than implied. Keep the losing arms' notes.
+
+**Phase 0 result (2026-09-14):** Arm A and the JS-side Arm B both pass all local `dom` gates, including the deliberate settle, geometry, and encoding divergences. Arm B′ is built as the no-Lexbor configuration and parses Arm B's serialized output through litehtml; it also passes the corpus. Arm A is selected for the next phase because it is the lower-RSS implementation (14.4 MiB sampled versus 15.0 MiB for Arm B), keeps the binding boundary in the planned C-rooted stack, and exposes geometry calls in the default telemetry stream. Both stay below the 150 MiB RSS, 3 s typical-page, 5 s cap, and 8 MiB shared-library budgets; the measured Arm A shared set is 5.18 MiB (QuickJS-ng + Lexbor). Arm B and Arm B′ remain in-tree as comparison targets (`distill-arm-b` and `distill-arm-b-pruned`). The structural question therefore stays answered in favour of a C project: Lexbor earns its place for direct DOM ownership, encoding detection, and the lower-memory native path. Detailed evidence is in [`PHASE0.md`](PHASE0.md).
 
 ### Phase 1 — Extraction breadth
 *Still headless*
