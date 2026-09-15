@@ -1,4 +1,7 @@
-/external/
+/external/build
+/external/js
+/external/src
+/external/install
 /build/
 __pycache__/
 *.py[cod]

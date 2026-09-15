@@ -7,6 +7,10 @@
 #include <stdlib.h>
 #include <string.h>
 
+#ifndef DISTILL_TEST_FONT_DIR
+#define DISTILL_TEST_FONT_DIR "../external/fonts"
+#endif
+
 /* Write a solid-colour PNG, so a render of it can be checked pixel by pixel.
    Hand-built rather than encoded with a library, to keep this test's only
    dependency the one it is testing. */
@@ -103,6 +107,21 @@ static void test_remote_sources_are_refused(void)
         "</style></head><body><img src=\"https://example.test/photo.png\"></body></html>";
     int height = distill_litehtml_content_height(html, 400, NULL);
     assert(height >= 0 && height < 40);
+}
+
+static void test_bundled_font_roles_are_available(void)
+{
+    DRenderContext *context = d_render_create(760, 240, DISTILL_TEST_FONT_DIR);
+    assert(context);
+    const char *families[] = {"Source Serif 4", "Source Sans 3", "Source Code Pro"};
+    for (size_t i = 0; i < sizeof(families) / sizeof(families[0]); ++i) {
+        DRenderFont *font = d_render_font_create(context, families[i], 18, 400,
+                                                 false, 0, NULL);
+        assert(font);
+        assert(d_render_text_width(font, "Typography role sample") > 0);
+        d_render_font_destroy(font);
+    }
+    d_render_destroy(context);
 }
 
 int main(void)
@@ -209,6 +228,7 @@ int main(void)
     test_wide_image_is_fitted_to_the_surface();
     test_unreadable_image_takes_no_space();
     test_remote_sources_are_refused();
+    test_bundled_font_roles_are_available();
 
     puts("litehtml-geometry: ok");
     return 0;

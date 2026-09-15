@@ -48,6 +48,9 @@ distill_enable_assertions(distill-app-state-test)
 add_test(NAME distill-app-state COMMAND distill-app-state-test)
 
 add_executable(distill-litehtml-geometry-test tests/litehtml_geometry_test.c src/litehtml_probe.cpp src/image.c)
+target_compile_definitions(distill-litehtml-geometry-test PRIVATE
+    DISTILL_TEST_FONT_DIR="${CMAKE_SOURCE_DIR}/external/fonts"
+)
 target_include_directories(distill-litehtml-geometry-test PRIVATE
     src
     "${EXTERNAL_PREFIX}/include"

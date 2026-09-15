@@ -4,6 +4,7 @@
 #include "shaper.h"
 
 #include <cairo/cairo.h>
+#include <ctype.h>
 #include <dirent.h>
 #include <errno.h>
 #include <ft2build.h>
@@ -29,6 +30,7 @@ typedef struct {
     char *style;
     int weight;
     bool italic;
+    bool monospace;
 } DFontFile;
 
 struct DRenderContext {
@@ -119,6 +121,7 @@ static void add_font_file(DRenderContext *context, const char *path)
     file->style = copy_string(style);
     file->weight = style_weight(style, face->style_flags);
     file->italic = style_italic(style, face->style_flags);
+    file->monospace = (face->face_flags & FT_FACE_FLAG_FIXED_WIDTH) != 0;
     FT_Done_Face(face);
 }
 
@@ -161,20 +164,84 @@ static void load_fonts(DRenderContext *context, const char *font_dir)
     for (size_t i = 0; defaults[i]; ++i) scan_font_directory(context, defaults[i], 0);
 }
 
-static bool text_has(const char *text, const char *needle)
+static void trim_family_token(const char **begin, const char **end)
 {
-    return contains_case_insensitive(text, needle);
+    while (*begin < *end && isspace((unsigned char)**begin)) ++*begin;
+    while (*end > *begin && isspace((unsigned char)*((*end) - 1))) --*end;
+    if (*end - *begin >= 2 && ((*(*begin) == '\'' && *((*end) - 1) == '\'') ||
+                               (*(*begin) == '"' && *((*end) - 1) == '"'))) {
+        ++*begin;
+        --*end;
+        while (*begin < *end && isspace((unsigned char)**begin)) ++*begin;
+        while (*end > *begin && isspace((unsigned char)*((*end) - 1))) --*end;
+    }
 }
 
-static int family_score(const char *requested, const char *family)
+static bool family_token_is(const char *begin, const char *end, const char *value)
 {
-    if (!requested || !*requested) return 20;
-    if (text_has(requested, "serif") && text_has(family, "serif")) return 0;
-    if (text_has(requested, "mono") && text_has(family, "mono")) return 0;
-    if ((text_has(requested, "sans") || text_has(requested, "system")) &&
-        text_has(family, "sans")) return 0;
-    if (text_has(requested, family) || text_has(family, requested)) return 0;
-    return 20;
+    trim_family_token(&begin, &end);
+    size_t length = (size_t)(end - begin);
+    return strlen(value) == length && strncasecmp(begin, value, length) == 0;
+}
+
+static bool family_token_contains(const char *begin, const char *end, const char *value)
+{
+    trim_family_token(&begin, &end);
+    size_t value_length = strlen(value);
+    if (!value_length || (size_t)(end - begin) < value_length) return false;
+    for (const char *cursor = begin; cursor + value_length <= end; ++cursor) {
+        if (strncasecmp(cursor, value, value_length) == 0) return true;
+    }
+    return false;
+}
+
+static int family_token_score(const char *begin, const char *end, const DFontFile *file)
+{
+    trim_family_token(&begin, &end);
+    if (begin == end) return -1;
+    if (family_token_is(begin, end, file->family)) return 0;
+    if (family_token_is(begin, end, "serif") &&
+        family_token_contains(file->family, file->family + strlen(file->family), "serif")) return 20;
+    if ((family_token_is(begin, end, "sans-serif") ||
+         family_token_is(begin, end, "sans") ||
+         family_token_is(begin, end, "system-ui")) &&
+        family_token_contains(file->family, file->family + strlen(file->family), "sans")) return 20;
+    if ((family_token_is(begin, end, "monospace") || family_token_is(begin, end, "mono")) &&
+        file->monospace) return 20;
+    return 1000;
+}
+
+/* litehtml passes the complete CSS font-family list to the container. Keep
+   the order from that list: an exact family should beat a generic family,
+   while a generic family should still be a useful fallback when the bundled
+   face is unavailable. Quoted names are kept intact while finding commas. */
+static int family_score(const char *requested, const DFontFile *file)
+{
+    if (!requested || !*requested) return 1000;
+    int best = INT_MAX;
+    const char *token_begin = requested;
+    const char *cursor = requested;
+    char quote = 0;
+    unsigned int rank = 0;
+    for (;;) {
+        if (*cursor == '\'' || *cursor == '"') {
+            if (quote == *cursor) quote = 0;
+            else if (!quote) quote = *cursor;
+        }
+        if ((*cursor == ',' && !quote) || *cursor == '\0') {
+            int token_score = family_token_score(token_begin, cursor, file);
+            if (token_score >= 0) {
+                int score = token_score >= 1000 ? 1000 + (int)rank * 100
+                                                : token_score + (int)rank * 100;
+                if (score < best) best = score;
+            }
+            if (*cursor == '\0') break;
+            token_begin = cursor + 1;
+            ++rank;
+        }
+        ++cursor;
+    }
+    return best == INT_MAX ? 1000 : best;
 }
 
 static const DFontFile *select_font_file(DRenderContext *context, const char *requested,
@@ -184,7 +251,7 @@ static const DFontFile *select_font_file(DRenderContext *context, const char *re
     int best_score = INT_MAX;
     for (size_t i = 0; i < context->file_count; ++i) {
         const DFontFile *file = &context->files[i];
-        int score = family_score(requested, file->family);
+        int score = family_score(requested, file);
         score += abs(file->weight - (weight >= 600 ? 700 : 400)) / 25;
         if (file->italic != italic) score += 8;
         if (score < best_score) {

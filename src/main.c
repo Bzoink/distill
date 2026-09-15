@@ -2504,8 +2504,9 @@ static char *reader_template(Engine *engine, const char *json, const char *theme
     dbuf_puts(&output, muted);
     dbuf_puts(&output,
         "}html,body{margin:0;padding:0;background:var(--page-background);color:var(--page-text);}"
-        "body{font-family:sans-serif;font-size:18px;line-height:1.62;padding-top:68px;padding-right:74px;padding-bottom:96px;padding-left:74px;}"
+        "body{font-family:\"Source Serif 4\",serif;font-size:18px;line-height:1.58;padding-top:68px;padding-right:74px;padding-bottom:96px;padding-left:74px;}"
         "main{max-width:612px;margin:0 auto;background:var(--main-background);}"
+        "h1,h2,h3,.eyebrow,.distill-meta,button,input,.button,th{font-family:\"Source Sans 3\",sans-serif;}"
         "h1{font-size:2.35em;line-height:1.08;letter-spacing:-.025em;margin:0 0 1.1em;color:var(--heading-text);}"
         "h2{font-size:1.45em;line-height:1.2;margin:1.7em 0 .55em;color:var(--heading-text);}"
         "h3{font-size:1.15em;line-height:1.25;margin:1.35em 0 .45em;color:var(--heading-text);}"
@@ -2513,7 +2514,7 @@ static char *reader_template(Engine *engine, const char *json, const char *theme
         ".link-index p,.link-index ul,.link-index ol{line-height:1.35;margin:0 0 .55em;}"
         ".link-index .distill-meta{margin-bottom:1.1em;}"
         "p,ul,ol,pre,blockquote{margin:0 0 1.05em;}"
-        "a{color:var(--link);}pre{padding:1em;overflow:hidden;white-space:pre-wrap;overflow-wrap:anywhere;background:var(--pre-background);border-radius:4px;font-size:.86em;line-height:1.45;}"
+        "a{color:var(--link);}pre,code{font-family:\"Source Code Pro\",monospace;}pre{padding:1em;overflow:hidden;white-space:pre-wrap;overflow-wrap:anywhere;background:var(--pre-background);border-radius:4px;font-size:.86em;line-height:1.45;}"
         "blockquote{margin-left:1.2em;padding-left:1em;border-left:3px solid var(--border);color:var(--muted);}"
         "img,video,iframe{max-width:100%;height:auto;}"
         "table{width:100%;border-collapse:collapse;margin:0 0 1.5em;}th,td{text-align:left;padding:.55em .6em;border-bottom:1px solid var(--border);}"
