@@ -1,0 +1,35 @@
+<!doctype html>
+<html lang="ar" dir="rtl">
+<meta charset="utf-8">
+<title>متصفح الويب</title>
+
+<!--
+  Right-to-left text. Three separate things are under test and only the first
+  two can be asserted here:
+
+  1. The document's direction and language must survive extraction, because
+     the reader renders its own template and lays out flush left without them.
+  2. The text itself must survive intact, including the Arabic-Indic digits.
+  3. Mixed-direction runs -- the Latin "web browser", the bracketed reference
+     markers, the parentheses -- need the Unicode Bidirectional Algorithm to
+     be ordered and mirrored correctly. There is no UBA in the render stack,
+     so this paragraph is where that shows. It is recorded, not asserted:
+     judging it needs a reference image, not a substring.
+-->
+
+<main>
+  <h1>متصفح الويب</h1>
+
+  <p id="content">قيد الانتظار</p>
+
+  <p>متصفح الويب (بالإنجليزية: web browser) هو تطبيق برمجي لاسترجاع مصادر
+  المعلومات عبر الإنترنت وعرضها على المستخدم. يستخدم المتصفح عنوان URL لتحديد
+  المورد المطلوب، ثم يعرض النص والصور والفيديو ضمن صفحة واحدة.</p>
+
+  <p>ظهر أول متصفح عام 1990، وبلغ عدد المستخدمين 4500 مليون بحلول عام 2020.
+  تعتمد المتصفحات الحديثة على محركات عرض مثل Blink وGecko وWebKit.</p>
+</main>
+
+<script>
+  document.getElementById("content").textContent = "RTL-ARABIC-OK";
+</script>

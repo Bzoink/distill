@@ -1,0 +1,37 @@
+<!doctype html>
+<html lang="th">
+<meta charset="utf-8">
+<title>เว็บเบราว์เซอร์</title>
+
+<!--
+  Two scripts that break the assumption that a character is a glyph.
+
+  Thai has no inter-word spaces and no visible word delimiter at all, so
+  correct line breaking requires dictionary-based segmentation rather than
+  character rules. It also stacks combining vowels and tone marks above and
+  below the base consonant.
+
+  Devanagari reorders within a cluster: the vowel sign in "कि" is typed after
+  the consonant but drawn before it, so a renderer that maps code points to
+  glyph positions in order produces visibly wrong output.
+
+  Extraction must preserve both intact. Correct shaping is a render-path
+  question and is recorded rather than asserted, for the same reason as the
+  bidi case in 24.
+-->
+
+<main>
+  <h1>เว็บเบราว์เซอร์</h1>
+
+  <p id="content">รอดำเนินการ</p>
+
+  <p>เว็บเบราว์เซอร์คือโปรแกรมที่ใช้สำหรับเข้าถึงและแสดงผลข้อมูลบนเวิลด์ไวด์เว็บ
+  โดยรับที่อยู่ของทรัพยากรแล้วดึงเอกสารมาแสดงผลรวมกันเป็นหน้าเดียว</p>
+
+  <p>वेब ब्राउज़र एक ऐसा अनुप्रयोग है जो इंटरनेट पर उपलब्ध सूचना संसाधनों को
+  प्राप्त करता है और उन्हें उपयोगकर्ता के सामने प्रस्तुत करता है।</p>
+</main>
+
+<script>
+  document.getElementById("content").textContent = "COMPLEX-SCRIPT-OK";
+</script>

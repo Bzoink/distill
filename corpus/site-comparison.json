@@ -280,6 +280,46 @@
       "name": "HTML5 Test",
       "url": "https://html5test.com/",
       "focus": "tag-soup parsing, malformed markup, and browser-compliance diagnostics"
+    },
+    {
+      "id": "35-wikipedia-arabic",
+      "tier": 11,
+      "class": "writing-system",
+      "name": "Wikipedia (Arabic)",
+      "url": "https://ar.wikipedia.org/wiki/%D9%85%D8%AA%D8%B5%D9%81%D8%AD_%D9%88%D9%8A%D8%A8",
+      "focus": "right-to-left layout, Arabic contextual shaping, and mixed-direction runs needing the bidirectional algorithm"
+    },
+    {
+      "id": "36-wikipedia-hebrew",
+      "tier": 11,
+      "class": "writing-system",
+      "name": "Wikipedia (Hebrew)",
+      "url": "https://he.wikipedia.org/wiki/%D7%93%D7%A4%D7%93%D7%A4%D7%9F",
+      "focus": "right-to-left layout without contextual shaping, isolating direction from shaping"
+    },
+    {
+      "id": "37-wikipedia-japanese",
+      "tier": 11,
+      "class": "writing-system",
+      "name": "Wikipedia (Japanese)",
+      "url": "https://ja.wikipedia.org/wiki/%E3%82%A6%E3%82%A7%E3%83%96%E3%83%96%E3%83%A9%E3%82%A6%E3%82%B6",
+      "focus": "CJK line breaking without inter-word spaces, kinsoku rules, and CJK font coverage"
+    },
+    {
+      "id": "38-wikipedia-thai",
+      "tier": 11,
+      "class": "writing-system",
+      "name": "Wikipedia (Thai)",
+      "url": "https://th.wikipedia.org/wiki/%E0%B9%80%E0%B8%A7%E0%B9%87%E0%B8%9A%E0%B9%80%E0%B8%9A%E0%B8%A3%E0%B8%B2%E0%B8%A7%E0%B9%8C%E0%B9%80%E0%B8%8B%E0%B8%AD%E0%B8%A3%E0%B9%8C",
+      "focus": "line breaking with no word delimiter, requiring dictionary segmentation, plus stacked vowels and tone marks"
+    },
+    {
+      "id": "39-wikipedia-hindi",
+      "tier": 11,
+      "class": "writing-system",
+      "name": "Wikipedia (Hindi)",
+      "url": "https://hi.wikipedia.org/wiki/%E0%A4%B5%E0%A5%87%E0%A4%AC_%E0%A4%AC%E0%A5%8D%E0%A4%B0%E0%A4%BE%E0%A4%89%E0%A4%9C%E0%A4%BC%E0%A4%B0",
+      "focus": "Devanagari cluster reordering, where a vowel sign typed after its consonant is drawn before it"
     }
   ]
 }

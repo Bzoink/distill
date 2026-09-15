@@ -245,6 +245,28 @@ complexity can be our own bug, and a scope boundary inferred from such a
 symptom is not yet evidence. The counterpart holds too: Airbnb's deferral was
 re-tested against the same suspicion and survived it.
 
+### Writing-system rungs (35-39)
+
+Five rungs added at tier 11, all Wikipedia so that the article content is held
+constant and only the script varies:
+
+| Rung | Isolates |
+| --- | --- |
+| `35-wikipedia-arabic` | RTL layout plus Arabic contextual shaping plus mixed-direction runs |
+| `36-wikipedia-hebrew` | RTL layout *without* contextual shaping, separating direction from shaping |
+| `37-wikipedia-japanese` | CJK line breaking with no inter-word spaces, and CJK font coverage |
+| `38-wikipedia-thai` | No word delimiter at all, requiring dictionary segmentation; stacked vowels and tone marks |
+| `39-wikipedia-hindi` | Devanagari cluster reordering |
+
+Pairing Arabic with Hebrew is the point of having both: if Hebrew renders and
+Arabic does not, the fault is shaping; if neither does, it is direction.
+
+All five extract correctly — `article` shape, correct `dir` and `lang`, full
+text. The render path is where they fail, and
+[`corpus/README.md`](corpus/README.md) records what they exposed: no font
+fallback, no bidirectional algorithm, and no segmentation for scripts without
+spaces.
+
 ### Exit status and mechanical classification
 
 Distill reports a recognised bot challenge with status `4`, distinct from `0`

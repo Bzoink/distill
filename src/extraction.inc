@@ -282,6 +282,31 @@ static char *safe_uri(Engine *engine, const char *candidate, size_t *rejected)
     return resolved;
 }
 
+/* Text carried by visible elements of one kind. The shape decision is a
+   question about proportion -- what is most of this page? -- and answering it
+   from element counts alone gets it wrong: a site-wide search box, one
+   tracking iframe, or a single layout table is present on pages that are
+   overwhelmingly prose. */
+static size_t visible_text_chars(lxb_dom_node_t *root, const char *selector)
+{
+    NodeVec nodes = find_selector(root, selector);
+    size_t total = 0;
+    for (size_t i = 0; i < nodes.length; ++i) {
+        if (hidden_node(root, nodes.items[i])) continue;
+        char *text = compact_text(nodes.items[i]);
+        total += strlen(text);
+        free(text);
+    }
+    free(nodes.items);
+    return total;
+}
+
+/* Enough prose that the page is about its text, whatever else it also
+   contains. Calibrated against the corpus: the isolating fixtures for form,
+   table, search, video, and gallery shapes carry 0-151 characters of
+   paragraph text, while a real article carries thousands. */
+#define DISTILL_PROSE_FLOOR 600
+
 static ExtractShape shape_for(lxb_dom_node_t *root)
 {
     NodeVec articles = find_selector(root, "article");
@@ -295,11 +320,21 @@ static ExtractShape shape_for(lxb_dom_node_t *root)
     size_t result_links = 0, visible_images = 0;
     for (size_t i = 0; i < links.length; ++i) if (!hidden_node(root, links.items[i]) && ancestor_class(links.items[i], "result")) ++result_links;
     for (size_t i = 0; i < images.length; ++i) if (!hidden_node(root, images.items[i])) ++visible_images;
+    size_t prose_chars = visible_text_chars(root, "p");
+    size_t table_chars = tables.length ? visible_text_chars(root, "table") : 0;
+    /* A page whose text is mostly prose is an article even when it also
+       carries a search box, an embed, or a handful of images. Without this
+       the first matching element decided the shape, so every encyclopaedia
+       article rendered as its own site-search form. */
+    bool prose_dominates = prose_chars >= DISTILL_PROSE_FLOOR;
     ExtractShape shape = {d_strdup("structured-text"), .55, d_strdup("fallback structured text")};
-    if (forms.length && ((is_element(forms.items[0]) && class_contains(lxb_dom_interface_element(forms.items[0]), "search")) || ancestor_class(forms.items[0], "login"))) { free(shape.kind); free(shape.evidence); shape = (ExtractShape){d_strdup("form"), .95, d_strdup("native form controls")}; }
-    else if (result_links >= 2) { free(shape.kind); free(shape.evidence); double confidence = .65 + result_links * .06; shape = (ExtractShape){d_strdup("search-results"), confidence > .99 ? .99 : confidence, d_strdup("repeated result links")}; }
-    else if (videos.length || iframes.length || find_selector(root, "embed").length || find_selector(root, "object").length) { free(shape.kind); free(shape.evidence); shape = (ExtractShape){d_strdup("video"), .92, d_strdup("video or embed element")}; }
-    else if (tables.length) { free(shape.kind); free(shape.evidence); shape = (ExtractShape){d_strdup("table"), .94, d_strdup("table with rows")}; }
+    if (!prose_dominates && forms.length && ((is_element(forms.items[0]) && class_contains(lxb_dom_interface_element(forms.items[0]), "search")) || ancestor_class(forms.items[0], "login"))) { free(shape.kind); free(shape.evidence); shape = (ExtractShape){d_strdup("form"), .95, d_strdup("native form controls without a prose body")}; }
+    else if (!prose_dominates && result_links >= 2) { free(shape.kind); free(shape.evidence); double confidence = .65 + result_links * .06; shape = (ExtractShape){d_strdup("search-results"), confidence > .99 ? .99 : confidence, d_strdup("repeated result links")}; }
+    else if (!prose_dominates && (videos.length || iframes.length || find_selector(root, "embed").length || find_selector(root, "object").length)) { free(shape.kind); free(shape.evidence); shape = (ExtractShape){d_strdup("video"), .92, d_strdup("video or embed element without a prose body")}; }
+    /* A table wins only on a page that is not otherwise prose. An
+       encyclopaedia article carries infoboxes and navigation boxes whose
+       combined text exceeds its paragraphs, which does not make it a table. */
+    else if (!prose_dominates && tables.length && table_chars >= prose_chars) { free(shape.kind); free(shape.evidence); shape = (ExtractShape){d_strdup("table"), .94, d_strdup("table holding most of the page text")}; }
     else {
         NodeVec paragraphs = find_selector(root, "p");
         NodeVec headings = find_selector(root, "h1");
@@ -307,8 +342,12 @@ static ExtractShape shape_for(lxb_dom_node_t *root)
         NodeVec h3 = find_selector(root, "h3");
         NodeVec code = find_selector(root, "pre");
         NodeVec code_inline = find_selector(root, "code");
-        if (visible_images >= 3 && visible_images > articles.length + mains.length) { free(shape.kind); free(shape.evidence); double confidence = .70 + visible_images * .04; shape = (ExtractShape){d_strdup("image-heavy"), confidence > .98 ? .98 : confidence, d_strdup("multiple visible images")}; }
-        else if (!articles.length && headings.length + h2.length + h3.length && code.length + code_inline.length) { free(shape.kind); free(shape.evidence); shape = (ExtractShape){d_strdup("docs"), .88, d_strdup("headings with code blocks")}; }
+        if (!prose_dominates && visible_images >= 3 && visible_images > articles.length + mains.length) { free(shape.kind); free(shape.evidence); double confidence = .70 + visible_images * .04; shape = (ExtractShape){d_strdup("image-heavy"), confidence > .98 ? .98 : confidence, d_strdup("multiple visible images without a prose body")}; }
+        /* Reference documentation is headings plus code blocks. Inline
+           <code> alone does not qualify: prose mentioning a function name is
+           still prose, which is why this tests <pre> rather than counting
+           every inline span. */
+        else if (!articles.length && headings.length + h2.length + h3.length && code.length) { free(shape.kind); free(shape.evidence); shape = (ExtractShape){d_strdup("docs"), .88, d_strdup("headings with code blocks")}; }
         else if (articles.length || mains.length || paragraphs.length >= 2) { free(shape.kind); free(shape.evidence); double confidence = .72 + paragraphs.length * .03; shape = (ExtractShape){d_strdup("article"), confidence > .98 ? .98 : confidence, d_strdup("article/main or paragraph body")}; }
         free(paragraphs.items); free(headings.items); free(h2.items); free(h3.items); free(code.items); free(code_inline.items);
     }

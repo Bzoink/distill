@@ -204,16 +204,21 @@ def dump_extract(engine, url, cap_ms, timeout_s, expect_exit=0):
         return None, f"extractor returned invalid JSON: {exc}"
 
 
-def render_page(engine, url, output_path, cap_ms, timeout_s, viewer=False):
-    """Render a reader PNG and verify its basic PNG dimensions."""
+def render_page(engine, url, output_path, cap_ms, timeout_s, viewer=False, expect_exit=0):
+    """Render a reader PNG and verify its basic PNG dimensions.
+
+    As with the DOM and extract stages, a page may declare a non-zero expected
+    status: a recognised challenge shell still renders, under its own status.
+    """
     cmd = [engine, "--url", url, "--viewer" if viewer else "--render", output_path,
            "--script-cap-ms", str(cap_ms)]
     try:
         r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout_s)
     except subprocess.TimeoutExpired:
         return None, f"renderer timed out after {timeout_s}s"
-    if r.returncode != 0:
-        return None, f"renderer exit {r.returncode}: {r.stderr.strip()[:300]}"
+    if r.returncode != expect_exit:
+        return None, (f"renderer exit {r.returncode}, expected {expect_exit}: "
+                      f"{r.stderr.strip()[:300]}")
     try:
         with open(output_path, "rb") as fh:
             header = fh.read(24)
@@ -464,14 +469,15 @@ def main():
             if args.render:
                 output_path = os.path.join(args.render, page["id"] + ".png")
                 render_info, err = render_page(engine, url, output_path,
-                                               manifest.get("settle_cap_ms", 5000), args.timeout)
+                                               manifest.get("settle_cap_ms", 5000), args.timeout,
+                                               expect_exit=page.get("expect_exit", 0))
                 html = None
                 extraction = None
             elif args.viewer:
                 output_path = os.path.join(args.viewer, page["id"] + ".png")
                 render_info, err = render_page(engine, url, output_path,
                                                manifest.get("settle_cap_ms", 5000), args.timeout,
-                                               viewer=True)
+                                               viewer=True, expect_exit=page.get("expect_exit", 0))
                 html = None
                 extraction = None
             elif args.extract:

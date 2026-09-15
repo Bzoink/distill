@@ -103,11 +103,28 @@ exists to test.
 | `20-structured-data` | JSON-LD harvested from a page that never hydrates; malformed block reported | Phase 1 extraction breadth |
 | `21-challenge-shell` | A recognised challenge is classified before its scripts spend the settle budget | Access classification |
 | `22-challenge-vendor-scripts` | A working page that names bot-mitigation vendors must not be misclassified | Access classification |
+| `23-composite-shape` | Shape selection when form, table, image and embed signals all appear on one article | Phase 1 extraction breadth |
+| `24-rtl-arabic` | Right-to-left direction and language metadata; Arabic text preserved | Writing systems |
+| `25-cjk-linebreak` | Japanese and Chinese text with no inter-word spaces | Writing systems |
+| `26-complex-script` | Thai with no word delimiter; Devanagari cluster reordering | Writing systems |
 
 `00` is the control: it has no scripts, so a failure there is never a binding
 bug. `07` is where a raw-pointer binding over Lexbor's arena-allocated nodes
 crashes — better here than on a live site. `08` deliberately resembles the top of
 the live ladder while still naming its own cause on failure.
+
+`23` exists because every other extraction fixture is clean in a way no real
+page is. Each presents one shape — a table, a form, a gallery — so nothing ever
+asked the classifier what to do when the signals compete. Real pages always
+have them competing, and the classifier was deciding on whichever element it
+checked first: an encyclopaedia article carrying a site search box was
+classified as a search form and rendered as one, with the article body
+discarded. `23` is an article that also carries a search form, a data table,
+four images, and an iframe, and asserts that the prose wins.
+
+That is the isolating corpus's structural blind spot, and it is worth
+remembering when adding fixtures: a capability can be correct in isolation and
+wrong in combination, and only a composite page catches it.
 
 `21` and `22` are a matched pair and only mean something together. `21` asserts
 that a challenge shell is recognised; `22` asserts that naming a bot-mitigation
@@ -116,6 +133,30 @@ easy to write and wrong: the first version of ours matched Airbnb and Product
 Hunt, which serve full pages while naming those vendors, and it would have
 skipped their scripts. `22` is deliberately a small document so that the
 detector's size guard cannot rescue it — only the choice of markers can.
+
+## Writing systems
+
+`24`-`26` are the first fixtures in this corpus containing any non-Latin text.
+That gap mattered: the stack carries HarfBuzz for shaping and libunibreak for
+line-break opportunities, and nothing exercised either beyond what
+space-separated Latin needs.
+
+They assert what is assertable — that direction and language metadata survive
+extraction, and that the text itself comes through intact. Correct *rendering*
+of these scripts cannot be asserted with a substring; judging it needs a
+reference image. What they did surface immediately, by being rendered and
+looked at:
+
+| Observation | Status |
+|---|---|
+| RTL articles were laid out flush left | Fixed: the reader template now carries `dir` and `lang` from the extraction and mirrors its physical-side rules |
+| CJK, Thai, and Devanagari render as tofu | Open. `select_font_file` picks one face by family name and never asks whether it contains the glyphs, and `--font-dir` suppresses the system font scan entirely. Per-run fallback needs a face list and run itemisation |
+| Thai paragraphs overflow the column | Open. With no inter-word spaces and no dictionary segmentation, the paragraph is one unbreakable run |
+| Mixed-direction runs are unverified | Open. There is no Unicode Bidirectional Algorithm in the stack; HarfBuzz orders a single run but does not reorder between runs |
+
+None of these is a reason to hold the fixtures back. Extraction is correct and
+gated today, and the render gaps are now recorded against a page that
+demonstrates them instead of being invisible.
 
 ## Where we must beat the browser
 

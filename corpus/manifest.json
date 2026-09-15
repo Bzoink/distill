@@ -554,6 +554,62 @@
       "assertions": [
         {"stage": "dom", "selector": "#content", "expect": "VENDOR-SCRIPTS-RAN"}
       ]
+    },
+    {
+      "id": "23-composite-shape",
+      "path": "23-composite-shape.html",
+      "gate": true,
+      "plan_section": "Phase 1 extraction breadth, shape selection",
+      "exercises": ["shape-selection", "competing-signals"],
+      "why": "Every other extraction fixture presents one shape cleanly, so nothing asked the classifier what to do when several signals appear at once -- which is what every real page does. An article carrying a site search box, a table, images, and an embed is still an article; deciding on the first matching element classified every encyclopaedia article as its own search form.",
+      "assertions": [
+        {"stage": "dom", "selector": "#content", "expect": "COMPOSITE-ARTICLE-OK"},
+        {"stage": "extract", "path": "shape.kind", "expect": "article"},
+        {"stage": "extract", "path": "extractor", "expect": "readability"},
+        {"stage": "extract", "path": "readability.content", "expect": "refraction that displaces"}
+      ]
+    },
+    {
+      "id": "24-rtl-arabic",
+      "path": "24-rtl-arabic.html",
+      "gate": true,
+      "plan_section": "Writing systems",
+      "exercises": ["rtl", "direction-metadata", "non-latin-text"],
+      "why": "The reader renders its own template, so a source document's direction and language must survive extraction or a right-to-left article is laid out flush left. Mixed-direction ordering within the paragraph needs the Unicode Bidirectional Algorithm and is recorded rather than asserted.",
+      "assertions": [
+        {"stage": "dom", "selector": "#content", "expect": "RTL-ARABIC-OK"},
+        {"stage": "extract", "path": "readability.dir", "expect": "rtl"},
+        {"stage": "extract", "path": "readability.lang", "expect": "ar"},
+        {"stage": "extract", "path": "readability.textContent", "expect": "متصفح الويب"}
+      ]
+    },
+    {
+      "id": "25-cjk-linebreak",
+      "path": "25-cjk-linebreak.html",
+      "gate": true,
+      "plan_section": "Writing systems",
+      "exercises": ["cjk", "line-breaking", "non-latin-text"],
+      "why": "Japanese and Chinese have no inter-word spaces, so a line may break between almost any two characters subject to kinsoku rules. This is what libunibreak is a dependency for, and no other corpus page exercises it: every other fixture breaks on spaces.",
+      "assertions": [
+        {"stage": "dom", "selector": "#content", "expect": "CJK-LINEBREAK-OK"},
+        {"stage": "extract", "path": "readability.lang", "expect": "ja"},
+        {"stage": "extract", "path": "readability.textContent", "expect": "ウェブブラウザは"},
+        {"stage": "extract", "path": "readability.textContent", "expect": "中文段落也没有词间空格"}
+      ]
+    },
+    {
+      "id": "26-complex-script",
+      "path": "26-complex-script.html",
+      "gate": true,
+      "plan_section": "Writing systems",
+      "exercises": ["thai", "devanagari", "combining-marks", "non-latin-text"],
+      "why": "Thai has no word delimiter at all and stacks vowels and tone marks on the base consonant; Devanagari reorders within a cluster, so a vowel typed after its consonant is drawn before it. Extraction must preserve both intact; correct shaping is a render-path question recorded rather than asserted.",
+      "assertions": [
+        {"stage": "dom", "selector": "#content", "expect": "COMPLEX-SCRIPT-OK"},
+        {"stage": "extract", "path": "readability.lang", "expect": "th"},
+        {"stage": "extract", "path": "readability.textContent", "expect": "เว็บเบราว์เซอร์"},
+        {"stage": "extract", "path": "readability.textContent", "expect": "वेब ब्राउज़र"}
+      ]
     }
   ],
   "live": [

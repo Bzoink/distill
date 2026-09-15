@@ -1,0 +1,65 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>Composite shape selection</title>
+
+<!--
+  Every isolating fixture in this corpus presents one shape cleanly, so the
+  shape classifier was never asked what to do when several signals appear at
+  once. Real pages always do: an encyclopaedia article carries a site search
+  box, an infobox table, illustrations, and an embed, and it is still an
+  article.
+
+  Before this fixture existed the first matching element decided, so every
+  Wikipedia article in every language was classified as its own site-search
+  form and rendered as a search box with the article body discarded.
+
+  The page is an article that also contains: a search form, a data table,
+  four images, and an iframe. The prose must win.
+-->
+
+<form class="site-search" action="/search" method="get">
+  <label for="q">Search this site</label>
+  <input id="q" name="q" type="search">
+  <button type="submit">Search</button>
+</form>
+
+<main>
+  <h1>The kingfisher's hunting technique</h1>
+
+  <p id="content">PENDING</p>
+
+  <p>The common kingfisher hunts from a perch above slow-moving water, holding
+  position for long stretches before dropping. The dive itself lasts under a
+  second, and the bird corrects its aim during descent to compensate for the
+  refraction that displaces its target's apparent position.</p>
+
+  <p>A nictitating membrane closes over the eye at the moment of entry, so the
+  final approach is made blind. The strike is committed before the bird can
+  see the outcome, which is why the perch time matters more than the dive: the
+  aim is fixed above the surface and cannot be revised below it.</p>
+
+  <p>Juveniles fail often enough that the first weeks after fledging carry high
+  mortality. A bird that cannot reliably judge the refraction correction will
+  not take enough fish to sustain the dive rate the technique demands, and the
+  margin between a competent adult and an incompetent juvenile is measured in
+  a handful of successful strikes per day.</p>
+
+  <table>
+    <caption>Dive statistics</caption>
+    <tr><th>Measure</th><th>Value</th></tr>
+    <tr><td>Perch height</td><td>1-3 m</td></tr>
+    <tr><td>Dive duration</td><td>under 1 s</td></tr>
+    <tr><td>Success rate, adult</td><td>60 percent</td></tr>
+  </table>
+
+  <img src="/images/perch.jpg" alt="Kingfisher on a perch">
+  <img src="/images/dive.jpg" alt="Kingfisher entering the water">
+  <img src="/images/catch.jpg" alt="Kingfisher surfacing with a fish">
+  <img src="/images/nest.jpg" alt="Kingfisher at a bank nest">
+
+  <iframe src="/embeds/slow-motion.html" title="Slow motion dive"></iframe>
+</main>
+
+<script>
+  document.getElementById("content").textContent = "COMPOSITE-ARTICLE-OK";
+</script>

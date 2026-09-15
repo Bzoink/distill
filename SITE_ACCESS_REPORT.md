@@ -238,6 +238,70 @@ text had about 98% reference vocabulary coverage, but the score is materially
 different information. Matching it would require implementing the missing
 browser features being measured; this is not a malformed-HTML parser fix.
 
+## A defect the live ladder could not see: shape selection
+
+The comparison harness scored Wikipedia as "checked and working" throughout.
+The reader was rendering it as a search box.
+
+`shape_for` decided a page's kind from the first matching element, checked in
+a fixed order with the article test last. Wikipedia's first form is the site
+search box, so every Wikipedia article — in every language — was classified
+`form`, and the reader rendered the search field while discarding 137,800
+characters of extracted article body. Python's documentation behaved the same
+way. BBC News and GitHub Trending fell to `image-heavy` for the same reason.
+
+Two separate blind spots let this stand:
+
+- **The live comparison could not see it.** Its information summary counts
+  blocks, links, and media, which are present regardless of which extractor is
+  selected. Vocabulary coverage stayed high while the reader output was wrong.
+- **The local corpus could not see it either.** Every extraction fixture
+  presents one shape cleanly — a table, a form, a gallery — so the classifier
+  was never asked what to do when signals compete, which is what every real
+  page does.
+
+The fix measures proportion rather than presence: a page whose visible
+paragraph text passes a floor is an article even when it also carries a search
+box, a table, images, or an embed. A table wins only when it holds most of the
+page's text *and* the page is not otherwise prose. Documentation is
+distinguished from prose by `<pre>` blocks rather than inline `<code>`, since
+prose that mentions a function name is still prose.
+
+Gate `23-composite-shape` pins it with an article that also carries a search
+form, a data table, four images, and an iframe. It reports `form` on the
+pre-fix engine and `article` after.
+
+The lesson is about the corpus's structure, not this one function. An
+isolating fixture suite proves each capability correct alone and says nothing
+about them in combination; a page that is only ever one thing cannot catch a
+classifier that picks the wrong thing.
+
+## Writing systems
+
+Until now no fixture in the corpus and no entry in the live ladder contained
+any non-Latin text, in a stack that carries HarfBuzz for shaping and
+libunibreak for line-break opportunities. Neither was exercised beyond what
+space-separated Latin requires.
+
+Three local fixtures (`24-rtl-arabic`, `25-cjk-linebreak`,
+`26-complex-script`) and five live rungs (Arabic, Hebrew, Japanese, Thai, and
+Hindi Wikipedia) now cover it. Extraction proved sound: direction and language
+metadata survive, and text comes through intact in every script tested.
+
+Rendering did not. Rendering the fixtures and looking at the output found:
+
+| Finding | Status |
+| --- | --- |
+| RTL articles laid out flush left | **Fixed.** The reader renders its own template, so the source document's direction was simply never carried across. It now emits `dir` and `lang` and mirrors its physical-side rules |
+| CJK, Thai, and Devanagari render as tofu | **Open.** `select_font_file` chooses one face by family name and never asks whether it contains the required glyphs; `--font-dir` also suppresses the system font scan. Per-run fallback needs a face list and run itemisation, which is a contained feature but not a tweak |
+| Thai paragraphs overflow the column | **Open.** No inter-word spaces and no dictionary segmentation makes the paragraph one unbreakable run |
+| Mixed-direction ordering unverified | **Open.** There is no Unicode Bidirectional Algorithm in the stack. HarfBuzz orders a single run correctly — pure Arabic renders in the right order — but nothing reorders between runs, which is where embedded Latin, digits, and mirrored punctuation live |
+
+These are recorded rather than gated. A substring assertion cannot judge
+whether a glyph was drawn in the right place; that needs reference images,
+which the corpus deliberately does not have. What has changed is that the gaps
+are now attached to pages that demonstrate them.
+
 ## A failure that was fixed: Three.js
 
 Three.js (`32-threejs-examples`) initially looked like a large extraction
@@ -368,7 +432,12 @@ canvas, a shadow tree, or a multi-frame editor can hit a real boundary.
    limits prevent hangs and bound resource use, but the JavaScript realm still
    runs in-process. A separate process or stronger sandbox is the eventual
    security direction for hostile input.
-6. **C++ rendering dependency.** The production core is C23, but keeping
+6. **Text rendering beyond Latin.** Extraction handles every script tested,
+   but the render path selects a single font face by family name with no
+   coverage check or fallback chain, has no Unicode Bidirectional Algorithm,
+   and cannot break lines in scripts without word delimiters. Font fallback is
+   the tractable piece and the precondition for the rest.
+7. **C++ rendering dependency.** The production core is C23, but keeping
    litehtml preserves a C++ dependency at the rendering boundary. Removing it
    would require replacing the layout engine or accepting a larger rendering
    project.

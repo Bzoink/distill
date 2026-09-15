@@ -2199,10 +2199,18 @@ static char *reader_template(Engine *engine, const char *json, const char *theme
     char *shape_kind = json_property_string(engine, shape, "kind");
     char *title = d_strdup("");
     char *content = d_strdup("");
+    char *text_dir = d_strdup("");
+    char *text_lang = d_strdup("");
     if (!JS_IsNull(readability) && !JS_IsUndefined(readability)) {
         title = json_property_string(engine, readability, "title");
         content = json_property_string(engine, readability, "content");
+        free(text_dir); text_dir = json_property_string(engine, readability, "dir");
+        free(text_lang); text_lang = json_property_string(engine, readability, "lang");
     }
+    /* The reader renders its own template, so the source document's
+       directionality has to be carried across deliberately or a
+       right-to-left article is laid out flush left. */
+    bool rtl = d_ieq(text_dir, "rtl");
 
     const char *selected_theme = theme && *theme ? theme : "warm";
     const char *page_background = "#f4f1ea";
@@ -2238,8 +2246,19 @@ static char *reader_template(Engine *engine, const char *json, const char *theme
 
     DBuffer output;
     dbuf_init(&output);
+    dbuf_puts(&output, "<!doctype html><html");
+    if (*text_lang) {
+        dbuf_puts(&output, " lang=\"");
+        append_html_escaped(&output, text_lang);
+        dbuf_puts(&output, "\"");
+    }
+    if (*text_dir) {
+        dbuf_puts(&output, " dir=\"");
+        append_html_escaped(&output, text_dir);
+        dbuf_puts(&output, "\"");
+    }
     dbuf_puts(&output,
-        "<!doctype html><html><head><meta charset=\"utf-8\"><title>");
+        "><head><meta charset=\"utf-8\"><title>");
     append_html_escaped(&output, title);
     dbuf_puts(&output,
         "</title><style>"
@@ -2280,7 +2299,20 @@ static char *reader_template(Engine *engine, const char *json, const char *theme
         ".eyebrow,.media-url{font-size:.78em;color:var(--muted);}.media-placeholder{min-height:100px;display:flex;align-items:center;justify-content:center;background:var(--card-background);color:var(--page-text);text-align:center;padding:1em;}"
         ".media-card{margin:0 0 1em;}.media-card figcaption{margin-top:.45em;}.media-card figcaption span{float:right;color:#827a6e;font-size:.8em;}"
         ".reader-list-item{padding-left:1em;}"
-        ".distill-meta{font-size:.8em;color:var(--muted);margin-bottom:2.6em;}"
+        ".distill-meta{font-size:.8em;color:var(--muted);margin-bottom:2.6em;}");
+    /* Mirrored rules rather than logical properties: litehtml lays out the
+       reader template, and physical sides are what it reliably supports. */
+    if (rtl) {
+        dbuf_puts(&output,
+            "body{text-align:right;}"
+            "th,td{text-align:right;}"
+            "blockquote{margin-left:0;margin-right:1.2em;padding-left:0;padding-right:1em;"
+            "border-left:0;border-right:3px solid var(--border);}"
+            ".reader-list-item{padding-left:0;padding-right:1em;}"
+            ".media-card figcaption span{float:left;}"
+            "pre{text-align:left;}");
+    }
+    dbuf_puts(&output,
         "</style></head><body><main><h1>");
     append_html_escaped(&output, *title ? title : "Untitled page");
     dbuf_puts(&output, "</h1><p class=\"distill-meta\">Rendered by Distill</p>");
@@ -2313,6 +2345,8 @@ static char *reader_template(Engine *engine, const char *json, const char *theme
     free(shape_kind);
     free(title);
     free(content);
+    free(text_dir);
+    free(text_lang);
     JS_FreeValue(engine->context, shape);
     JS_FreeValue(engine->context, blocks);
     JS_FreeValue(engine->context, tables);

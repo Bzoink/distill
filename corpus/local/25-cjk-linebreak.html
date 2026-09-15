@@ -1,0 +1,36 @@
+<!doctype html>
+<html lang="ja">
+<meta charset="utf-8">
+<title>ウェブブラウザ</title>
+
+<!--
+  Japanese and Chinese text has no inter-word spaces, so a line may be broken
+  between almost any two characters -- except where kinsoku rules forbid it,
+  such as before a closing bracket or a small kana. This is precisely what
+  libunibreak is in the dependency list for, and until this fixture existed
+  nothing in the corpus exercised it: every other page breaks on spaces.
+
+  The paragraphs are long enough to force several breaks at the reader's
+  column width.
+-->
+
+<main>
+  <h1>ウェブブラウザ</h1>
+
+  <p id="content">保留中</p>
+
+  <p>ウェブブラウザは、インターネット上の情報資源を取得して利用者に表示する
+  ソフトウェアである。利用者が入力した統一資源位置指定子にもとづいて資源を
+  取得し、文書や画像や動画を一つの画面に組み立てて提示する。</p>
+
+  <p>現代のブラウザは、描画エンジンと実行エンジンを分離した構成をとることが
+  多く、文書の構造解析、様式の適用、配置計算、描画という段階を順に処理する。
+  この段階のどこで時間が費やされているかを測ることが、性能改善の出発点となる。</p>
+
+  <p>中文段落也没有词间空格，因此换行位置几乎可以出现在任意两个字符之间，
+  但标点符号的禁则规定了若干不允许断开的位置。</p>
+</main>
+
+<script>
+  document.getElementById("content").textContent = "CJK-LINEBREAK-OK";
+</script>
