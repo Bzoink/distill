@@ -1,0 +1,30 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>Structured data harvest</title>
+
+<!--
+  The JSON-LD block is never executed as script. It is still the page's own
+  description of itself, and it is present whether or not the application
+  below ever hydrates -- which is the case this fixture stands in for.
+-->
+
+<script type="application/ld+json">
+{
+  "@context": "https://schema.org",
+  "@type": "NewsArticle",
+  "headline": "Structured data survives a failed hydration",
+  "description": "The record is in the served HTML, not in the application.",
+  "author": {"@type": "Person", "name": "Corpus"}
+}
+</script>
+
+<script type="application/ld+json">
+  { this is not valid json
+</script>
+
+<div id="content">STRUCTURED-DATA-SHELL</div>
+
+<script>
+  /* Stands in for an application that never reaches its content branch. */
+  if (globalThis.__never) document.getElementById("content").textContent = "hydrated";
+</script>

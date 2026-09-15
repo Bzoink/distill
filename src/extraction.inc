@@ -566,6 +566,74 @@ static char *links_json(Engine *engine, lxb_dom_node_t *root, size_t *rejected)
     free(links.items); dbuf_puts(&out, "]"); return dbuf_take(&out);
 }
 
+/* Pages that never finish hydrating still ship their record in a JSON-LD
+   block, and the script discovery pass deliberately skips those blocks
+   instead of executing them. Reading them here recovers the page's own
+   description of itself without depending on the application starting. */
+static char *structured_data_json(Engine *engine, lxb_dom_node_t *root)
+{
+    DBuffer out; dbuf_init(&out); dbuf_puts(&out, "["); bool first = true;
+    NodeVec scripts = find_selector(root, "script");
+    for (size_t i = 0; i < scripts.length; ++i) {
+        lxb_dom_element_t *element = lxb_dom_interface_element(scripts.items[i]);
+        char *type_raw = attr_value(element, "type");
+        char *type = d_lower(type_raw);
+        free(type_raw);
+        if (!d_contains(type, "ld+json")) { free(type); continue; }
+        free(type);
+        char *text = node_text(scripts.items[i]);
+        char *body = d_trim(text);
+        free(text);
+        if (!*body) { free(body); continue; }
+        /* The block is page-controlled text. It is parsed to confirm it is
+           well formed and to lift a few common fields; malformed blocks are
+           reported rather than dropped, and the raw text is always emitted as
+           a JSON string so one bad block cannot corrupt our own output. */
+        JSValue parsed = JS_ParseJSON(engine->context, body, strlen(body),
+                                      "distill-ld.json");
+        bool valid = !JS_IsException(parsed);
+        char *kind = d_strdup(""), *name = d_strdup(""), *description = d_strdup("");
+        if (valid) {
+            JSValue object = parsed;
+            /* A top-level array or @graph wrapper holds the real records. */
+            if (JS_IsArray(object)) {
+                JSValue zero = JS_GetPropertyUint32(engine->context, object, 0);
+                if (JS_IsObject(zero)) { JS_FreeValue(engine->context, object); object = zero; }
+                else JS_FreeValue(engine->context, zero);
+            }
+            const char *fields[] = {"@type", "name", "description"};
+            char **targets[] = {&kind, &name, &description};
+            for (size_t f = 0; f < 3; ++f) {
+                JSValue value = JS_GetPropertyStr(engine->context, object, fields[f]);
+                if (JS_IsString(value)) {
+                    const char *raw = JS_ToCString(engine->context, value);
+                    if (raw) { free(*targets[f]); *targets[f] = d_strdup(raw); JS_FreeCString(engine->context, raw); }
+                }
+                JS_FreeValue(engine->context, value);
+            }
+            if (!*name) {
+                JSValue value = JS_GetPropertyStr(engine->context, object, "headline");
+                if (JS_IsString(value)) {
+                    const char *raw = JS_ToCString(engine->context, value);
+                    if (raw) { free(name); name = d_strdup(raw); JS_FreeCString(engine->context, raw); }
+                }
+                JS_FreeValue(engine->context, value);
+            }
+            JS_FreeValue(engine->context, object);
+        } else {
+            JS_FreeValue(engine->context, JS_GetException(engine->context));
+        }
+        if (!first) dbuf_puts(&out, ","); first = false;
+        char *qk = json_quote(kind), *qn = json_quote(name), *qd = json_quote(description), *qc = json_quote(body);
+        dbuf_printf(&out, "{\"format\":\"ld+json\",\"valid\":%s,\"type\":%s,\"name\":%s,\"description\":%s,\"content\":%s}",
+                    valid ? "true" : "false", qk, qn, qd, qc);
+        free(qk); free(qn); free(qd); free(qc);
+        free(kind); free(name); free(description); free(body);
+    }
+    free(scripts.items);
+    dbuf_puts(&out, "]"); return dbuf_take(&out);
+}
+
 static char *run_extraction(Engine *engine, const char *serialized)
 {
     lxb_html_document_t *document = lxb_html_document_create();
@@ -583,11 +651,11 @@ static char *run_extraction(Engine *engine, const char *serialized)
     lxb_html_serialize_tree_str(root, &filtered);
     const char *readability_input = filtered.data ? (const char *)filtered.data : serialized;
     ExtractShape shape = shape_for(root); ReadabilityFields readability = run_readability(engine, readability_input); size_t rejected = 0;
-    char *content = sanitize_content(readability.content); char *tables = table_json(root); char *search = search_json(engine, root, &rejected); char *forms = forms_json(engine, root, &rejected); char *videos = videos_json(engine, root, &rejected); char *media = media_json(engine, root, &rejected); char *links = links_json(engine, root, &rejected);
+    char *content = sanitize_content(readability.content); char *tables = table_json(root); char *search = search_json(engine, root, &rejected); char *forms = forms_json(engine, root, &rejected); char *videos = videos_json(engine, root, &rejected); char *media = media_json(engine, root, &rejected); char *links = links_json(engine, root, &rejected); char *structured = structured_data_json(engine, root);
     const char *selected = "structured-text"; if (d_eq(shape.kind, "article")) selected = readability.ok ? "readability" : "structured-text"; else if (d_eq(shape.kind, "table")) selected = "table"; else if (d_eq(shape.kind, "search-results")) selected = "search-results"; else if (d_eq(shape.kind, "form")) selected = "form"; else if (d_eq(shape.kind, "video")) selected = "video-metadata"; else if (d_eq(shape.kind, "image-heavy")) selected = "media-reference";
     DBuffer out; dbuf_init(&out); char *qurl = json_quote(engine->source_url), *qbase = json_quote(engine->base_url), *qkind = json_quote(shape.kind), *qevidence = json_quote(shape.evidence), *qselected = json_quote(selected);
     dbuf_printf(&out, "{\"schema\":1,\"url\":%s,\"base_url\":%s,\"shape\":{\"kind\":%s,\"confidence\":%.2f,\"evidence\":%s},\"extractor\":%s,\"extractor_registry\":[\"readability\",\"structured-text\",\"table\",\"search-results\",\"form\",\"video-metadata\",\"media-reference\"],\"readability\":", qurl, qbase, qkind, shape.confidence, qevidence, qselected);
     if (!readability.ok) dbuf_puts(&out, "null"); else { char *qt = json_quote(readability.title), *qb = json_quote(readability.byline), *qd = json_quote(readability.dir), *ql = json_quote(readability.lang), *qc = json_quote(content), *qtc = json_quote(readability.text_content), *qe = json_quote(readability.excerpt), *qs = json_quote(readability.site_name), *qp = json_quote(readability.published_time); dbuf_printf(&out, "{\"title\":%s,\"byline\":%s,\"dir\":%s,\"lang\":%s,\"content\":%s,\"textContent\":%s,\"excerpt\":%s,\"siteName\":%s,\"publishedTime\":%s}", qt, readability.byline_null ? "null" : qb, readability.dir_null ? "null" : qd, readability.lang_null ? "null" : ql, qc, qtc, readability.excerpt_null ? "null" : qe, readability.site_name_null ? "null" : qs, readability.published_time_null ? "null" : qp); free(qt); free(qb); free(qd); free(ql); free(qc); free(qtc); free(qe); free(qs); free(qp); }
-    dbuf_puts(&out, ",\"blocks\":"); append_blocks(&out, root); dbuf_printf(&out, ",\"tables\":%s,\"search_results\":%s,\"forms\":%s,\"videos\":%s,\"media\":%s,\"links\":%s,\"sanitization\":{\"allowed_schemes\":[\"http\",\"https\",\"mailto\",\"tel\"],\"rejected_uris\":%zu}}", tables, search, forms, videos, media, links, rejected);
-    free(qurl); free(qbase); free(qkind); free(qevidence); free(qselected); free(content); free(tables); free(search); free(forms); free(videos); free(media); free(links); free(shape.kind); free(shape.evidence); free_readability(&readability); lxb_html_document_destroy(document); return dbuf_take(&out);
+    dbuf_puts(&out, ",\"blocks\":"); append_blocks(&out, root); dbuf_printf(&out, ",\"tables\":%s,\"search_results\":%s,\"forms\":%s,\"videos\":%s,\"media\":%s,\"links\":%s,\"structured_data\":%s,\"sanitization\":{\"allowed_schemes\":[\"http\",\"https\",\"mailto\",\"tel\"],\"rejected_uris\":%zu}}", tables, search, forms, videos, media, links, structured, rejected);
+    free(qurl); free(qbase); free(qkind); free(qevidence); free(qselected); free(content); free(tables); free(search); free(forms); free(videos); free(media); free(links); free(structured); free(shape.kind); free(shape.evidence); free_readability(&readability); lxb_html_document_destroy(document); return dbuf_take(&out);
 }

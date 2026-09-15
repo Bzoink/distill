@@ -28,6 +28,120 @@ cause. Eleven are access-control results. Five are capability or target-scope
 results. Treating both as ordinary extraction bugs would lead to the wrong
 engineering work.
 
+## Current state after network remediation
+
+The network-layer remedies proposed after the first comparison have now been
+implemented in commit `c25b538` (`Improve network compatibility and cookie
+handling`). They improve protocol compatibility and session continuity, but
+they do not attempt to defeat anti-bot challenges, CAPTCHAs, paywalls, or
+headless-browser detection.
+
+| Remedy | Current implementation | Result |
+| --- | --- | --- |
+| Per-run cookies | libcurl cookie state is shared between navigation, `fetch`, XHR, and asynchronously loaded scripts; `document.cookie` reads and writes the same state | Cookies now round-trip between JavaScript and network requests during one run |
+| Request defaults | Navigation requests send an HTML `Accept`; fetch/XHR subrequests send `Accept: */*`; all requests send `Accept-Language`, negotiated `Accept-Encoding`, a desktop user agent, and a subrequest `Referer` | Requests are materially closer to ordinary browser traffic |
+| Page request headers | `fetch(..., {headers})`, `Headers`, and XHR `setRequestHeader()` are forwarded to libcurl, subject to browser-style restricted-header filtering | API and form requests can supply their own content type and application headers |
+| Request bodies | POST and other request bodies are passed through without forcing `Content-Type: application/json` | Form-encoded and other caller-selected body formats are preserved |
+| Response metadata | Response headers are captured, exposed through `get`, `has`, `forEach`, `entries`, `keys`, and `values`, and effective redirect URLs populate `url` and `redirected` | Scripts can branch on ordinary response metadata |
+| XHR response state | XHR now exposes response URL, response headers, `getResponseHeader()`, and `getAllResponseHeaders()` | The local XHR path matches the fetch path more closely |
+
+The new local fixture `18-network-contract` exercises cookies, `Headers`,
+custom request headers, POST bodies, response headers, redirects, and XHR. It
+passes both Distill and the Chromium baseline. The complete local Phase 0 and
+Phase 1 gates, the three CTest tests, and the rebuilt binaries also pass.
+
+The live retest was deliberately limited to previously problematic targets:
+
+| Target | Current result after remediation |
+| --- | --- |
+| Stack Overflow (`10-stack-overflow`) | Still Cloudflare's `Just a moment...` challenge; ordinary cookies and request metadata did not make content available |
+| Airbnb (`13-airbnb`) | Network requests now have the required basic bridge support, but the application still does not hydrate into Chromium's content; remains out of scope |
+| Zillow (`22-zillow`) | Still access-denied/verification behavior; Distill's challenge scripts consume the settle budget |
+| IMDb (`23-imdb`) | Still `403 Forbidden` for both clients |
+
+Therefore the remedy changed a genuine engine limitation and established a
+tested network contract, but it did not change the anti-bot classifications or
+the Airbnb scope classification. Persistent user-supplied sessions,
+structured-data harvesting, robots/rate-limit handling, explicit HTTP-version
+selection, and sanctioned API/RSS adapters remain future work.
+
+## Second round: module resolution, structured data, classification
+
+The network remediation above was scored rather than assumed, and scoring it
+produced a second round of work. Two of the predictions that motivated Tier 1
+were falsified, one site was unblocked that nobody had predicted, and reading
+the module path exposed a defect rather than a missing capability.
+
+### A defect, not a missing capability
+
+`module_normalize` discarded the `base_name` argument and resolved every
+module specifier against the page URL. A bundle at `/assets/app.js` importing
+`./chunk.js` therefore requested `/chunk.js`, received the site's HTML
+fallback, and failed to compile with `unexpected token '<'`.
+
+That is the exact error recorded against JSFiddle. A local fixture reproduces
+it verbatim on the pre-fix engine:
+
+```
+SyntaxError: unexpected token in expression: '<'
+    at http://127.0.0.1:8899/chunk.js:1:1
+```
+
+The resolved path is `/chunk.js`, not `/modules/chunk.js`. This affected the
+second and every subsequent level of any module graph, so it was never
+specific to JSFiddle. Alongside it, `module_loader` captured the HTTP status
+and never read it, which is why the failure surfaced as a syntax error instead
+of a missing module. Both are fixed and gated by `19-module-graph`, which also
+asserts that a page shipping a module bundle and a `nomodule` fallback runs
+one of them rather than both.
+
+### Structured data without hydration
+
+Script discovery already located every JSON block on a page and discarded it.
+JSON-LD is the page's own record of itself and is present whether or not the
+application hydrates, so it is now extracted into a `structured_data` field,
+with malformed blocks reported rather than dropped. This is the one measure
+that addresses layout-dependent hydration without a browser-semantics project:
+it does not need the application to start.
+
+### Classifying challenges instead of extracting them empty
+
+A challenge shell runs its own scripts and spends the entire settle budget
+before the run can report that no content was ever available. Recognised
+challenges are now detected — against the served HTML before scripts run, and
+against the settled DOM afterwards for challenges that write their message
+from script — and reported with exit status `4`.
+
+Recognising a challenge is not solving one. No challenge is answered, no
+token is computed, and every site that blocked us still blocks us. What
+changes is that the result is a classification rather than an empty extraction
+that looks like a parser bug.
+
+**The first version of this detector was wrong, in an instructive way.** It
+used vendor names as markers. Checked against pages that actually serve
+content, `datadome` matched Airbnb and `/cdn-cgi/challenge-platform` matched
+Product Hunt — both serve full pages while naming those vendors — so the
+detector was skipping the scripts of working pages. The markers are now
+restricted to strings unique to an interstitial, with a document-size guard as
+a second line of defence, and gate `22-challenge-vendor-scripts` locks the
+false-positive case in permanently.
+
+### What the retest showed
+
+| Target | Result |
+| --- | --- |
+| Zillow (`22-zillow`) | **Now returns content** — real title, 1448 characters, 271 links — where both clients previously received an access-denied page. The probable cause is protocol-version negotiation, which was still missing after Tier 1 |
+| IMDb (`23-imdb`) | The flat `403` is gone; IMDb now answers `202` with an AWS WAF challenge. The request shape was a real defect; the challenge behind it is not ours |
+| Airbnb (`13-airbnb`) | Headers and bodies cross the bridge and no listing request is still made. The architectural diagnosis below is confirmed on evidence rather than suspicion |
+| Stack Overflow (`10-stack-overflow`) | Cookies round-trip and the Cloudflare interstitial remains. A policy result, not a defect |
+| JSFiddle (`31-jsfiddle`) | The syntax error was ours. The site now serves a Cloudflare challenge, so its editor/frame requirements are untested rather than disproven |
+
+Two conclusions worth separating. Distill genuinely improved: a protocol
+inconsistency and a module-resolution bug were real defects, and fixing them
+unblocked one site and corrected the recorded cause on two more. And the
+anti-bot classifications largely held: cookies and headers did not open
+Cloudflare, and no measure here was aimed at making them.
+
 ## Sites classified as anti-bot
 
 These sites did not provide a usable content target to both sides of the
@@ -43,8 +157,8 @@ browser run without login or special cookies is the comparison baseline.
 | Reddit (`18-reddit`) | Both clients received Reddit's `Prove your humanity` challenge. |
 | CodePen Trending (`19-codepen-trending`) | Both clients received CodePen/Cloudflare security verification reporting that the browser was unsupported. |
 | Product Hunt (`20-product-hunt`) | Chromium was stopped at Product Hunt's Cloudflare verification page; Distill reached site content, so the reference side was blocked. |
-| Zillow (`22-zillow`) | Both clients received an access-denied page with a human-verification prompt. |
-| IMDb (`23-imdb`) | Both clients received `403 Forbidden` and no usable IMDb content. |
+| Zillow (`22-zillow`) | Superseded. Distill now reaches Zillow content; the access-denied page still appears on some requests and is classified as `perimeterx`. |
+| IMDb (`23-imdb`) | Revised. The `403 Forbidden` was partly our own request shape; IMDb now answers `202` with an AWS WAF challenge, classified as `aws-waf`. |
 | Bloomberg (`24-bloomberg`) | Both clients received Bloomberg's unusual-activity robot check. |
 | Target (`25-target`) | Chromium received the homepage; Distill received Target's `Pardon the interruption` bot-mitigation page. |
 | CodePen (`30-codepen-embed`) | Both clients received CodePen's Cloudflare security-verification page; Distill additionally reported that its browser was unsupported. |
@@ -100,13 +214,20 @@ it remains deferred.
 
 ### JSFiddle — `31-jsfiddle`
 
-Chromium loaded the editor UI. Distill remained at the server-rendered title
-shell: its main editor module failed with `unexpected token '<'`, while a
-supporting SVG loader reported missing `DOMParser`. The intended product also
-uses an editor and isolated/cross-origin preview frames. The observed errors
-may contain individually fixable compatibility gaps, but making JSFiddle work
-requires reliable module loading, a larger DOM API surface, and multi-frame
-semantics together.
+**This deferral was wrong, and the reason matters.** The `unexpected token
+'<'` was not JSFiddle's complexity; it was our module resolver requesting the
+wrong URL and compiling the resulting HTML error page as JavaScript. The
+deferral reasoning was built on a symptom we had produced ourselves.
+
+That resolver bug is fixed and gated. JSFiddle now returns a Cloudflare
+challenge, so the remaining claims — that it needs a larger DOM API surface
+(`DOMParser` is genuinely absent) and isolated cross-origin preview frames —
+are untested rather than disproven. They remain plausible and unproven.
+
+The lesson generalises: a symptom that looks like a site being too complex can
+be our own defect, and a scope boundary inferred from such a symptom is not
+yet evidence. Airbnb below is the counter-example — its deferral was re-tested
+against exactly this suspicion and survived.
 
 ### HTML5 Test — `34-html5-test`
 
@@ -171,8 +292,17 @@ The work was deliberately incremental and evidence-driven:
    network-contract regression fixture.
 7. Preserved link information for media/embed-shaped reader output, which
    fixed the Three.js example-index case.
-8. Classified anti-bot pages and browser-runtime boundaries explicitly instead
-   of repeatedly changing extraction code for problems it cannot solve.
+8. Fixed module specifier resolution to follow the importing module's URL,
+   added HTTP status and content checks to the module loader, and excluded
+   `nomodule` fallbacks from execution.
+9. Harvested JSON-LD into the extraction result, so a page's own record
+   survives an application that never hydrates.
+10. Negotiated HTTP/2 and bounded redirect following.
+11. Classified recognised bot challenges with a distinct exit status, before
+    their scripts spend the settle budget, and gated the false-positive case
+    after the first detector misclassified two working pages.
+12. Classified anti-bot pages and browser-runtime boundaries explicitly instead
+    of repeatedly changing extraction code for problems it cannot solve.
 
 The Airbnb work is the clearest example of the boundary: several missing APIs
 were fixed, then the comparison was stopped when the remaining evidence
@@ -188,7 +318,7 @@ Distill is a C23-rooted, content-first browser-like pipeline:
 | JavaScript | Embedded QuickJS-ng, with resource limits and a settle policy for timers, microtasks, requests, and script execution |
 | Page DOM | A LinkeDOM-compatible JavaScript DOM surface runs page scripts inside QuickJS; the settled result is serialized for native extraction |
 | Native parsing/extraction | Lexbor parses the settled HTML and provides native traversal; Readability.js is run as the article extractor, alongside structured blocks, tables, search results, forms, video metadata, media references, and links |
-| Networking | libcurl with per-run shared cookies, request/response headers, redirects, GET/POST, and the page/subresource bridge |
+| Networking | libcurl with per-run shared cookies, request/response headers, negotiated HTTP/2, bounded redirects, GET/POST, and the page/subresource bridge |
 | Reader layout | litehtml lays out Distill's own reader template rather than arbitrary source-site CSS |
 | Font/render path | FreeType for glyph metrics/rasterization, HarfBuzz for shaping, libunibreak for line-break opportunities, and Cairo for desktop PNG/surface painting |
 | Desktop shell | GTK3 with a Cairo reader surface and native GTK form widgets positioned from litehtml geometry |
@@ -229,11 +359,11 @@ canvas, a shadow tree, or a multi-frame editor can hit a real boundary.
 3. **Frames and encapsulation.** The current pipeline owns one settled DOM;
    it does not provide independent browsing contexts with origin, lifecycle,
    storage, and messaging semantics for every iframe or shadow tree.
-4. **Modern module and network behavior.** Pages may depend on module graphs,
-   credentials, cache behavior, streaming, service workers, and browser
-   metadata that the lightweight bridge does not fully reproduce. Basic
-   cookies and request/response headers are now covered, but not the complete
-   Fetch/CORS/cache model.
+4. **Modern module and network behavior.** Cookies, request/response headers,
+   HTTP/2, and module specifier resolution are now covered, and a module that
+   fails to load reports why. Import maps and bare specifiers are still
+   unimplemented, and credentials, cache behavior, streaming, service workers,
+   and the complete Fetch/CORS model remain outside the bridge.
 5. **Untrusted script isolation.** Interrupts, memory limits, and script
    limits prevent hangs and bound resource use, but the JavaScript realm still
    runs in-process. A separate process or stronger sandbox is the eventual
@@ -250,6 +380,8 @@ Build and run the local gates:
 ```sh
 cmake --build build -j2
 python3 corpus/check.py
+python3 corpus/check.py --extract
+ctest --test-dir build
 ```
 
 Run a live comparison by manifest ID:

@@ -1,0 +1,34 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>Module graph resolution</title>
+
+<!--
+  A module specifier resolves against the URL of the module that imported it.
+  /modules/app.js imports "./chunk.js" and "./nested/deep.js"; deep.js in turn
+  imports "./leaf.js". Resolving any hop against the page URL instead sends the
+  request to /chunk.js or /leaf.js, which this server answers with a 404 HTML
+  page, and the module then fails to compile.
+
+  The nomodule script must not run: a module-capable client runs the module
+  bundle or the fallback, never both.
+-->
+
+<div id="content">MODULE-GRAPH-PENDING</div>
+
+<script nomodule>
+  document.getElementById("content").textContent = "NOMODULE-RAN";
+  globalThis.__nomoduleRan = true;
+</script>
+
+<script type="module" src="/modules/app.js"></script>
+
+<script type="module">
+  import { CHUNK } from "/modules/chunk.js";
+  const target = document.getElementById("content");
+  const parts = [CHUNK, globalThis.__moduleGraph || "GRAPH-MISSING"];
+  if (globalThis.__nomoduleRan) {
+    target.textContent = "NOMODULE-RAN";
+  } else {
+    target.textContent = "MODULE-GRAPH-OK " + parts.join(" ");
+  }
+</script>

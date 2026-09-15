@@ -505,6 +505,55 @@
       "assertions": [
         {"stage": "dom", "selector": "#content", "expect": "NETWORK-CONTRACT-OK"}
       ]
+    },
+    {
+      "id": "19-module-graph",
+      "path": "19-module-graph.html",
+      "gate": true,
+      "plan_section": "Modern module and network behavior",
+      "exercises": ["module-resolution", "nested-imports", "nomodule"],
+      "why": "A relative specifier must resolve against the importing module's URL, not the page URL, at every hop; and a module-capable client must run the module bundle or the nomodule fallback, never both.",
+      "assertions": [
+        {"stage": "dom", "selector": "#content", "expect": "MODULE-GRAPH-OK CHUNK-OK CHUNK-OK/LEAF-OK"},
+        {"stage": "dom", "selector": "#content", "expect_absent": ["NOMODULE-RAN", "GRAPH-MISSING"]}
+      ]
+    },
+    {
+      "id": "20-structured-data",
+      "path": "20-structured-data.html",
+      "gate": true,
+      "plan_section": "Phase 1 extraction breadth, structured data",
+      "exercises": ["json-ld", "malformed-json-ld"],
+      "why": "JSON-LD is the page's own record of itself and is present whether or not the application hydrates. A malformed block must be reported rather than dropped, and must not corrupt the extraction output.",
+      "assertions": [
+        {"stage": "extract", "path": "structured_data[0].name", "expect": "Structured data survives a failed hydration"},
+        {"stage": "extract", "path": "structured_data[0].type", "expect": "NewsArticle"},
+        {"stage": "extract", "path": "structured_data[1].valid", "expect": "false"}
+      ]
+    },
+    {
+      "id": "21-challenge-shell",
+      "path": "21-challenge-shell.html",
+      "gate": true,
+      "expect_exit": 4,
+      "plan_section": "Access classification",
+      "exercises": ["challenge-detection", "settle-budget"],
+      "why": "A recognised bot-challenge shell must be classified before its scripts run. Detecting one is not solving it: the run reports a distinct status instead of spending the settle budget on a page that can never yield content.",
+      "assertions": [
+        {"stage": "dom", "selector": "#content", "expect": "CHALLENGE-SHELL"},
+        {"stage": "dom", "selector": "#content", "expect_absent": ["CHALLENGE-SCRIPT-RAN"]}
+      ]
+    },
+    {
+      "id": "22-challenge-vendor-scripts",
+      "path": "22-challenge-vendor-scripts.html",
+      "gate": true,
+      "plan_section": "Access classification",
+      "exercises": ["challenge-detection", "false-positive"],
+      "why": "Ordinary pages name bot-mitigation vendors without being challenges. Misclassifying one skips the scripts of a working page, so vendor script names must never be treated as evidence of a challenge.",
+      "assertions": [
+        {"stage": "dom", "selector": "#content", "expect": "VENDOR-SCRIPTS-RAN"}
+      ]
     }
   ],
   "live": [

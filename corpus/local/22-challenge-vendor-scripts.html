@@ -1,0 +1,22 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>Vendor scripts on a working page</title>
+
+<!--
+  A page that serves real content while naming bot-mitigation vendors, which
+  ordinary sites do. Airbnb names DataDome and Product Hunt loads
+  Cloudflare's challenge-platform precursor; both serve full pages.
+
+  Classifying this as a challenge would skip its scripts and discard a page
+  that works, so the vendor names below must NOT be treated as evidence. This
+  page is small on purpose: the size guard cannot rescue it, only the choice
+  of markers can.
+-->
+
+<div id="content">VENDOR-SHELL</div>
+
+<script src="/cdn-cgi/challenge-platform/scripts/precursor/main.js"></script>
+<script>
+  window.__ddjskey = "datadome-integration-key";
+  document.getElementById("content").textContent = "VENDOR-SCRIPTS-RAN";
+</script>

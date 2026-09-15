@@ -321,12 +321,24 @@ def compare(reference, distill_dom, extraction):
     }
 
 
+# Distill reports a recognised bot challenge with its own status, so the
+# harness can record "we were never given content" separately from "the
+# capture failed". Neither is a content comparison, but only one is a defect.
+CHALLENGE_EXIT = 4
+
+
 def run_command(command, timeout):
     started = time.monotonic()
     try:
         result = subprocess.run(command, capture_output=True, text=True, timeout=timeout)
+        if result.returncode == 0:
+            status = "ok"
+        elif result.returncode == CHALLENGE_EXIT:
+            status = "challenge"
+        else:
+            status = "error"
         return {
-            "status": "ok" if result.returncode == 0 else "error",
+            "status": status,
             "returncode": result.returncode,
             "stdout": result.stdout,
             "stderr": result.stderr,
@@ -401,7 +413,9 @@ def site_report(site, browser, engine, output, timeout, budget, cap_ms, screensh
     )
     write_text(output / "distill-extract.stderr.txt", extract_result["stderr"])
     extraction = None
-    if extract_result["status"] == "ok":
+    # A challenge run still emits a valid extraction of the challenge shell,
+    # which is the evidence for the classification; parse it like any other.
+    if extract_result["status"] in ("ok", "challenge"):
         try:
             extraction = json.loads(extract_result["stdout"])
             write_json(output / "distill.extract.json", extraction)
@@ -557,7 +571,9 @@ def main():
             report["distill"]["extract_capture"]["status"],
         )
         print(f"  chromium={statuses[0]} distill-dom={statuses[1]} distill-extract={statuses[2]}")
-        if any(status != "ok" for status in statuses):
+        # A challenge is a recorded access result, not a capture failure, so
+        # it must not fail a --strict run the way a broken capture does.
+        if any(status not in ("ok", "challenge") for status in statuses):
             failures += 1
         print(f"  report={args.out / site['id'] / 'report.md'}")
     if args.strict and failures:

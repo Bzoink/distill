@@ -162,8 +162,13 @@ def dump_dom(browser, url, budget_ms, timeout_s):
     return r.stdout, None
 
 
-def dump_engine(engine, url, cap_ms, timeout_s):
-    """Post-JS DOM from the Phase 0 engine, or (None, reason)."""
+def dump_engine(engine, url, cap_ms, timeout_s, expect_exit=0):
+    """Post-JS DOM from the Phase 0 engine, or (None, reason).
+
+    A page may declare a non-zero expected status: a recognised bot challenge
+    still serializes its shell, but reports a status that separates it from a
+    content run.
+    """
     cmd = [
         engine, "--url", url, "--dump-dom", "--script-cap-ms", str(cap_ms),
     ]
@@ -171,22 +176,28 @@ def dump_engine(engine, url, cap_ms, timeout_s):
         r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout_s)
     except subprocess.TimeoutExpired:
         return None, f"engine timed out after {timeout_s}s"
-    if r.returncode != 0:
-        return None, f"engine exit {r.returncode}: {r.stderr.strip()[:200]}"
+    if r.returncode != expect_exit:
+        return None, (f"engine exit {r.returncode}, expected {expect_exit}: "
+                      f"{r.stderr.strip()[:200]}")
     if not r.stdout.strip():
         return None, f"engine returned no DOM: {r.stderr.strip()[:200]}"
     return r.stdout, None
 
 
-def dump_extract(engine, url, cap_ms, timeout_s):
-    """Structured extraction JSON for a URL, or (None, reason)."""
+def dump_extract(engine, url, cap_ms, timeout_s, expect_exit=0):
+    """Structured extraction JSON for a URL, or (None, reason).
+
+    As with dump_engine, a page may declare a non-zero expected status: a
+    recognised challenge shell is still extracted, under its own status.
+    """
     cmd = [engine, "--url", url, "--extract", "--script-cap-ms", str(cap_ms)]
     try:
         r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout_s)
     except subprocess.TimeoutExpired:
         return None, f"extractor timed out after {timeout_s}s"
-    if r.returncode != 0:
-        return None, f"extractor exit {r.returncode}: {r.stderr.strip()[:300]}"
+    if r.returncode != expect_exit:
+        return None, (f"extractor exit {r.returncode}, expected {expect_exit}: "
+                      f"{r.stderr.strip()[:300]}")
     try:
         return json.loads(r.stdout), None
     except json.JSONDecodeError as exc:
@@ -464,7 +475,8 @@ def main():
                 html = None
                 extraction = None
             elif args.extract:
-                extraction, err = dump_extract(engine, url, manifest.get("settle_cap_ms", 5000), args.timeout)
+                extraction, err = dump_extract(engine, url, manifest.get("settle_cap_ms", 5000),
+                                               args.timeout, page.get("expect_exit", 0))
                 html = None
             elif args.baseline:
                 html, err = dump_dom(browser, url, args.budget, args.timeout)
@@ -473,7 +485,8 @@ def main():
                 html, err = dump_arm_b(arm_b, url, manifest.get("settle_cap_ms", 5000), args.timeout)
                 extraction = None
             else:
-                html, err = dump_engine(engine, url, manifest.get("settle_cap_ms", 5000), args.timeout)
+                html, err = dump_engine(engine, url, manifest.get("settle_cap_ms", 5000),
+                                        args.timeout, page.get("expect_exit", 0))
                 extraction = None
             elapsed = time.time() - t0
 

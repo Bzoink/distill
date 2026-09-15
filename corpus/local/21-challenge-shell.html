@@ -1,0 +1,23 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>Just a moment...</title>
+
+<!--
+  A stand-in for a bot-challenge interstitial. Recognising one is not solving
+  one: the point is that the challenge's own scripts must not be run, because
+  they spend the whole settle budget and can never produce content.
+
+  The marker below is the one such interstitials actually serve. The script is
+  the part that must never execute.
+-->
+
+<div id="content">CHALLENGE-SHELL</div>
+<div id="cf-browser-verification">Checking your browser before accessing the site.</div>
+
+<script src="/cdn-cgi/challenge-platform/orchestrate.js"></script>
+<script>
+  /* A real challenge spins here until the budget is gone. */
+  document.getElementById("content").textContent = "CHALLENGE-SCRIPT-RAN";
+  const until = Date.now() + 60000;
+  while (Date.now() < until) { /* burn the settle budget */ }
+</script>

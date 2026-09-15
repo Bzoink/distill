@@ -98,11 +98,24 @@ exists to test.
 | `15-gallery` | Decorative/content image classification | Phase 1 extraction breadth |
 | `16-redirect` | Effective URL after redirect and base resolution | Phase 1 extraction breadth |
 | `17-empty-async` | Empty async script response must not crash evaluation | Browser globals and document lifecycle |
+| `18-network-contract` | Cookies, page-supplied headers, POST bodies, response headers, redirects, XHR | Network ↔ JS bridge |
+| `19-module-graph` | Nested module resolution against the importer's URL; `nomodule` exclusion | Modern module and network behavior |
+| `20-structured-data` | JSON-LD harvested from a page that never hydrates; malformed block reported | Phase 1 extraction breadth |
+| `21-challenge-shell` | A recognised challenge is classified before its scripts spend the settle budget | Access classification |
+| `22-challenge-vendor-scripts` | A working page that names bot-mitigation vendors must not be misclassified | Access classification |
 
 `00` is the control: it has no scripts, so a failure there is never a binding
 bug. `07` is where a raw-pointer binding over Lexbor's arena-allocated nodes
 crashes — better here than on a live site. `08` deliberately resembles the top of
 the live ladder while still naming its own cause on failure.
+
+`21` and `22` are a matched pair and only mean something together. `21` asserts
+that a challenge shell is recognised; `22` asserts that naming a bot-mitigation
+vendor is not by itself evidence of one. A detector that passes `21` alone is
+easy to write and wrong: the first version of ours matched Airbnb and Product
+Hunt, which serve full pages while naming those vendors, and it would have
+skipped their scripts. `22` is deliberately a small document so that the
+detector's size guard cannot rescue it — only the choice of markers can.
 
 ## Where we must beat the browser
 
@@ -132,6 +145,12 @@ is `08b-charset-lie.html`, deliberately left undecided and ungated. See
   Only `#id` selectors are supported, on purpose: every fixture is written to
   make its assertion unambiguous.
 - `browser_expect` — present only where we deliberately diverge, as above.
+
+A page may also carry `expect_exit`, a process status the engine is required to
+report. It defaults to `0`. `21-challenge-shell` sets `4`: a recognised
+challenge still serializes and extracts its shell, so the run produces output,
+but the status separates it from a run that reached content. `check.py` treats
+any other status as a capture failure, as before.
 
 ## Live rungs
 

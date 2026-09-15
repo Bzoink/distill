@@ -142,6 +142,7 @@ struct Engine {
     int async_pending;
     bool load_sent;
     bool cap_hit;
+    const char *challenge;
     TimerVec timers;
     ListenerVec listeners;
     RequestVec requests;
@@ -443,6 +444,13 @@ static void configure_curl_common(Engine *engine, CURL *easy, const char *refere
     curl_easy_setopt(easy, CURLOPT_USERAGENT,
                      "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/152.0.0.0 Safari/537.36");
     curl_easy_setopt(easy, CURLOPT_ACCEPT_ENCODING, "");
+    /* A client presenting a Chrome user agent should negotiate the protocol
+       version Chrome negotiates. HTTP/1.1-only traffic from a self-declared
+       Chrome is an inconsistency some origins reject on its own. */
+    curl_easy_setopt(easy, CURLOPT_HTTP_VERSION, (long)CURL_HTTP_VERSION_2TLS);
+    /* FOLLOWLOCATION without a bound follows a redirect loop until the
+       request timeout expires, spending the whole settle budget. */
+    curl_easy_setopt(easy, CURLOPT_MAXREDIRS, 20L);
     curl_easy_setopt(easy, CURLOPT_AUTOREFERER, 1L);
     (void)referer;
 }
@@ -1351,16 +1359,49 @@ static void process_network(Engine *engine)
     }
 }
 
+/* A module specifier resolves against the URL of the module that imported
+   it, not against the page. A bundle at /assets/app.js importing
+   './chunk.js' must reach /assets/chunk.js; resolving against the page URL
+   instead sends the request to the site's HTML fallback, which then fails to
+   compile with a bare syntax error at the first '<'. The base name is only
+   usable when it is a real URL: top-level inline modules are evaluated under
+   a placeholder name and still resolve against the document base. */
 static char *module_normalize(JSContext *ctx, const char *base_name,
                               const char *name, void *opaque)
 {
-    (void)base_name;
     Engine *engine = opaque;
-    char *url = resolve_url(engine->base_url, name);
+    const char *base = (base_name && is_http_url(base_name)) ? base_name
+                                                             : engine->base_url;
+    char *url = resolve_url(base, name);
     char *out = js_malloc(ctx, strlen(url) + 1);
     if (out) strcpy(out, url);
     free(url);
     return out;
+}
+
+/* Servers answer an unknown path with an HTML error page or a single-page
+   application fallback. Compiling that as JavaScript reports only
+   "unexpected token '<'", which hides the real cause, so the condition is
+   detected and reported by name instead. */
+static bool looks_like_html(const char *data, size_t length)
+{
+    static const char *marks[] = {"<!doctype", "<html", "<?xml", "<head", "<body"};
+    size_t i = 0;
+    while (i < length && (unsigned char)data[i] <= ' ') ++i;
+    if (i >= length || data[i] != '<') return false;
+    for (size_t m = 0; m < sizeof(marks) / sizeof(*marks); ++m) {
+        size_t n = strlen(marks[m]);
+        if (length - i < n) continue;
+        size_t k = 0;
+        while (k < n) {
+            char c = data[i + k];
+            if (c >= 'A' && c <= 'Z') c = (char)(c - 'A' + 'a');
+            if (c != marks[m][k]) break;
+            ++k;
+        }
+        if (k == n) return true;
+    }
+    return false;
 }
 
 static JSModuleDef *module_loader(JSContext *ctx, const char *name, void *opaque)
@@ -1369,7 +1410,20 @@ static JSModuleDef *module_loader(JSContext *ctx, const char *name, void *opaque
     DBuffer body;
     long status = 0;
     if (!fetch_sync(engine, name, &body, &status, NULL)) {
+        dbuf_free(&body);
         JS_ThrowReferenceError(ctx, "module not found: %s", name);
+        return NULL;
+    }
+    if (status >= 400) {
+        dbuf_free(&body);
+        JS_ThrowReferenceError(ctx, "module request failed with HTTP %d: %s",
+                               (int)status, name);
+        return NULL;
+    }
+    if (looks_like_html(body.data, body.length)) {
+        dbuf_free(&body);
+        JS_ThrowReferenceError(ctx, "module request returned HTML, not JavaScript: %s",
+                               name);
         return NULL;
     }
     JSValue value = JS_Eval(ctx, body.data, body.length, name,
@@ -1599,7 +1653,7 @@ static bool install_host(Engine *engine)
 static bool discover_scripts(Engine *engine)
 {
     const char *source =
-        "Array.from(document.querySelectorAll('script')).map(s => ({node:s, src:s.getAttribute('src') || '', async:s.hasAttribute('async'), defer:s.hasAttribute('defer'), text:s.textContent || '', type:s.getAttribute('type') || ''}))";
+        "Array.from(document.querySelectorAll('script')).map(s => ({node:s, src:s.getAttribute('src') || '', async:s.hasAttribute('async'), defer:s.hasAttribute('defer'), nomodule:s.hasAttribute('nomodule'), text:s.textContent || '', type:s.getAttribute('type') || ''}))";
     JSValue scripts = JS_Eval(engine->context, source, strlen(source), "distill-scripts.js", JS_EVAL_TYPE_GLOBAL);
     if (JS_IsException(scripts)) { note_exception(engine, "script discovery"); return false; }
     JSValue deferred = JS_NewArray(engine->context);
@@ -1615,15 +1669,22 @@ static bool discover_scripts(Engine *engine)
         JSValue defer_value = JS_GetPropertyStr(engine->context, spec, "defer");
         JSValue text_value = JS_GetPropertyStr(engine->context, spec, "text");
         JSValue type_value = JS_GetPropertyStr(engine->context, spec, "type");
+        JSValue nomodule_value = JS_GetPropertyStr(engine->context, spec, "nomodule");
         char *src = js_string(engine->context, src_value);
         char *code = js_string(engine->context, text_value);
         char *type = js_string(engine->context, type_value);
         bool is_async = JS_ToBool(engine->context, async_value);
         bool is_defer = JS_ToBool(engine->context, defer_value);
+        bool is_nomodule = JS_ToBool(engine->context, nomodule_value);
         JS_FreeValue(engine->context, node); JS_FreeValue(engine->context, src_value); JS_FreeValue(engine->context, async_value);
         JS_FreeValue(engine->context, defer_value); JS_FreeValue(engine->context, text_value);
-        JS_FreeValue(engine->context, type_value); JS_FreeValue(engine->context, spec);
+        JS_FreeValue(engine->context, type_value); JS_FreeValue(engine->context, nomodule_value);
+        JS_FreeValue(engine->context, spec);
         if (d_contains(type, "json")) { free(src); free(code); free(type); continue; }
+        /* A page that ships a module bundle and a nomodule fallback expects a
+           module-capable client to run exactly one of them. Running both
+           initialises the same framework twice. */
+        if (is_nomodule) { free(src); free(code); free(type); continue; }
         char *url = src[0] ? resolve_url(engine->base_url, src) : NULL;
         if (is_async && url) {
             ++engine->async_pending;
@@ -1749,6 +1810,55 @@ static void dispatch_load_if_ready(Engine *engine)
     dispatch_host_event(engine, "document", "readystatechange");
     dispatch_host_event(engine, "window", "load");
     execute_jobs(engine);
+}
+
+/* Recognising a bot challenge is not solving one. A challenge shell runs its
+   own scripts, which otherwise consume the whole settle budget before the run
+   can report that no content was ever available.
+
+   Every marker here was checked against pages that do serve content, because
+   the cost of a false positive is high: it would skip the scripts of a
+   working page. Vendor script names are deliberately NOT used. Airbnb names
+   DataDome and Product Hunt loads Cloudflare's challenge-platform precursor
+   while both serve full pages; only strings unique to an interstitial
+   qualify. The size guard is the second line of defence -- a challenge shell
+   served challenge shell is a small document, so a large one is never
+   classified from its markup alone however its scripts are named.
+
+   The limit differs by caller. Before scripts run, the decision is
+   destructive -- it skips the page's scripts -- so the served document must
+   also be small. After settling, the decision only labels the exit status, and
+   a challenge that renders itself from script has by then grown well past the
+   served size, so the larger limit applies. */
+#define DISTILL_CHALLENGE_SERVED_BYTES 131072
+#define DISTILL_CHALLENGE_SETTLED_BYTES 1048576
+
+static const char *challenge_kind(const char *data, size_t length, size_t limit)
+{
+    static const struct { const char *mark; const char *name; } marks[] = {
+        {"cf-browser-verification", "cloudflare"},
+        {"cf_chl_opt", "cloudflare"},
+        {"just a moment...", "cloudflare"},
+        {"checking your browser before accessing", "cloudflare"},
+        {"prove your humanity", "humanity-check"},
+        {"pardon the interruption", "bot-mitigation"},
+        {"px-captcha", "perimeterx"},
+        {"_px_captcha", "perimeterx"},
+        {"captcha-delivery.com", "datadome"},
+        {"awswafcookiedomainlist", "aws-waf"},
+        {"window.gokuprops", "aws-waf"},
+    };
+    if (!data || !length || length > limit) return NULL;
+    char *lower = d_strndup(data, length);
+    for (char *p = lower; *p; ++p) {
+        if (*p >= 'A' && *p <= 'Z') *p = (char)(*p - 'A' + 'a');
+    }
+    const char *found = NULL;
+    for (size_t i = 0; i < sizeof(marks) / sizeof(*marks) && !found; ++i) {
+        if (strstr(lower, marks[i].mark)) found = marks[i].name;
+    }
+    free(lower);
+    return found;
 }
 
 static void settle(Engine *engine)
@@ -2439,6 +2549,12 @@ static int run_page(const char *input, uint64_t cap_ms, uint64_t memory_mb,
     if (effective_url && *effective_url) { free(engine.source_url); engine.source_url = effective_url; }
     else free(effective_url);
     free(engine.base_url); engine.base_url = d_strdup(engine.source_url);
+    engine.challenge = challenge_kind(html.data, html.length,
+                                      DISTILL_CHALLENGE_SERVED_BYTES);
+    if (engine.challenge) {
+        fprintf(stderr, "challenge page detected (%s) for %s; skipping script execution\n",
+                engine.challenge, engine.source_url);
+    }
 
     engine.runtime = JS_NewRuntime();
     if (!engine.runtime) {
@@ -2472,18 +2588,32 @@ static int run_page(const char *input, uint64_t cap_ms, uint64_t memory_mb,
     }
     dbuf_free(&html);
     set_document_base(&engine);
-    if (!discover_scripts(&engine)) {
-        engine_cleanup(&engine);
+    if (!engine.challenge) {
+        if (!discover_scripts(&engine)) {
+            engine_cleanup(&engine);
 #ifdef DISTILL_RENDER
-        free(owned_font_dir);
+            free(owned_font_dir);
 #endif
-        return 2;
+            return 2;
+        }
+        settle(&engine);
     }
-    settle(&engine);
     /* The settle cap stops page activity; it must not interrupt our own
        final DOM snapshot or extraction pass. */
     JS_SetInterruptHandler(engine.runtime, NULL, NULL);
     char *serialized = serialize_document(&engine);
+    /* Some challenges write their message from script, so the served HTML
+       carries no marker and only the settled DOM does. Detecting it here is
+       too late to save the settle budget, but the run is still classified
+       correctly rather than reported as an empty extraction. */
+    if (!engine.challenge) {
+        engine.challenge = challenge_kind(serialized, strlen(serialized),
+                                          DISTILL_CHALLENGE_SETTLED_BYTES);
+        if (engine.challenge) {
+            fprintf(stderr, "challenge page detected (%s) for %s after script execution\n",
+                    engine.challenge, engine.source_url);
+        }
+    }
     int result = 0;
     if (viewer_path) {
 #ifdef DISTILL_RENDER
@@ -2549,6 +2679,9 @@ static int run_page(const char *input, uint64_t cap_ms, uint64_t memory_mb,
         fprintf(stderr, "arm-b-pruned litehtml=%s\n", distill_litehtml_probe(serialized) ? "ok" : "failed");
 #endif
     }
+    /* The output above is still produced so the challenge shell can be
+       inspected; the status distinguishes it from a content run. */
+    if (result == 0 && engine.challenge) result = 4;
     fprintf(stderr, "%s scripts=%llu cap_hit=%s\n", viewer_path ? "phase2-viewer" : (render_path ? "phase2" : (extract ? "phase1" : "phase0")),
             (unsigned long long)engine.scripts_run, engine.cap_hit ? "true" : "false");
     free(serialized);

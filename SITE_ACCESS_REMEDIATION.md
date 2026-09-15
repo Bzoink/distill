@@ -137,7 +137,7 @@ test does not move it. This class needs no access work.
 Ordered by value over cost. Each states what to change, where, and how we would
 know it worked.
 
-### Tier 1 — protocol correctness (addresses F1–F7)
+### Tier 1 — protocol correctness (addresses F1–F7) — **done**
 
 **M1. Send a coherent request.** Add `Accept`, `Accept-Language`,
 `Accept-Encoding` (let libcurl negotiate via `CURLOPT_ACCEPT_ENCODING`),
@@ -183,7 +183,7 @@ Tier 1 is bounded, touches one file, and requires no new dependency. It is
 protocol conformance — the request becoming what it already claims to be — not
 challenge handling.
 
-### Tier 2 — get content without completing hydration
+### Tier 2 — get content without completing hydration — **M4 done, M5 open**
 
 **M4. Structured-data harvester.** Before the hydration path runs, extract
 `application/ld+json`, `__NEXT_DATA__`, `__NUXT__`, and `self.__next_f`
@@ -201,7 +201,7 @@ This is the user reaching their own authorised sessions, and it is what
 `SITE_ACCESS_REPORT.md` already recommends as the correct follow-up. One
 mechanism covers X, Medium's paywall, Reddit, and consent walls.
 
-### Tier 3 — sanctioned sources and good citizenship
+### Tier 3 — sanctioned sources and good citizenship — **open**
 
 **M6. Sanctioned-source resolver.** A small adapter layer tried ahead of the
 DOM path: per-host, check for an RSS/Atom feed, a sitemap, an oEmbed endpoint,
@@ -222,13 +222,28 @@ and after M1–M3 it is no longer needed to paper over a thin request. An honest
 being allowlisted by a site operator. This is a judgement call worth making
 deliberately rather than by default.
 
-### Tier 4 — harness hygiene
+### Tier 4 — harness hygiene — **open**
 
 **M10.** Pin `12-x` and `16-youtube` to concrete public permalinks rather than
 homepages; give the reference Chromium a persistent profile so
 `20-product-hunt` and `25-target` are not blocked on the reference side; and
 report "reference blocked" as a status distinct from "Distill blocked". These
 cost almost nothing and remove four misleading rows.
+
+### Added after the first round
+
+Three items were not in the original plan and came out of scoring it:
+
+- **M11. Module specifier resolution.** Resolve against the importing
+  module's URL, and check HTTP status and content type before compiling.
+  Done; gated by `19-module-graph`.
+- **M12. Challenge classification.** Recognise a challenge shell before its
+  scripts spend the settle budget, and report a distinct exit status. Done;
+  gated by `21-challenge-shell` and, for the false-positive case,
+  `22-challenge-vendor-scripts`.
+- **M13. Protocol version and redirect bound.** `CURLOPT_HTTP_VERSION` and
+  `CURLOPT_MAXREDIRS`, both missed in the Tier 1 pass. Done; the probable
+  cause of Zillow becoming reachable.
 
 ## Part 4 — Measures we are not proposing
 
@@ -247,28 +262,66 @@ omission. M9 arguably reduces deception further. None of them attempt to defeat
 a challenge, and Class B sites stay blocked under every measure here — which is
 the correct outcome.
 
-## Part 5 — Verification plan
+## Part 5 — Verification results
 
-After Tier 1, re-run the full ladder and compare against the current baseline:
+Tier 1 landed in `c25b538`. The predictions this document made have now been
+scored, and a second round of fixes followed from what they showed.
+
+| Prediction | Measure | Outcome |
+| --- | --- | --- |
+| IMDb's 403 is request-shape, not policy | M1 | **Partly confirmed.** IMDb no longer returns 403; it returns 202 with an AWS WAF challenge. The request shape was a real defect, and a challenge sits behind it |
+| The Stack Overflow interstitial is cookie loss | M3 | **Falsified.** Cookies round-trip and the Cloudflare interstitial still appears. It is a policy result, not a defect |
+| Airbnb's missing content request is header loss | M2 | **Falsified.** Headers and bodies now cross the bridge and no listing request is made. The architectural diagnosis in `SITE_ACCESS_REPORT.md` is confirmed, and Airbnb is out of scope on evidence rather than on suspicion |
+| The `dn.se` consent wall is cookie loss | M3 | Not yet retested |
+
+One prediction was not on the list and turned out to matter more than any of
+them: **Zillow now returns content** (real title, 1448 characters, 271 links)
+where both clients previously received an access-denied page. The probable
+cause is protocol-version negotiation, added in the second round below.
+
+### Second round: defects found while scoring the first
+
+Reading the module path during this work exposed a resolution bug rather than
+a missing capability.
+
+| Fix | Finding | Evidence |
+| --- | --- | --- |
+| Module base URL | `module_normalize` discarded `base_name` and resolved every specifier against the page URL. A bundle at `/assets/app.js` importing `./chunk.js` reached `/chunk.js` | The local fixture reproduces the exact JSFiddle symptom on the pre-fix engine: `SyntaxError: unexpected token in expression: '<' at /chunk.js` |
+| Module diagnostics | `module_loader` captured the HTTP status and never read it, so an HTML error page was compiled as JavaScript | Status and content are now checked and reported by name |
+| `nomodule` | Pages shipping a module bundle and a fallback executed both | Gate `19-module-graph` asserts the fallback does not run |
+| JSON-LD | Script discovery located every JSON block and freed it | Gate `20-structured-data` asserts the record survives a page that never hydrates |
+| Protocol version | No `CURLOPT_HTTP_VERSION`; HTTP/1.1 while advertising Chrome | Zillow and IMDb both changed behaviour |
+| Redirect bound | `FOLLOWLOCATION` with no `MAXREDIRS` | Bounded at 20 |
+| Challenge classification | Challenge shells spent the whole settle budget before reporting nothing | Gate `21-challenge-shell` runs in 0.0s where the shell's own script would have burned 60s |
+
+### The false positive this produced, and the guard against it
+
+The first challenge detector used vendor names as markers. Checked against
+pages that actually serve content, two were wrong: `datadome` matched Airbnb
+and `/cdn-cgi/challenge-platform` matched Product Hunt, both of which serve
+full pages while naming those vendors. Misclassifying them skipped the scripts
+of working pages.
+
+The detector now uses only strings unique to an interstitial, and carries a
+size guard as a second line of defence. Gate `22-challenge-vendor-scripts`
+locks this in with a small page that names both vendors and must still run its
+scripts — small on purpose, so only the choice of markers can save it.
+
+### Current live classification
+
+Six targets classify mechanically as challenges (`exit 4`): Reddit, Target,
+IMDb, Stack Overflow, Medium, CodePen. Ten content pages — Airbnb, Product
+Hunt, GitHub, Wikipedia, Hacker News, DEV, React, Cloudflare, Three.js,
+W3Schools — are unaffected, with Three.js still reporting its 608 links.
+
+Reproduce with:
 
 ```sh
 cmake --build build -j2
 python3 corpus/check.py
-python3 tools/compare_sites.py --id 23-imdb --id 10-stack-overflow --id 13-airbnb
+python3 corpus/check.py --extract
+ctest --test-dir build
 ```
-
-The specific predictions to score, so this document can be proved wrong:
-
-| Prediction | Measure | Falsified if |
-| --- | --- | --- |
-| IMDb's 403 is request-shape, not policy | M1 | Still 403 with conformant headers |
-| The Stack Overflow interstitial is cookie loss | M3 | Still interstitial with a working jar |
-| Airbnb's missing content request is header loss | M2 | No listing request after headers forward |
-| The `dn.se` consent wall is cookie loss | M3 | Body still absent after consent cookie persists |
-
-A measure that does not move its target is still useful: it converts a
-hypothesis into a confirmed scope boundary, which is what the previous report
-did well for Airbnb and should keep doing.
 
 ## Open questions
 

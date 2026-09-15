@@ -166,8 +166,8 @@ The original 25-site comparison has been completed:
 | CodePen Trending (`19-codepen-trending`) | antibot | Chromium and Distill both receive CodePen/Cloudflare's `Performing security verification` page, which reports the browser is not supported |
 | Product Hunt (`20-product-hunt`) | antibot | Chromium receives Product Hunt's Cloudflare verification page while Distill reaches the site content; the reference is blocked, so this is not a valid content comparison |
 | Cloudflare (`21-cloudflare`) | checked and working | Same substantive public homepage information with high Distill fidelity; navigation, cookie UI, and decorative marketing structure are reduced, and non-content custom-element/video errors do not prevent extraction |
-| Zillow (`22-zillow`) | antibot | Chromium and Distill both receive Zillow's `Access to this page has been denied` page with a human-verification prompt |
-| IMDb (`23-imdb`) | antibot | Chromium and Distill both receive `403 Forbidden` and no usable IMDb content |
+| Zillow (`22-zillow`) | checked and working (was `antibot`) | After the network remediation Distill reaches Zillow content — real title, 1448 characters, and 271 links — where both clients previously received `Access to this page has been denied`. Zillow still serves the PerimeterX block page to some requests, which Distill now classifies rather than extracting as empty |
+| IMDb (`23-imdb`) | antibot | The flat `403 Forbidden` is gone: IMDb now answers `202` with an AWS WAF challenge. The request shape was a real defect and is fixed; the challenge behind it is not ours to solve, and is now classified as `aws-waf` |
 | Bloomberg (`24-bloomberg`) | antibot | Chromium and Distill both receive Bloomberg's unusual-activity robot check; matching text is only the shared protection page |
 | Target (`25-target`) | antibot | Chromium receives the Target homepage, while Distill receives Target's `Pardon the interruption` bot-mitigation page; this is not a content extraction mismatch |
 
@@ -206,7 +206,7 @@ with evidence rather than treating them as extraction failures.
 | Hacker News Newest (`28-hacker-news-newest`) | checked and working | Same newest-story feed information with 100% reference vocabulary coverage and identical links, images, and form; extra reader terms reduce reverse fidelity but do not remove feed content |
 | DEV Community Feed (`29-devto-infinite-feed`) | checked and working | Same hydrated feed cards, titles, descriptions, links, and images; reader extraction omits surrounding UI and formats one date as an ISO timestamp rather than Chromium's short date |
 | CodePen (`30-codepen-embed`) | antibot | Chromium and Distill both receive CodePen's Cloudflare security-verification page; Distill also reports that its browser is unsupported, so no landing-page or iframe content is available |
-| JSFiddle (`31-jsfiddle`) | out of scope — deferred | Chromium loads the editor UI, but Distill remains at the SSR title shell: the main editor module fails with `unexpected token '<'`, supporting code reports missing `DOMParser`, and the intended preview/editor behavior requires isolated cross-origin frames |
+| JSFiddle (`31-jsfiddle`) | antibot | The `unexpected token '<'` was our own defect, not JSFiddle's: module specifiers resolved against the page URL instead of the importing module's, so every nested import fetched the site's HTML fallback. That is fixed and covered by gate `19-module-graph`. JSFiddle itself now returns a Cloudflare challenge, so the editor/iframe scope question is untested rather than settled; `DOMParser` and multi-frame semantics remain genuinely absent |
 | Three.js Examples (`32-threejs-examples`) | checked and working | Reader now preserves the example index as links when an inline viewer iframe selects the embed path; refreshed comparison has 100% vocabulary coverage/fidelity, all 15 headings, and 608 links/images, while WebGL pixels remain outside text extraction |
 | Chart.js (`33-chartjs-gallery`) | checked and working | Same chart-library overview, headings, and links; 100% reference vocabulary coverage with identical links and images, while canvas-rendered chart pixels are intentionally not extracted |
 | HTML5 Test (`34-html5-test`) | out of scope — deferred | The page and detailed table load, but its central feature-detection score differs substantially: Chromium reports 521/555 while Distill reports 113/555; matching that diagnostic requires a much broader browser API surface, not a focused malformed-HTML parser fix |
@@ -221,6 +221,50 @@ extractors.
 
 Across all 34 entries, 18 are checked and working, 11 are marked `antibot`,
 and 5 are marked `out of scope — deferred`. No entry remains pending.
+
+### Revisions after the module and classification work
+
+Three rows above changed, and the direction of the changes is worth stating
+plainly: one site moved out of `antibot` because our client improved, one
+stayed `antibot` for a different reason than we recorded, and one was never an
+anti-bot problem at all in the way we described.
+
+- **Zillow** moved to `checked and working`. The likely cause is protocol
+  version negotiation: the client advertised Chrome while speaking HTTP/1.1.
+- **IMDb** stays `antibot`, but the recorded `403 Forbidden` was partly our
+  own request shape. It now answers `202` with an AWS WAF challenge.
+- **JSFiddle** moved from `out of scope — deferred` to `antibot`. Its
+  `unexpected token '<'` was a Distill bug — module specifiers resolved
+  against the page rather than the importing module — and the deferral
+  reasoning built on that symptom was therefore built on our own defect. The
+  site now serves a Cloudflare challenge, so its editor and cross-origin frame
+  requirements are untested rather than disproven.
+
+The last of these is the one to learn from. A symptom that looks like a site's
+complexity can be our own bug, and a scope boundary inferred from such a
+symptom is not yet evidence. The counterpart holds too: Airbnb's deferral was
+re-tested against the same suspicion and survived it.
+
+### Exit status and mechanical classification
+
+Distill reports a recognised bot challenge with status `4`, distinct from `0`
+for a content run and from any other status for a capture failure. The
+comparison harness records that as `challenge` rather than `error`, and
+`--strict` does not fail on it: a challenge is an access result we recorded,
+not a capture that broke.
+
+The classification happens twice — against the served HTML before any script
+runs, and against the settled DOM afterwards. The first is what saves the
+settle budget, since a challenge shell would otherwise spend all of it. The
+second catches challenges that write their message from script, as Reddit and
+Target do; by then the budget is gone, but the run is still classified
+correctly instead of being reported as an unexplained empty extraction.
+
+Six entries currently classify this way: Medium, Stack Overflow, Reddit,
+CodePen, IMDb, and Target, with Zillow and JSFiddle doing so intermittently.
+Marker choice is deliberately conservative — see `22-challenge-vendor-scripts`
+in [`corpus/README.md`](corpus/README.md) for why naming a vendor is not
+evidence.
 
 ### Airbnb deferral rationale
 
