@@ -11,16 +11,26 @@ Arm B′ is decided on corpus pass rate. Until this exists, Phase 0 cannot start
 
 ```sh
 ./check.py                    # all gates, engine expectations
+./check.py --extract          # Phase 1 extraction and golden-output gates
+./check.py --bundles          # recorded saved-bundle smoke checks, never gates
 ./check.py --baseline         # validate the fixtures against a real browser
 ./check.py --id 07-churn      # one page
 ./check.py --keep-dom /tmp/d  # save each dumped DOM for inspection
 ./check.py --live             # also list the live rungs
 ```
 
-`check.py` starts `serve.py` itself, drives headless Chromium, and exits non-zero
-if any gate fails — so Phase 0's "done when" is a CI condition, not a judgement
-call. `serve.py` can also be run alone (`./serve.py -p 8731`) to poke at a fixture
-by hand.
+`check.py` starts `serve.py` itself. The default mode drives the selected C23
+headless engine and exits non-zero if any Phase 0 gate fails; `--extract` drives
+the C23 Arm A extractor and checks the Phase 1 assertions and golden contracts.
+These are CI conditions, not judgement calls. `serve.py` can also be run alone
+(`./serve.py -p 8731`) to poke at a fixture by hand.
+
+`--extract` emits a versioned JSON contract containing the final URL and base
+URL, shape/confidence, selected extractor, Readability metadata/content, block
+text, tables, search results, forms, video metadata, media references, links,
+and rejected URI counts. Its stable field checks live in
+[`golden/`](golden/); the combined saved-page bundle under `local/bundles/` is
+recorded for breadth and is never a gate.
 
 **Validate with `--baseline` before trusting a failure.** A fixture bug and a
 binding bug look identical, and these fixtures are written to be hard. As of the
@@ -57,6 +67,14 @@ exists to test.
 | `07-churn` | DOM churn, node identity, detached nodes, `MutationObserver` | Arm A: node lifetime |
 | `08-messy` | Undeclared encoding, `<base href>`, hostile schemes, dynamic `import()` | Step 4c |
 | `08b-charset-lie` | An open decision, recorded not settled. Not a gate | Step 4c |
+| `09-article` | Post-JS article extraction through Readability | Phase 1 extraction breadth |
+| `10-docs` | Headings, code blocks, structured-text fallback | Phase 1 extraction breadth |
+| `11-table` | Caption, headers, and cell data | Phase 1 extraction breadth |
+| `12-search` | Repeated result records and mail links | Phase 1 extraction breadth |
+| `13-form` | Action, method, labels, and hidden fields | Phase 1 extraction breadth |
+| `14-video` | Embed and OpenGraph video metadata | Phase 1 extraction breadth |
+| `15-gallery` | Decorative/content image classification | Phase 1 extraction breadth |
+| `16-redirect` | Effective URL after redirect and base resolution | Phase 1 extraction breadth |
 
 `00` is the control: it has no scripts, so a failure there is never a binding
 bug. `07` is where a raw-pointer binding over Lexbor's arena-allocated nodes

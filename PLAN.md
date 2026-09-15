@@ -1,9 +1,9 @@
 # Distill
 
-*A small, C-rooted stack that runs a page's real JavaScript against a real DOM, pulls out what actually matters, and renders it back — clearly, consistently, on our own terms.*
+*A small, C23-rooted stack that runs a page's real JavaScript against a real DOM, pulls out what actually matters, and renders it back — clearly, consistently, on our own terms.*
 
-**Status:** Phase 0 complete — Arm A selected; Phase 1 not started
-**Drafted:** 2026-09-14 · **Revised:** 2026-09-14 (second review pass)
+**Status:** Phase 1 complete — Phase 2 not started
+**Drafted:** 2026-09-14 · **Revised:** 2026-09-15 (Phase 1 implementation)
 **Origin:** NetSurf JS/rendering gap analysis (see `../netsurf`)
 **Rendered version:** https://claude.ai/code/artifact/fcbd8e5f-f6dc-4abd-a2a4-e7282070cf4a *(predates this revision)*
 
@@ -30,9 +30,9 @@ Scope cuts made up front, so effort doesn't quietly drift toward rebuilding a ge
 
 Decisions already made, recorded so they stop being re-litigated. Where the reasoning was wrong the first time, the corrected reasoning is recorded too — recording a bad reason is how a settled decision comes back.
 
-**A full browser engine (WebKitGTK/CEF) with Readability injected — rejected.** It would delete steps 1–3 of the pipeline wholesale, for roughly an order of magnitude less code, and on a desktop-only project it would be the obviously correct call. It is rejected because the small C stack *is* the project: the NetSurf lineage, modest target hardware, and the framebuffer target (Phase 5) all presuppose it. Embedding WebKit contradicts the premise rather than serving it. This is a settled constraint, not an open trade-off — which is precisely what justifies the bespoke work in the DOM↔JS layer below. Nothing else in this plan would justify it.
+**A full browser engine (WebKitGTK/CEF) with Readability injected — rejected.** It would delete steps 1–3 of the pipeline wholesale, for roughly an order of magnitude less code, and on a desktop-only project it would be the obviously correct call. It is rejected because the small C23 stack *is* the project: the NetSurf lineage, modest target hardware, and the framebuffer target (Phase 5) all presuppose it. Embedding WebKit contradicts the premise rather than serving it. This is a settled constraint, not an open trade-off — which is precisely what justifies the bespoke work in the DOM↔JS layer below. Nothing else in this plan would justify it.
 
-**Bespoke C bindings as a foregone conclusion — deferred, not adopted.** The binding layer is the largest unscoped item here, and there is a real alternative (a JS-side DOM running inside the engine) that could delete most of it. Phase 0 runs both as an A/B before either is committed to. Recorded here so the alternative isn't quietly forgotten once C work starts. See also the [structural question](#the-structural-question-does-this-stay-a-c-project) that A/B actually decides.
+**Bespoke C bindings as a foregone conclusion — deferred, not adopted.** The binding layer is the largest unscoped item here, and there is a real alternative (a JS-side DOM running inside the engine) that could delete most of it. Phase 0 runs both as an A/B before either is committed to. Recorded here so the alternative isn't quietly forgotten once C work starts. See also the [language boundary](#the-language-boundary-does-this-stay-a-c23-project) that A/B actually decides.
 
 **libuv — cut.** We don't need a general event loop. We need a microtask drain, a timer queue, and socket polling for `curl_multi` — that's `poll()` and a few hundred lines. libuv costs roughly a megabyte and imposes pthreads for work we don't do. (An earlier draft claimed quickjs-ng's runtime depends on libuv; that's the `qjs` CLI's os/timer module, not the engine core. The engine has no such dependency.)
 
@@ -62,7 +62,7 @@ These are also tiebreakers in the Phase 0 A/B: an arm that can't meet them isn't
 
 ## The stack
 
-Every layer is an existing, small project — C, except litehtml (C++) — other than the rows marked bespoke, which are the actual work.
+Every layer is an existing, small project — C23, except litehtml (C++) — other than the rows marked bespoke, which are the actual work. The C++ boundary is intentionally narrow: litehtml's adapter is the only production C++ component; the application, extraction pipeline, bridges, and paint backends are C23.
 
 | Layer | Component | Status | Role |
 |---|---|---|---|
@@ -78,11 +78,13 @@ Every layer is an existing, small project — C, except litehtml (C++) — other
 | Text shaping & breaking | HarfBuzz + FreeType + libunibreak, behind our own run shaper | **new, scoped small** | See [Typography](#typography--themes) |
 | Paint | backend interface | **new, small** | Cairo on desktop; direct ARGB32 blitter on framebuffer; no raster path at all on TUI |
 
-### The structural question: does this stay a C project?
+### The language boundary: does this stay a C23 project?
 
-The Phase 0 A/B is usually described as choosing a binding shape. It isn't only that. If the JS-side-DOM arm wins, Lexbor has no remaining job — **litehtml parses HTML itself** (`document::createFromString`), so it can consume the serialized extraction output directly, and the C-side parser disappears from the stack. What's left is QuickJS + a JS DOM + litehtml + libcurl, with the only C written being the bridge, the shaper, and the shell.
+The Phase 0 A/B is usually described as choosing a binding shape. It isn't only that. If the JS-side-DOM arm wins, Lexbor has no remaining job — **litehtml parses HTML itself** (`document::createFromString`), so it can consume the serialized extraction output directly, and the C-side parser disappears from the stack. What's left is QuickJS + a JS DOM + litehtml + libcurl, with the only C23 written being the bridge, the shaper, and the shell.
 
 That may well be the right answer for "small and easy." But it is a different project from the one the tagline describes, and it should be chosen deliberately rather than arrived at in month four. Phase 0 therefore measures a **third, no-Lexbor baseline** explicitly, so the question asked is "does Lexbor earn its place," not merely "which binding shape wins."
+
+The implementation language is now explicit: bespoke production code is C23. litehtml stays because it is the selected box-layout engine, and its C++ adapter is an intentional exception at the rendering boundary. The Phase 0/1 application and extraction code has been ported to C23; the adapter exposes a C ABI so the C23 core never depends on C++ types.
 
 One thing that leaves with Lexbor, and is easy to forget: **character-encoding detection.** Real pages routinely declare the wrong charset or none at all. Whoever replaces Lexbor inherits that job.
 
@@ -221,7 +223,7 @@ Paint sits behind one interface, and the implementations behind it are decided n
 - **Framebuffer:** our own ARGB32 blitter straight to the mmap'd surface — roughly 300 lines, and it keeps Cairo and pixman out of the minimal build entirely.
 - **TUI:** no raster path at all for the common case — layout only, emitted as escapes.
 
-Note what this doesn't solve: **libstdc++ stays as long as litehtml does.** If some future target can't take C++, litehtml is the blocker, not the paint layer.
+Note what this doesn't solve: **libstdc++ stays as long as litehtml does.** If some future target can't take C++, litehtml is the blocker, not the paint layer. That dependency is isolated behind the C ABI adapter; the rest of the application remains C23.
 
 ## Media presentation
 
@@ -310,7 +312,9 @@ NetSurf's libdom and `dukky` (both MIT) are prior art for exactly these question
 
 **Done when:** one arm passes the corpus assertions, meets both budgets, and has been chosen on recorded evidence — with the structural question answered explicitly rather than implied. Keep the losing arms' notes.
 
-**Phase 0 result (2026-09-14):** Arm A and the JS-side Arm B both pass all local `dom` gates, including the deliberate settle, geometry, and encoding divergences. Arm B′ is built as the no-Lexbor configuration and parses Arm B's serialized output through litehtml; it also passes the corpus. Arm A is selected for the next phase because it is the lower-RSS implementation (14.4 MiB sampled versus 15.0 MiB for Arm B), keeps the binding boundary in the planned C-rooted stack, and exposes geometry calls in the default telemetry stream. Both stay below the 150 MiB RSS, 3 s typical-page, 5 s cap, and 8 MiB shared-library budgets; the measured Arm A shared set is 5.18 MiB (QuickJS-ng + Lexbor). Arm B and Arm B′ remain in-tree as comparison targets (`distill-arm-b` and `distill-arm-b-pruned`). The structural question therefore stays answered in favour of a C project: Lexbor earns its place for direct DOM ownership, encoding detection, and the lower-memory native path. Detailed evidence is in [`PHASE0.md`](PHASE0.md).
+**Phase 0 result (2026-09-14):** Arm A and the JS-side Arm B both pass all local `dom` gates, including the deliberate settle, geometry, and encoding divergences. Arm B′ is built as the no-Lexbor configuration and parses Arm B's serialized output through litehtml; it also passes the corpus. Arm A is selected for the next phase because it is the lower-RSS implementation (14.4 MiB sampled versus 15.0 MiB for Arm B), keeps the binding boundary in the planned C23-rooted stack, and exposes geometry calls in the default telemetry stream. Both stay below the 150 MiB RSS, 3 s typical-page, 5 s cap, and 8 MiB shared-library budgets; the measured Arm A shared set is 5.18 MiB (QuickJS-ng + Lexbor). Arm B and Arm B′ remain in-tree as comparison targets (`distill-arm-b` and `distill-arm-b-pruned`). The language decision is C23 for the production core, with litehtml's C++ adapter as the deliberate exception. Lexbor earns its place for direct DOM ownership, encoding detection, and the lower-memory native path. Detailed evidence is in [`PHASE0.md`](PHASE0.md).
+
+**C23 port result (2026-09-15):** The application and extraction pipeline now build as C23. The headless runtime uses the linkedom-compatible DOM surface, while Lexbor remains the native parser used by extraction; this preserves the settled DOM and extraction contract without leaving C++ in the application. litehtml remains isolated behind the C ABI adapter in the no-Lexbor comparison target. The historical Phase 0 measurements above are retained as recorded evidence and are not claimed as measurements of the new C23 build.
 
 ### Phase 1 — Extraction breadth
 *Still headless*
@@ -326,6 +330,21 @@ NetSurf's libdom and `dukky` (both MIT) are prior art for exactly these question
 6. **Fill `corpus/local/bundles/`** with saved real pages — breadth, recorded and never gated, per the two-kinds-of-fixture split.
 
 **Done when:** reasonable output exists for at least one article, one docs page, one table-heavy page, one search-results page, one video-embedding page, one form, and one image-heavy page with a plausible decorative/content split — all from the corpus, so the results are re-runnable.
+
+**Phase 1 result (2026-09-15):** The selected Arm A now exposes a post-settle
+extraction command (`--extract`) with a dispatch skeleton, confidence-scored page
+shape classification, and stable JSON output. Step 4c is implemented first:
+libcurl's effective URL is retained across redirects, `<base href>` is honored,
+relative references are resolved against that final base, and extracted URIs are
+sanitized to `http`, `https`, `mailto`, and `tel` before they enter reader data.
+Readability 0.6.0 runs unmodified against a normalized snapshot of the settled
+Lexbor DOM; the native tree is also walked for the structured-text fallback,
+tables, search results, forms (including hidden fields), video metadata, and
+decorative/content media references. The new fixtures `09` through `16` pass
+all extract-stage assertions, golden contracts, and the redirect check. The
+original Phase 0 DOM gates remain independently green. Phase 2 can now consume
+the JSON extraction contract; realistic saved-page bundles remain recorded
+fixtures and never become gates.
 
 ### Phase 2 — Reader rendering
 *First visual output*
@@ -417,7 +436,7 @@ FreeType's dual license needs the FTL election recorded explicitly, since the al
 ## Open risks
 
 - **[unknown effort]** The DOM↔JS layer is still the largest item. It is no longer unmeasured: Phase 0's A/B, DOM-level assertions, and telemetry size it before Phase 1 or 2 is committed to.
-- **[structural]** If Arm B or B′ wins, this stops being a C-rooted stack in any meaningful sense. That's a legitimate outcome, but it changes what the project *is* — it needs to be chosen out loud, not absorbed silently.
+- **[structural]** If Arm B or B′ wins, this stops being a C23-rooted stack in any meaningful sense. That's a legitimate outcome, but it changes what the project *is* — it needs to be chosen out loud, not absorbed silently.
 - **[unproven]** The layout fiction is a working hypothesis. Pages that branch on measured geometry will misbehave in ways that look like content bugs; telemetry flags geometry calls so the failure mode stays visible, but we don't know how common it is.
 - **[unproven]** Lexbor's CSS cascade may not be deep enough for the `display`/`visibility` resolver. Spiked in Phase 0; the inline-style fallback is the contingency, and the failure mode — nav and footers leaking into output — is already known.
 - **[unproven]** Readability.js is tuned for article-shaped content; its behavior on docs, tables, and search results is a genuine open question — Phase 1 tests it directly.

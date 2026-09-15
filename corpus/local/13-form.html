@@ -1,0 +1,12 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>Search the archive</title>
+<main>
+  <h1>Search the archive</h1>
+  <form class="search-form" method="get" action="/search">
+    <label for="query">Query</label>
+    <input id="query" name="q" type="search" value="reader">
+    <input name="token" type="hidden" value="CSRF-PASSTHROUGH">
+    <button type="submit" name="go" value="Search">Search</button>
+  </form>
+</main>

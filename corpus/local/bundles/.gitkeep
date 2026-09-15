@@ -1,4 +1,3 @@
-Realistic saved pages land here in Phase 1: whole SPA bundles that test breadth
-and the interaction between features. They are recorded, never gated -- a failure
-in a saved bundle names no cause. The gates are the isolating fixtures one level
-up. See ../../README.md, "Two kinds of local fixture".
+Realistic saved-page bundles live here as recorded, never-gated breadth checks.
+The isolating fixtures one level up remain the phase gates; a bundle failure
+names no single cause. See ../../README.md, "Two kinds of local fixture".

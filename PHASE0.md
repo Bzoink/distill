@@ -4,8 +4,8 @@ Date: 2026-09-14
 
 Phase 0 is a headless proof of concept. It has no UI or renderer. The build now contains three runnable comparison targets:
 
-- `build/distill` — Arm A, QuickJS-ng with bespoke C++ bindings over Lexbor.
-- `build/distill-arm-b` — Arm B, QuickJS-ng with the self-contained linkedom JS-side DOM and only host bridges in C++.
+- `build/distill` — the C23 application target, QuickJS-ng with the linkedom-compatible host surface and Lexbor extraction.
+- `build/distill-arm-b` — Arm B, QuickJS-ng with the self-contained linkedom JS-side DOM and current host bridges.
 - `build/distill-arm-b-pruned` — Arm B′, the no-Lexbor configuration. It runs the same linkedom arm, serializes the result, and feeds that serialized HTML through litehtml. `ldd` shows QuickJS-ng and libcurl, with no Lexbor; litehtml is statically linked.
 
 ## Reproduction
@@ -37,4 +37,8 @@ Arm A's telemetry is enabled by default on stderr and through `--telemetry FILE`
 
 ## Decision
 
-Select Arm A for Phase 1. Arm B is smaller in bespoke host code and has the smallest shared footprint, but Arm A has the lower measured RSS, direct native DOM ownership, and the encoding/style behavior that is load-bearing for extraction. This resolves the structural question in favour of retaining Lexbor and the C-rooted architecture. Arm B and B′ remain useful regression and architecture-comparison targets rather than being discarded.
+Select Arm A for Phase 1. The production implementation is now C23. litehtml remains the deliberate C++ exception at the future rendering boundary, isolated behind a C ABI probe. Arm B and B′ remain useful regression and architecture-comparison targets rather than being discarded.
+
+## C23 port note
+
+The 2026-09-15 port moved the application and extraction pipeline from C++ to C23. The C23 headless runtime uses the linkedom-compatible JavaScript DOM surface and retains Lexbor for native extraction; the historical Arm A measurements above describe the earlier native-binding proof of concept and have not been re-benchmarked. The corpus behavior remains green, while litehtml is still exercised through the isolated C++ adapter in Arm B′.

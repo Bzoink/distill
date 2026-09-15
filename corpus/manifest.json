@@ -348,7 +348,11 @@
             "javascript:",
             "XSS-LEAKED"
           ]
-        }
+        },
+        {"stage": "extract", "path": "links", "expect": "/deep/other/page.html"},
+        {"stage": "extract", "path": "links", "expect": "mailto:red@example.org"},
+        {"stage": "extract", "path": "forms", "expect": "/deep/section/find"},
+        {"stage": "extract", "path": "media", "expect": "/deep/section/images/photo.jpg"}
       ]
     },
     {
@@ -367,6 +371,118 @@
           "expect": "LIE-BODY-OK"
         }
       ]
+    },
+    {
+      "id": "09-article",
+      "path": "09-article.html",
+      "gate": true,
+      "plan_section": "Phase 1 extraction breadth, article",
+      "exercises": ["post-JS-article", "readability", "structured-text"],
+      "why": "Article-shaped content is the primary Readability path and includes a post-load paragraph.",
+      "golden": "golden/09-article.json",
+      "assertions": [
+        {"stage": "extract", "path": "shape.kind", "expect": "article"},
+        {"stage": "extract", "path": "extractor", "expect": "readability"},
+        {"stage": "extract", "path": "readability.textContent", "expect": "added after the page loaded"}
+      ]
+    },
+    {
+      "id": "10-docs",
+      "path": "10-docs.html",
+      "gate": true,
+      "plan_section": "Phase 1 extraction breadth, docs",
+      "exercises": ["headings", "code-blocks", "structured-text-fallback"],
+      "why": "Documentation needs headings and code blocks preserved as structure, not scored as article prose.",
+      "golden": "golden/10-docs.json",
+      "assertions": [
+        {"stage": "extract", "path": "shape.kind", "expect": "docs"},
+        {"stage": "extract", "path": "extractor", "expect": "structured-text"},
+        {"stage": "extract", "path": "blocks", "expect": "const response = await fetch"}
+      ]
+    },
+    {
+      "id": "11-table",
+      "path": "11-table.html",
+      "gate": true,
+      "plan_section": "Phase 1 extraction breadth, table",
+      "exercises": ["caption", "header-row", "table-cells"],
+      "why": "Tables must be read as data before Readability can mistake them for layout.",
+      "golden": "golden/11-table.json",
+      "assertions": [
+        {"stage": "extract", "path": "shape.kind", "expect": "table"},
+        {"stage": "extract", "path": "tables", "expect": "Phase 1 extraction measurements"},
+        {"stage": "extract", "path": "tables", "expect": "14.4 MiB"}
+      ]
+    },
+    {
+      "id": "12-search",
+      "path": "12-search.html",
+      "gate": true,
+      "plan_section": "Phase 1 extraction breadth, search results",
+      "exercises": ["repeated-results", "link-resolution", "mailto-link"],
+      "why": "Repeated result records should not be flattened into an article or lose their actions.",
+      "golden": "golden/12-search.json",
+      "assertions": [
+        {"stage": "extract", "path": "shape.kind", "expect": "search-results"},
+        {"stage": "extract", "path": "search_results", "expect": "DOM ownership in a small reader"},
+        {"stage": "extract", "path": "search_results[2].url", "expect": "mailto:editor@example.org"}
+      ]
+    },
+    {
+      "id": "13-form",
+      "path": "13-form.html",
+      "gate": true,
+      "plan_section": "Phase 1 extraction breadth, form",
+      "exercises": ["method", "action", "labels", "hidden-inputs"],
+      "why": "Native form controls are extracted as data so the later reader can re-render them functionally.",
+      "golden": "golden/13-form.json",
+      "assertions": [
+        {"stage": "extract", "path": "shape.kind", "expect": "form"},
+        {"stage": "extract", "path": "forms[0].action", "expect": "/search"},
+        {"stage": "extract", "path": "forms[0].fields", "expect": "CSRF-PASSTHROUGH"}
+      ]
+    },
+    {
+      "id": "14-video",
+      "path": "14-video.html",
+      "gate": true,
+      "plan_section": "Phase 1 extraction breadth, video metadata",
+      "exercises": ["iframe", "og-video", "poster"],
+      "why": "Video is represented as metadata and a hand-off URL; the reader does not become a media engine.",
+      "golden": "golden/14-video.json",
+      "assertions": [
+        {"stage": "extract", "path": "shape.kind", "expect": "video"},
+        {"stage": "extract", "path": "videos[0].url", "expect": "youtube.com/embed/distill-demo"},
+        {"stage": "extract", "path": "videos[0].title", "expect": "A short history of the reader"}
+      ]
+    },
+    {
+      "id": "15-gallery",
+      "path": "15-gallery.html",
+      "gate": true,
+      "plan_section": "Phase 1 extraction breadth, media references",
+      "exercises": ["content-images", "decorative-images", "captions"],
+      "why": "Image-heavy pages need a plausible decorative/content split and safe URLs without decoding media.",
+      "golden": "golden/15-gallery.json",
+      "assertions": [
+        {"stage": "extract", "path": "shape.kind", "expect": "image-heavy"},
+        {"stage": "extract", "path": "media", "expect": "content"},
+        {"stage": "extract", "path": "media", "expect": "decorative"}
+      ]
+    },
+    {
+      "id": "16-redirect",
+      "path": "redirect?to=09-article.html",
+      "gate": true,
+      "plan_section": "Phase 1 extraction breadth, final URL resolution",
+      "exercises": ["redirect", "effective-url", "base-url"],
+      "why": "Relative references must resolve against the final URL after an HTTP redirect.",
+      "assertions": [
+        {"stage": "extract", "path": "base_url", "expect": "/09-article.html"},
+        {"stage": "extract", "path": "shape.kind", "expect": "article"},
+        {"stage": "extract", "path": "readability.title", "expect": "A careful reader"}
+      ],
+      "golden": "golden/16-redirect.json"
     }
   ],
   "live": [

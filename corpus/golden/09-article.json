@@ -1,0 +1,8 @@
+{
+  "checks": [
+    {"path": "shape.kind", "contains": "article"},
+    {"path": "extractor", "contains": "readability"},
+    {"path": "readability.title", "contains": "A careful reader"},
+    {"path": "readability.textContent", "contains": "added after the page loaded"}
+  ]
+}

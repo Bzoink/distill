@@ -6,6 +6,7 @@ Starts serve.py, drives the Phase 0 engine over each page, and checks the
 --baseline to validate the fixtures against a reference browser instead.
 
     ./check.py                 all local gates
+    ./check.py --extract       Phase 1 extraction and golden gates
     ./check.py --id 03-settle  one page
     ./check.py --live          also record the live rungs (never gates)
     ./check.py --keep-dom DIR  save each dumped DOM for inspection
@@ -160,6 +161,21 @@ def dump_engine(engine, url, cap_ms, timeout_s):
     return r.stdout, None
 
 
+def dump_extract(engine, url, cap_ms, timeout_s):
+    """Structured extraction JSON for a URL, or (None, reason)."""
+    cmd = [engine, "--url", url, "--extract", "--script-cap-ms", str(cap_ms)]
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout_s)
+    except subprocess.TimeoutExpired:
+        return None, f"extractor timed out after {timeout_s}s"
+    if r.returncode != 0:
+        return None, f"extractor exit {r.returncode}: {r.stderr.strip()[:300]}"
+    try:
+        return json.loads(r.stdout), None
+    except json.JSONDecodeError as exc:
+        return None, f"extractor returned invalid JSON: {exc}"
+
+
 def dump_arm_b(engine, url, cap_ms, timeout_s):
     """Post-JS DOM from the JS-side-DOM comparison arm."""
     cmd = [engine, "--url", url, "--dump-dom", "--script-cap-ms", str(cap_ms)]
@@ -174,12 +190,70 @@ def dump_arm_b(engine, url, cap_ms, timeout_s):
     return r.stdout, None
 
 
-def check_page(page, html, baseline=False):
-    """(results, n_failed) for one page's dom-stage assertions."""
+def json_path(value, path):
+    """Read a small dotted JSON path, with optional numeric array indexes."""
+    current = value
+    for part in path.split(".") if path else []:
+        while part.endswith("]") and "[" in part:
+            name, index = part.rsplit("[", 1)
+            index = index[:-1]
+            if name:
+                if not isinstance(current, dict) or name not in current:
+                    return None, False
+                current = current[name]
+            try:
+                current = current[int(index)]
+            except (IndexError, TypeError, ValueError):
+                return None, False
+            part = ""
+        if part:
+            if not isinstance(current, dict) or part not in current:
+                return None, False
+            current = current[part]
+    return current, True
+
+
+def extraction_text(extraction, path=None):
+    value, found = json_path(extraction, path) if path else (extraction, True)
+    if not found:
+        return None, False
+    if isinstance(value, str):
+        return value, True
+    return json.dumps(value, ensure_ascii=False, sort_keys=True), True
+
+
+def check_page(page, html=None, baseline=False, extraction=None):
+    """(results, n_failed) for DOM or extraction assertions."""
     results, failed = [], 0
     for a in page["assertions"]:
-        if a.get("stage") != "dom":
-            results.append(("pending", "extract-stage, Phase 1", ""))
+        stage = a.get("stage")
+        if stage == "extract":
+            if extraction is None:
+                results.append(("pending", "extract-stage, use --extract", ""))
+                continue
+            text, found = extraction_text(extraction, a.get("path"))
+            if not found:
+                results.append(("fail", f'extract path {a.get("path")!r} not found', ""))
+                failed += 1
+                continue
+            if "expect" in a:
+                want = a["expect"]
+                ok = want in text
+                results.append(("pass" if ok else "fail",
+                                f'extract {a.get("path", "$")} ⊃ "{want}"',
+                                "" if ok else f"got: {text[:240]}"))
+                failed += 0 if ok else 1
+            for bad in a.get("expect_absent", []):
+                ok = bad not in text
+                results.append(("pass" if ok else "fail",
+                                f'extract {a.get("path", "$")} ⊅ "{bad}"',
+                                "" if ok else f"got: {text[:240]}"))
+                failed += 0 if ok else 1
+            continue
+        if stage != "dom":
+            results.append(("pending", "unknown assertion stage", ""))
+            continue
+        if extraction is not None:
             continue
 
         sel = a.get("selector")
@@ -209,6 +283,30 @@ def check_page(page, html, baseline=False):
     return results, failed
 
 
+def check_golden(page, extraction):
+    """Check stable golden fields while ignoring request-specific URLs."""
+    golden_name = page.get("golden")
+    if not golden_name:
+        return [], 0
+    golden_path = os.path.join(HERE, golden_name)
+    try:
+        golden = json.load(open(golden_path, encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        return [("fail", f"golden {golden_name} unavailable", str(exc))], 1
+
+    results, failed = [], 0
+    for check in golden.get("checks", []):
+        path = check.get("path", "")
+        actual, found = extraction_text(extraction, path)
+        want = str(check.get("contains", ""))
+        ok = found and want in actual
+        results.append(("pass" if ok else "fail",
+                        f'golden {path or "$"} ⊃ "{want}"',
+                        "" if ok else ("path not found" if not found else f"got: {actual[:240]}")))
+        failed += 0 if ok else 1
+    return results, failed
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -217,8 +315,12 @@ def main():
     ap.add_argument("--baseline", action="store_true",
                     help="validate the fixtures against the reference browser: honour "
                          "browser_expect where we deliberately diverge from a browser")
+    ap.add_argument("--extract", action="store_true",
+                    help="run the Phase 1 extractor and check extract-stage assertions")
+    ap.add_argument("--bundles", action="store_true",
+                    help="also run saved local bundles as recorded, non-gating checks")
     ap.add_argument("--arm", choices=("a", "b", "b-pruned"), default="a",
-                    help="engine arm: a is Lexbor+C bindings (default), b is JS-side linkedom, b-pruned is the no-Lexbor baseline")
+                    help="engine arm: a is the C23 runtime with Lexbor extraction (default), b is the JS-side linkedom comparison, b-pruned is the no-Lexbor/litehtml baseline")
     ap.add_argument("--keep-dom", metavar="DIR", help="save each dumped DOM")
     ap.add_argument("--budget", type=int, default=6000, help="virtual time budget, ms")
     ap.add_argument("--timeout", type=int, default=45, help="real-time cap per page, s")
@@ -227,6 +329,14 @@ def main():
     manifest = json.load(open(MANIFEST, encoding="utf-8"))
     if args.baseline and args.arm != "a":
         ap.error("--baseline is only valid with the default reference-browser comparison")
+    if args.baseline and args.extract:
+        ap.error("--extract is only valid with the engine")
+    if args.extract and args.arm != "a":
+        ap.error("--extract currently targets the selected Arm A implementation")
+    if args.baseline and args.bundles:
+        ap.error("--bundles is only valid with the engine")
+    if args.bundles and args.arm != "a":
+        ap.error("--bundles currently targets the selected Arm A implementation")
     browser = find_browser() if args.baseline else None
     engine = find_engine() if not args.baseline and args.arm == "a" else None
     arm_b = find_arm_b(args.arm == "b-pruned") if not args.baseline and args.arm in ("b", "b-pruned") else None
@@ -253,7 +363,7 @@ def main():
             if not pages:
                 sys.exit(f"no page with id {args.id!r}")
 
-        mode = "baseline (reference browser)" if args.baseline else ("Arm B' (no-Lexbor + litehtml)" if args.arm == "b-pruned" else ("Arm B (JS-side linkedom)" if args.arm == "b" else "Arm A (Lexbor+C bindings)"))
+        mode = "baseline (reference browser)" if args.baseline else ("Arm B' (no-Lexbor + litehtml)" if args.arm == "b-pruned" else ("Arm B (JS-side linkedom)" if args.arm == "b" else ("Arm A extraction (C23)" if args.extract else "Arm A (C23 runtime + Lexbor extraction)")))
         driver = browser if args.baseline else (arm_b if args.arm in ("b", "b-pruned") else engine)
         print(f"{DIM}{'browser' if args.baseline else 'driver'}: {driver}\nserver:  http://127.0.0.1:{port}/\nmode:    {mode}{RESET}\n")
 
@@ -261,12 +371,18 @@ def main():
         for page in pages:
             url = f"http://127.0.0.1:{port}/{page['path']}"
             t0 = time.time()
-            if args.baseline:
+            if args.extract:
+                extraction, err = dump_extract(engine, url, manifest.get("settle_cap_ms", 5000), args.timeout)
+                html = None
+            elif args.baseline:
                 html, err = dump_dom(browser, url, args.budget, args.timeout)
+                extraction = None
             elif args.arm in ("b", "b-pruned"):
                 html, err = dump_arm_b(arm_b, url, manifest.get("settle_cap_ms", 5000), args.timeout)
+                extraction = None
             else:
                 html, err = dump_engine(engine, url, manifest.get("settle_cap_ms", 5000), args.timeout)
+                extraction = None
             elapsed = time.time() - t0
 
             print(f"{page['id']}  {DIM}{page['plan_section']}{RESET}")
@@ -282,11 +398,16 @@ def main():
                 continue
 
             if args.keep_dom:
-                with open(os.path.join(args.keep_dom, page["id"] + ".html"), "w",
+                keep_name = page["id"] + (".json" if args.extract else ".html")
+                with open(os.path.join(args.keep_dom, keep_name), "w",
                           encoding="utf-8") as fh:
-                    fh.write(html)
+                    fh.write(json.dumps(extraction, ensure_ascii=False, indent=2) if args.extract else html)
 
-            results, failed = check_page(page, html, baseline=args.baseline)
+            results, failed = check_page(page, html, baseline=args.baseline, extraction=extraction)
+            if args.extract:
+                golden_results, golden_failed = check_golden(page, extraction)
+                results.extend(golden_results)
+                failed += golden_failed
             for status, label, detail in results:
                 mark = {"pass": f"{GREEN}pass{RESET}",
                         "fail": f"{RED}FAIL{RESET}",
@@ -299,6 +420,21 @@ def main():
             total_failed += failed
             if failed and page.get("gate"):
                 gates_failed.append(page["id"])
+
+        if args.bundles:
+            bundle_dir = os.path.join(HERE, "local", "bundles")
+            print(f"{DIM}--- saved bundles: recorded, never gates ---{RESET}")
+            for name in sorted(os.listdir(bundle_dir)):
+                if not name.endswith((".html", ".htm")):
+                    continue
+                path = os.path.join(bundle_dir, name)
+                t0 = time.time()
+                extraction, err = dump_extract(engine, path, manifest.get("settle_cap_ms", 5000), args.timeout)
+                if err:
+                    print(f"  {name}  {YELLOW}recorded error{RESET}  {err}")
+                    continue
+                print(f"  {name}  {extraction['shape']['kind']} / {extraction['extractor']}"
+                      f"  {DIM}{time.time() - t0:.1f}s{RESET}")
 
         if args.live:
             print(f"{DIM}--- live rungs: recorded, never gates ---{RESET}")

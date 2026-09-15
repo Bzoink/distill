@@ -1,0 +1,7 @@
+{
+  "checks": [
+    {"path": "base_url", "contains": "/09-article.html"},
+    {"path": "url", "contains": "/09-article.html"},
+    {"path": "readability.title", "contains": "A careful reader"}
+  ]
+}

@@ -1,0 +1,19 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>Distill API notes</title>
+<main class="documentation">
+  <h1>Distill API notes</h1>
+  <p>This page explains the smallest useful request path for a document that
+  contains prose, headings, and executable examples.</p>
+  <h2>Fetch a document</h2>
+  <pre><code>const response = await fetch('/document');
+const article = await response.json();</code></pre>
+  <p>The response is then handed to the extraction stage. Code is kept as a
+  code block, while explanatory prose remains ordinary text.</p>
+  <h2>Handle failure</h2>
+  <pre><code>if (!response.ok) throw new Error('document unavailable');</code></pre>
+  <ul>
+    <li>Keep the source URL with every extracted reference.</li>
+    <li>Do not pass untrusted schemes to an operating-system handler.</li>
+  </ul>
+</main>

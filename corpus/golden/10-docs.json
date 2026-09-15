@@ -1,0 +1,8 @@
+{
+  "checks": [
+    {"path": "shape.kind", "contains": "docs"},
+    {"path": "extractor", "contains": "structured-text"},
+    {"path": "blocks", "contains": "const response = await fetch"},
+    {"path": "blocks", "contains": "Do not pass untrusted schemes"}
+  ]
+}

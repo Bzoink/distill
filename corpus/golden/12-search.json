@@ -1,0 +1,8 @@
+{
+  "checks": [
+    {"path": "shape.kind", "contains": "search-results"},
+    {"path": "search_results[0].title", "contains": "DOM ownership"},
+    {"path": "search_results[1].url", "contains": "/docs/two"},
+    {"path": "search_results[2].url", "contains": "mailto:editor@example.org"}
+  ]
+}

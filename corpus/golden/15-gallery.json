@@ -1,0 +1,8 @@
+{
+  "checks": [
+    {"path": "shape.kind", "contains": "image-heavy"},
+    {"path": "media", "contains": "content"},
+    {"path": "media", "contains": "decorative"},
+    {"path": "media", "contains": "harbour.jpg"}
+  ]
+}

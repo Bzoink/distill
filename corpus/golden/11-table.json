@@ -1,0 +1,8 @@
+{
+  "checks": [
+    {"path": "shape.kind", "contains": "table"},
+    {"path": "tables[0].caption", "contains": "Phase 1 extraction measurements"},
+    {"path": "tables", "contains": "Arm A"},
+    {"path": "tables", "contains": "selected"}
+  ]
+}

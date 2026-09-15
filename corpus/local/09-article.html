@@ -1,0 +1,29 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>A careful reader</title>
+<article id="story" class="article">
+  <h1>A careful reader</h1>
+  <p id="lead">The useful page is the one that leaves a reader with a clear
+  understanding of what happened, why it matters, and what can be done next.</p>
+  <p>Extraction is not a request to flatten the web into a bag of words. It is
+  a request to preserve the structure that carries meaning while removing the
+  navigation, promotion, and chrome that surround it. Headings establish the
+  shape of an argument, paragraphs carry its turns, and links keep the useful
+  references attached to the sentence that introduced them.</p>
+  <p>A small reader can therefore be ambitious about content while remaining
+  deliberately modest about presentation. It runs the page's own scripts until
+  the content settles, then chooses a stable representation of the result. The
+  source layout is evidence about structure, not a command to reproduce every
+  pixel or interaction.</p>
+  <p>That boundary makes the result easier to test. A saved page can be run
+  repeatedly, its title and text can be compared to a golden output, and a
+  change in the extractor can be explained instead of mistaken for a redesign.
+  The output should be calm, legible, and honest about what it could not keep.</p>
+</article>
+<aside class="related">This sidebar is not part of the article.</aside>
+<script>
+  var note = document.createElement('p');
+  note.id = 'dynamic-note';
+  note.textContent = 'This sentence was added after the page loaded and belongs in the article.';
+  document.getElementById('story').appendChild(note);
+</script>

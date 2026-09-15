@@ -57,6 +57,16 @@ class CorpusHandler(SimpleHTTPRequestHandler):
             self._json({"ok": True, "root": ROOT})
             return
 
+        if route.path == "/redirect":
+            target = parse_qs(route.query).get("to", ["/"])[0]
+            if not target.startswith("/"):
+                target = "/" + target
+            self.send_response(302)
+            self.send_header("Location", target)
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+            return
+
         super().do_GET()
 
     def _json(self, payload):

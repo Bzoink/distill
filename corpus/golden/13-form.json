@@ -1,0 +1,9 @@
+{
+  "checks": [
+    {"path": "shape.kind", "contains": "form"},
+    {"path": "forms[0].method", "contains": "get"},
+    {"path": "forms[0].action", "contains": "/search"},
+    {"path": "forms[0].fields", "contains": "CSRF-PASSTHROUGH"},
+    {"path": "forms[0].fields", "contains": "Query"}
+  ]
+}
