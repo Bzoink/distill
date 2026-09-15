@@ -14,6 +14,7 @@ Arm B′ is decided on corpus pass rate. Until this exists, Phase 0 cannot start
 ./check.py --extract          # Phase 1 extraction and golden-output gates
 ./check.py --render /tmp/png  # Phase 2 reader PNG smoke renders
 ./check.py --viewer /tmp/png  # Phase 2 media viewer smoke render
+./check.py --app              # Phase 3 desktop-shell model smoke test
 ./check.py --bundles          # recorded saved-bundle smoke checks, never gates
 ./check.py --baseline         # validate the fixtures against a real browser
 ./check.py --id 07-churn      # one page
@@ -41,6 +42,13 @@ non-empty PNG with valid dimensions; visual quality remains a human review.
 
 `--viewer DIR` runs the gallery fixture through the fit-to-width media viewer
 path and checks its navigation surface produces a valid PNG.
+
+The Phase 3 desktop shell is `build/distill-gtk`. Run it with `--url URL` to
+open a page in the GTK reader, or run `./check.py --app` for the display-free
+history/form-geometry shell gate. The window provides an address bar, cached
+back/forward history, a Cairo reader surface, native GTK form controls placed
+from litehtml geometry, simple GET/POST submission, URI-validated external
+hand-off, three reader themes, and a reading-list toggle.
 
 For a single page, `build/distill --url URL --viewer /tmp/media.png
 --media-index 0 --save-media /tmp/original.bin` renders one media reference and

@@ -295,12 +295,18 @@ static size_t curl_write(void *ptr, size_t size, size_t count, void *opaque)
     return length;
 }
 
-static bool fetch_sync(Engine *engine, const char *url, DBuffer *body,
-                       long *status, char **effective_url)
+static bool fetch_sync_request(Engine *engine, const char *url, DBuffer *body,
+                               long *status, char **effective_url,
+                               const char *request_method, const char *request_data)
 {
     dbuf_init(body);
     char *path = file_from_url(url);
     if (!is_http_url(url)) {
+        if (request_method && d_ieq(request_method, "post")) {
+            free(path);
+            if (status) *status = 400;
+            return false;
+        }
         size_t length = 0;
         char *data = d_read_file(path, &length);
         free(path);
@@ -321,6 +327,10 @@ static bool fetch_sync(Engine *engine, const char *url, DBuffer *body,
     curl_easy_setopt(easy, CURLOPT_USERAGENT, "distill/0.1");
     curl_easy_setopt(easy, CURLOPT_CONNECTTIMEOUT_MS, 1000L);
     curl_easy_setopt(easy, CURLOPT_TIMEOUT_MS, (long)engine->cap_ms);
+    if (request_method && d_ieq(request_method, "post")) {
+        curl_easy_setopt(easy, CURLOPT_POST, 1L);
+        curl_easy_setopt(easy, CURLOPT_POSTFIELDS, request_data ? request_data : "");
+    }
     CURLcode result = curl_easy_perform(easy);
     long code = 0;
     curl_easy_getinfo(easy, CURLINFO_RESPONSE_CODE, &code);
@@ -332,6 +342,12 @@ static bool fetch_sync(Engine *engine, const char *url, DBuffer *body,
     curl_easy_cleanup(easy);
     if (status) *status = code;
     return result == CURLE_OK;
+}
+
+static bool fetch_sync(Engine *engine, const char *url, DBuffer *body,
+                       long *status, char **effective_url)
+{
+    return fetch_sync_request(engine, url, body, status, effective_url, NULL, NULL);
 }
 
 static void request_vec_push(RequestVec *vec, Request *request)
@@ -1251,7 +1267,7 @@ static void append_json_media(Engine *engine, JSValueConst media, DBuffer *outpu
     dbuf_puts(output, "</section>");
 }
 
-static char *reader_template(Engine *engine, const char *json)
+static char *reader_template(Engine *engine, const char *json, const char *theme)
 {
     JSValue parsed = JS_ParseJSON(engine->context, json, strlen(json), "distill-extraction.json");
     if (JS_IsException(parsed)) {
@@ -1274,6 +1290,38 @@ static char *reader_template(Engine *engine, const char *json)
         content = json_property_string(engine, readability, "content");
     }
 
+    const char *selected_theme = theme && *theme ? theme : "warm";
+    const char *page_background = "#f4f1ea";
+    const char *page_text = "#282622";
+    const char *main_background = "#fffdf8";
+    const char *heading_text = "#171614";
+    const char *card_background = "#f5f2ec";
+    const char *border = "#ddd5c9";
+    const char *link = "#165d7a";
+    const char *pre_background = "#f0eee8";
+    const char *muted = "#827a6e";
+    if (d_eq(selected_theme, "night")) {
+        page_background = "#17191b";
+        page_text = "#e7e2d8";
+        main_background = "#202326";
+        heading_text = "#fffaf0";
+        card_background = "#292d31";
+        border = "#454b50";
+        link = "#78b9cf";
+        pre_background = "#2b3034";
+        muted = "#a7a39b";
+    } else if (d_eq(selected_theme, "paper")) {
+        page_background = "#e7dfd0";
+        page_text = "#332d24";
+        main_background = "#f8f0df";
+        heading_text = "#261f17";
+        card_background = "#eee3cf";
+        border = "#d1c1a8";
+        link = "#79533b";
+        pre_background = "#e8dcc7";
+        muted = "#85735f";
+    }
+
     DBuffer output;
     dbuf_init(&output);
     dbuf_puts(&output,
@@ -1281,25 +1329,44 @@ static char *reader_template(Engine *engine, const char *json)
     append_html_escaped(&output, title);
     dbuf_puts(&output,
         "</title><style>"
-        "html,body{margin:0;padding:0;background:#f4f1ea;color:#282622;}"
+        ":root{--page-background:");
+    dbuf_puts(&output, page_background);
+    dbuf_puts(&output, ";--page-text:");
+    dbuf_puts(&output, page_text);
+    dbuf_puts(&output, ";--main-background:");
+    dbuf_puts(&output, main_background);
+    dbuf_puts(&output, ";--heading-text:");
+    dbuf_puts(&output, heading_text);
+    dbuf_puts(&output, ";--card-background:");
+    dbuf_puts(&output, card_background);
+    dbuf_puts(&output, ";--border:");
+    dbuf_puts(&output, border);
+    dbuf_puts(&output, ";--link:");
+    dbuf_puts(&output, link);
+    dbuf_puts(&output, ";--pre-background:");
+    dbuf_puts(&output, pre_background);
+    dbuf_puts(&output, ";--muted:");
+    dbuf_puts(&output, muted);
+    dbuf_puts(&output,
+        "}html,body{margin:0;padding:0;background:var(--page-background);color:var(--page-text);}"
         "body{font-family:sans-serif;font-size:18px;line-height:1.62;padding-top:68px;padding-right:74px;padding-bottom:96px;padding-left:74px;}"
-        "main{max-width:612px;margin:0 auto;background:#fffdf8;}"
-        "h1{font-size:2.35em;line-height:1.08;letter-spacing:-.025em;margin:0 0 1.1em;color:#171614;}"
-        "h2{font-size:1.45em;line-height:1.2;margin:1.7em 0 .55em;color:#24211e;}"
+        "main{max-width:612px;margin:0 auto;background:var(--main-background);}"
+        "h1{font-size:2.35em;line-height:1.08;letter-spacing:-.025em;margin:0 0 1.1em;color:var(--heading-text);}"
+        "h2{font-size:1.45em;line-height:1.2;margin:1.7em 0 .55em;color:var(--heading-text);}"
         "p,ul,ol,pre,blockquote{margin:0 0 1.05em;}"
-        "a{color:#165d7a;}pre{padding:1em;overflow:hidden;white-space:pre-wrap;overflow-wrap:anywhere;background:#f0eee8;border-radius:4px;font-size:.86em;line-height:1.45;}"
-        "blockquote{margin-left:1.2em;padding-left:1em;border-left:3px solid #c9c1b4;color:#5a554d;}"
+        "a{color:var(--link);}pre{padding:1em;overflow:hidden;white-space:pre-wrap;overflow-wrap:anywhere;background:var(--pre-background);border-radius:4px;font-size:.86em;line-height:1.45;}"
+        "blockquote{margin-left:1.2em;padding-left:1em;border-left:3px solid var(--border);color:var(--muted);}"
         "img,video,iframe{max-width:100%;height:auto;}"
-        "table{width:100%;border-collapse:collapse;margin:0 0 1.5em;}th,td{text-align:left;padding:.55em .6em;border-bottom:1px solid #d8d1c6;}"
-        ".table-card,.form-card,.video-card,.media-gallery,.result-list{margin:2em 0;padding:1.2em;background:#f5f2ec;border:1px solid #ddd5c9;border-radius:5px;}"
-        ".result-card{padding:.7em 0;border-bottom:1px solid #ddd5c9;}.result-card h3{margin:0 0 .3em;}"
-        ".form-field{display:block;margin:.8em 0;color:#514b43;}.form-field input{display:block;width:100%;box-sizing:border-box;margin-top:.25em;padding:.55em;border:1px solid #b9b0a3;border-radius:3px;background:#fffdf8;}"
-        "button,.button{display:inline-block;padding:.55em .85em;border:0;border-radius:3px;background:#165d7a;color:white;text-decoration:none;font:inherit;}"
+        "table{width:100%;border-collapse:collapse;margin:0 0 1.5em;}th,td{text-align:left;padding:.55em .6em;border-bottom:1px solid var(--border);}"
+        ".table-card,.form-card,.video-card,.media-gallery,.result-list{margin:2em 0;padding:1.2em;background:var(--card-background);border:1px solid var(--border);border-radius:5px;}"
+        ".result-card{padding:.7em 0;border-bottom:1px solid var(--border);}.result-card h3{margin:0 0 .3em;}"
+        ".form-field{display:block;margin:.8em 0;color:var(--page-text);}.form-field input{display:block;width:100%;box-sizing:border-box;margin-top:.25em;padding:.55em;border:1px solid var(--border);border-radius:3px;background:var(--main-background);color:var(--page-text);}"
+        "button,.button{display:inline-block;padding:.55em .85em;border:0;border-radius:3px;background:var(--link);color:white;text-decoration:none;font:inherit;}"
         ".video-card h2,.table-card h2,.form-card h2,.media-gallery h2,.result-list h2{margin-top:0;}"
-        ".eyebrow,.media-url{font-size:.78em;color:#827a6e;}.media-placeholder{min-height:100px;display:flex;align-items:center;justify-content:center;background:#ded8ce;color:#665f56;text-align:center;padding:1em;}"
+        ".eyebrow,.media-url{font-size:.78em;color:var(--muted);}.media-placeholder{min-height:100px;display:flex;align-items:center;justify-content:center;background:var(--card-background);color:var(--page-text);text-align:center;padding:1em;}"
         ".media-card{margin:0 0 1em;}.media-card figcaption{margin-top:.45em;}.media-card figcaption span{float:right;color:#827a6e;font-size:.8em;}"
         ".reader-list-item{padding-left:1em;}"
-        ".distill-meta{font-size:.8em;color:#827a6e;margin-bottom:2.6em;}"
+        ".distill-meta{font-size:.8em;color:var(--muted);margin-bottom:2.6em;}"
         "</style></head><body><main><h1>");
     append_html_escaped(&output, *title ? title : "Untitled page");
     dbuf_puts(&output, "</h1><p class=\"distill-meta\">Rendered by Distill</p>");
@@ -1431,6 +1498,16 @@ static bool save_media_file(Engine *engine, const char *json, int media_index,
 }
 #endif
 
+static bool write_file_bytes(const char *path, const char *data, size_t length)
+{
+    if (!path || !data) return false;
+    FILE *file = fopen(path, "wb");
+    if (!file) return false;
+    bool ok = fwrite(data, 1, length, file) == length;
+    if (fclose(file) != 0) ok = false;
+    return ok;
+}
+
 static void engine_cleanup(Engine *engine)
 {
     if (!engine) return;
@@ -1478,7 +1555,9 @@ static int run_page(const char *input, uint64_t cap_ms, uint64_t memory_mb,
                     uint64_t max_scripts, bool dump_dom, bool extract,
                     const char *render_path, const char *viewer_path, int media_index,
                     const char *save_media_path, int render_width, int render_height,
-                    const char *font_dir)
+                    const char *font_dir, const char *template_path,
+                    const char *theme, const char *request_method,
+                    const char *request_data)
 {
     Engine engine = {0};
 #ifdef DISTILL_RENDER
@@ -1498,7 +1577,8 @@ static int run_page(const char *input, uint64_t cap_ms, uint64_t memory_mb,
     DBuffer html;
     long status = 0;
     char *effective_url = NULL;
-    if (!fetch_sync(&engine, engine.source_url, &html, &status, &effective_url)) {
+    if (!fetch_sync_request(&engine, engine.source_url, &html, &status, &effective_url,
+                            request_method, request_data)) {
         fprintf(stderr, "unable to load %s (status %ld)\n", engine.source_url, status);
 #ifdef DISTILL_RENDER
         free(owned_font_dir);
@@ -1576,9 +1656,10 @@ static int run_page(const char *input, uint64_t cap_ms, uint64_t memory_mb,
     } else if (render_path) {
 #ifdef DISTILL_RENDER
         char *json = run_extraction(&engine, serialized);
-        char *template = reader_template(&engine, json);
-        if (!*template || !distill_litehtml_render(template, render_path,
-                                                    render_width, render_height, font_dir)) {
+        char *template = reader_template(&engine, json, theme);
+        bool template_ok = !template_path || write_file_bytes(template_path, template, strlen(template));
+        if (!template_ok || !*template || !distill_litehtml_render(template, render_path,
+                                                                     render_width, render_height, font_dir)) {
             fprintf(stderr, "unable to render %s\n", render_path);
             result = 3;
         } else {
@@ -1588,6 +1669,21 @@ static int run_page(const char *input, uint64_t cap_ms, uint64_t memory_mb,
         free(json);
 #else
         (void)render_width; (void)render_height; (void)font_dir;
+        fprintf(stderr, "this build has no litehtml renderer\n");
+        result = 2;
+#endif
+    } else if (template_path) {
+#ifdef DISTILL_RENDER
+        char *json = run_extraction(&engine, serialized);
+        char *template = reader_template(&engine, json, theme);
+        if (!*template || !write_file_bytes(template_path, template, strlen(template))) {
+            fprintf(stderr, "unable to write reader template %s\n", template_path);
+            result = 3;
+        }
+        free(template);
+        free(json);
+#else
+        (void)theme;
         fprintf(stderr, "this build has no litehtml renderer\n");
         result = 2;
 #endif
@@ -1613,7 +1709,7 @@ static int run_page(const char *input, uint64_t cap_ms, uint64_t memory_mb,
 
 static void usage(const char *program)
 {
-    fprintf(stderr, "usage: %s --url URL [--dump-dom|--extract|--render FILE|--viewer FILE] [--media-index N] [--save-media FILE] [--width N] [--height N] [--font-dir DIR] [--script-cap-ms N] [--memory-limit-mb N] [--max-scripts N]\n", program);
+    fprintf(stderr, "usage: %s --url URL [--dump-dom|--extract|--render FILE|--template FILE|--viewer FILE] [--media-index N] [--save-media FILE] [--width N] [--height N] [--font-dir DIR] [--theme warm|night|paper] [--request-method GET|POST] [--request-data DATA] [--script-cap-ms N] [--memory-limit-mb N] [--max-scripts N]\n", program);
 }
 
 int main(int argc, char **argv)
@@ -1621,8 +1717,12 @@ int main(int argc, char **argv)
     const char *url = NULL;
     const char *render_path = NULL;
     const char *viewer_path = NULL;
+    const char *template_path = NULL;
     const char *save_media_path = NULL;
     const char *font_dir = NULL;
+    const char *theme = "warm";
+    const char *request_method = NULL;
+    const char *request_data = NULL;
     uint64_t cap_ms = 5000, memory_mb = 128, max_scripts = 1000;
     int render_width = 760, render_height = 1100;
     int media_index = 0;
@@ -1632,27 +1732,35 @@ int main(int argc, char **argv)
         else if (d_eq(argv[i], "--dump-dom")) dump_dom = true;
         else if (d_eq(argv[i], "--extract")) extract = true;
         else if (d_eq(argv[i], "--render") && i + 1 < argc) render_path = argv[++i];
+        else if (d_eq(argv[i], "--template") && i + 1 < argc) template_path = argv[++i];
         else if (d_eq(argv[i], "--viewer") && i + 1 < argc) viewer_path = argv[++i];
         else if (d_eq(argv[i], "--media-index") && i + 1 < argc) media_index = (int)strtol(argv[++i], NULL, 10);
         else if (d_eq(argv[i], "--save-media") && i + 1 < argc) save_media_path = argv[++i];
         else if (d_eq(argv[i], "--width") && i + 1 < argc) render_width = (int)strtol(argv[++i], NULL, 10);
         else if (d_eq(argv[i], "--height") && i + 1 < argc) render_height = (int)strtol(argv[++i], NULL, 10);
         else if (d_eq(argv[i], "--font-dir") && i + 1 < argc) font_dir = argv[++i];
+        else if (d_eq(argv[i], "--theme") && i + 1 < argc) theme = argv[++i];
+        else if (d_eq(argv[i], "--request-method") && i + 1 < argc) request_method = argv[++i];
+        else if (d_eq(argv[i], "--request-data") && i + 1 < argc) request_data = argv[++i];
         else if (d_eq(argv[i], "--script-cap-ms") && i + 1 < argc) cap_ms = strtoull(argv[++i], NULL, 10);
         else if (d_eq(argv[i], "--memory-limit-mb") && i + 1 < argc) memory_mb = strtoull(argv[++i], NULL, 10);
         else if (d_eq(argv[i], "--max-scripts") && i + 1 < argc) max_scripts = strtoull(argv[++i], NULL, 10);
         else if (d_eq(argv[i], "--help") || d_eq(argv[i], "-h")) { usage(argv[0]); return 0; }
     }
-    if (!url || !*url || (dump_dom && (extract || render_path || viewer_path)) ||
-        (extract && (render_path || viewer_path)) || (render_path && viewer_path) ||
+    if (!url || !*url || (dump_dom && (extract || render_path || template_path || viewer_path)) ||
+        (extract && (render_path || template_path || viewer_path)) ||
+        (template_path && viewer_path) || (render_path && viewer_path) ||
         (save_media_path && !viewer_path) || media_index < 0 ||
-        render_width <= 0 || render_height <= 0) {
+        render_width <= 0 || render_height <= 0 ||
+        (request_data && (!request_method || !d_ieq(request_method, "post"))) ||
+        (request_method && !d_ieq(request_method, "get") && !d_ieq(request_method, "post"))) {
         usage(argv[0]); return 2;
     }
     curl_global_init(CURL_GLOBAL_DEFAULT);
     int result = run_page(url, cap_ms, memory_mb, max_scripts, dump_dom, extract,
                           render_path, viewer_path, media_index, save_media_path,
-                          render_width, render_height, font_dir);
+                          render_width, render_height, font_dir, template_path, theme,
+                          request_method, request_data);
     curl_global_cleanup();
     return result;
 }

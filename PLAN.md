@@ -2,8 +2,8 @@
 
 *A small, C23-rooted stack that runs a page's real JavaScript against a real DOM, pulls out what actually matters, and renders it back — clearly, consistently, on our own terms.*
 
-**Status:** Phase 2 complete — Phase 3 not started
-**Drafted:** 2026-09-14 · **Revised:** 2026-09-15 (Phase 1 implementation)
+**Status:** Phase 3 complete — Phase 4 not started
+**Drafted:** 2026-09-14 · **Revised:** 2026-09-15 (Phase 3 implementation)
 **Origin:** NetSurf JS/rendering gap analysis (see `../netsurf`)
 **Rendered version:** https://claude.ai/code/artifact/fcbd8e5f-f6dc-4abd-a2a4-e7282070cf4a *(predates this revision)*
 
@@ -55,7 +55,7 @@ The hard constraint above makes footprint a *design input*, not something to mea
 
 **Size and dependencies** — the half of the stack the first draft never budgeted, and the half where "small and portable" actually gets tested:
 - **≤ 8 MB** total shared-library footprint on the framebuffer target, excluding bundled font data.
-- **Hard rule: no GLib, GObject, Pango, or fontconfig linked on any target.** fontconfig may be `dlopen`ed on desktop as an optional convenience, never linked.
+- **Hard rule for framebuffer/TUI/minimal targets: no GLib, GObject, Pango, or fontconfig linked.** The Phase 3 desktop shell is the explicit GTK/GLib exception for native form widgets; fontconfig may still be `dlopen`ed on desktop as an optional convenience, never linked.
 - Every new dependency is named in the [Reuse ledger](#reuse-ledger) with its transitive tree understood, not just its own size.
 
 These are also tiebreakers in the Phase 0 A/B: an arm that can't meet them isn't the arm.
@@ -396,6 +396,19 @@ window around this completed paint path.
 
 **Done when:** a URL can be typed in and read, start to finish, with no terminal involved.
 
+**Phase 3 result (2026-09-15):** `distill-gtk` is a C23 GTK3 desktop shell
+around the existing pipeline. It owns a Cairo-backed reader surface inside a
+scrollable window, an address bar and asynchronous URL load path, cached
+back/forward history, and a URI-validated `xdg-open` hand-off. The shell asks
+the litehtml C++ boundary for form and link box geometry, overlays native GTK
+entries/buttons on the rendered reader, and dispatches simple GET forms and
+URL-encoded POST forms back through the engine. Warm, night, and paper themes
+are selectable through the reader template; a reading-list toggle keeps URLs
+for the session. `distill-app-state` and `distill-litehtml-geometry` CTest
+contracts cover history truncation/replacement and native-control geometry,
+while `corpus/check.py --app` covers the display-free shell model. Phase 4 can
+now widen the interaction and binding surface from evidence.
+
 ### Phase 4 — Hardening
 *Open-ended, later*
 
@@ -478,6 +491,7 @@ What this project is actually building, once the borrowed parts are set aside.
 - HarfBuzz, FreeType, libunibreak — shaping, rasterization, break opportunities
 - SheenBidi, libhyphen — deferred until the corpus demands them
 - Cairo — desktop paint backend only
+- GTK3 — desktop window shell and native form widgets, desktop target only
 - libpng / libjpeg / libwebp — image decoding, linked directly
 - SIL OFL font faces — bundled, three or four
 - linkedom or domino — only if Phase 0 Arm B/B′ wins

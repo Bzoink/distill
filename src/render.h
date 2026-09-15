@@ -39,6 +39,30 @@ typedef struct {
     size_t end;
 } DRenderTextLine;
 
+/* Geometry and attributes for native controls placed over a reader surface. */
+typedef struct {
+    int x;
+    int y;
+    int width;
+    int height;
+    unsigned int form_index;
+    char tag[16];
+    char type[32];
+    char name[128];
+    char value[512];
+    char action[2048];
+    char method[16];
+} DFormBox;
+
+/* Hit-test data for links in the rendered reader template. */
+typedef struct {
+    int x;
+    int y;
+    int width;
+    int height;
+    char href[2048];
+} DLinkBox;
+
 DRenderContext *d_render_create(int width, int height, const char *font_dir);
 void d_render_destroy(DRenderContext *context);
 int d_render_write_png(DRenderContext *context, const char *path);
@@ -60,6 +84,13 @@ void d_render_draw_marker(DRenderContext *context, DRenderRect rect,
                           DRenderColor color, bool ordered, int index);
 void d_render_set_clip(DRenderContext *context, DRenderRect rect);
 void d_render_del_clip(DRenderContext *context);
+
+size_t distill_litehtml_form_boxes(const char *html, int width, int height,
+                                   const char *font_dir, DFormBox *boxes,
+                                   size_t box_capacity);
+size_t distill_litehtml_link_boxes(const char *html, int width, int height,
+                                   const char *font_dir, DLinkBox *boxes,
+                                   size_t box_capacity);
 
 #ifdef __cplusplus
 }

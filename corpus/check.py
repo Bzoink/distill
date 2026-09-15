@@ -9,6 +9,7 @@ Starts serve.py, drives the Phase 0 engine over each page, and checks the
     ./check.py --extract       Phase 1 extraction and golden gates
     ./check.py --render DIR    Phase 2 PNG smoke renders
     ./check.py --viewer DIR    Phase 2 media-viewer smoke render
+    ./check.py --app           Phase 3 desktop-shell model smoke test
     ./check.py --id 03-settle  one page
     ./check.py --live          also record the live rungs (never gates)
     ./check.py --keep-dom DIR  save each dumped DOM for inspection
@@ -127,6 +128,20 @@ def find_arm_b(pruned=False):
             return candidate
     label = "Arm B'" if pruned else "Arm B"
     sys.exit(f"no {label} engine found; build it first (cmake -S . -B build && cmake --build build)")
+
+
+def find_app():
+    candidates = [
+        os.environ.get("DISTILL_APP"),
+        os.path.join(os.path.dirname(HERE), "build", "distill-gtk"),
+    ]
+    for candidate in candidates:
+        if candidate and os.path.isfile(candidate) and os.access(candidate, os.X_OK):
+            return candidate
+    path = shutil.which("distill-gtk")
+    if path:
+        return path
+    sys.exit("no distill-gtk app found; build it first (cmake -S . -B build && cmake --build build)")
 
 
 def dump_dom(browser, url, budget_ms, timeout_s):
@@ -347,6 +362,8 @@ def main():
                     help="render each corpus page to a Phase 2 PNG in DIR")
     ap.add_argument("--viewer", metavar="DIR",
                     help="render the gallery fixture through the Phase 2 media viewer")
+    ap.add_argument("--app", action="store_true",
+                    help="run the Phase 3 desktop-shell model smoke test")
     ap.add_argument("--bundles", action="store_true",
                     help="also run saved local bundles as recorded, non-gating checks")
     ap.add_argument("--arm", choices=("a", "b", "b-pruned"), default="a",
@@ -355,6 +372,18 @@ def main():
     ap.add_argument("--budget", type=int, default=6000, help="virtual time budget, ms")
     ap.add_argument("--timeout", type=int, default=45, help="real-time cap per page, s")
     args = ap.parse_args()
+
+    if args.app:
+        incompatible = args.id or args.live or args.baseline or args.extract or args.render or args.viewer or args.bundles or args.keep_dom
+        if incompatible:
+            ap.error("--app is a standalone Phase 3 shell smoke test")
+        app = find_app()
+        result = subprocess.run([app, "--self-test"], capture_output=True, text=True)
+        if result.returncode != 0:
+            print(result.stderr.strip() or result.stdout.strip())
+            return 1
+        print(f"app:    {app}\nmode:   Phase 3 desktop shell\n{result.stdout.strip()}\nOK  desktop-shell gate passes")
+        return 0
 
     manifest = json.load(open(MANIFEST, encoding="utf-8"))
     if args.baseline and args.arm != "a":

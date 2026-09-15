@@ -3,6 +3,7 @@
 #include "render.h"
 
 #include <cctype>
+#include <cstring>
 #include <memory>
 #include <string>
 #include <vector>
@@ -165,4 +166,143 @@ extern "C" int distill_litehtml_render(const char *html, const char *output_path
     }
     d_render_destroy(renderer);
     return result;
+}
+
+namespace {
+
+static void copy_box_string(char *destination, size_t capacity, const char *value)
+{
+    if (!destination || capacity == 0) return;
+    const char *source = value ? value : "";
+    std::strncpy(destination, source, capacity - 1);
+    destination[capacity - 1] = '\0';
+}
+
+static bool is_form_control(const char *tag)
+{
+    return tag && (!std::strcmp(tag, "input") || !std::strcmp(tag, "button") ||
+                   !std::strcmp(tag, "select") || !std::strcmp(tag, "textarea"));
+}
+
+static void collect_form_boxes(const litehtml::element::ptr &element,
+                               bool in_form, unsigned int form_index,
+                               unsigned int &next_form_index, const char *action,
+                               const char *method, std::vector<DFormBox> &output)
+{
+    if (!element) return;
+    const char *tag = element->get_tagName();
+    bool child_in_form = in_form;
+    unsigned int child_form_index = form_index;
+    std::string child_action = action ? action : "";
+    std::string child_method = method ? method : "get";
+    if (tag && !std::strcmp(tag, "form")) {
+        child_in_form = true;
+        child_form_index = next_form_index++;
+        child_action = element->get_attr("action", "");
+        child_method = element->get_attr("method", "get");
+    }
+    if (is_form_control(tag) && child_in_form) {
+        litehtml::position position = element->get_placement();
+        DFormBox box = {};
+        box.x = position.x;
+        box.y = position.y;
+        box.width = position.width;
+        box.height = position.height;
+        box.form_index = child_form_index;
+        copy_box_string(box.tag, sizeof(box.tag), tag);
+        copy_box_string(box.type, sizeof(box.type), element->get_attr("type", "text"));
+        copy_box_string(box.name, sizeof(box.name), element->get_attr("name", ""));
+        copy_box_string(box.value, sizeof(box.value), element->get_attr("value", ""));
+        if (!box.value[0] && tag && !std::strcmp(tag, "button")) {
+            litehtml::string text;
+            element->get_text(text);
+            copy_box_string(box.value, sizeof(box.value), text.c_str());
+        }
+        copy_box_string(box.action, sizeof(box.action), child_action.c_str());
+        copy_box_string(box.method, sizeof(box.method), child_method.c_str());
+        output.push_back(box);
+    }
+    for (const auto &child : element->children())
+        collect_form_boxes(child, child_in_form, child_form_index, next_form_index,
+                           child_action.c_str(), child_method.c_str(), output);
+}
+
+static void collect_link_boxes(const litehtml::element::ptr &element,
+                               std::vector<DLinkBox> &output)
+{
+    if (!element) return;
+    const char *tag = element->get_tagName();
+    if (tag && !std::strcmp(tag, "a")) {
+        const char *href = element->get_attr("href", "");
+        litehtml::position position = element->get_placement();
+        if (href && *href && position.width > 0 && position.height > 0) {
+            DLinkBox box = {};
+            box.x = position.x;
+            box.y = position.y;
+            box.width = position.width;
+            box.height = position.height;
+            copy_box_string(box.href, sizeof(box.href), href);
+            output.push_back(box);
+        }
+    }
+    for (const auto &child : element->children()) collect_link_boxes(child, output);
+}
+
+}
+
+extern "C" size_t distill_litehtml_form_boxes(const char *html, int width, int height,
+                                               const char *font_dir, DFormBox *boxes,
+                                               size_t box_capacity)
+{
+    if (!html || width <= 0 || height <= 0) return 0;
+    DRenderContext *renderer = d_render_create(width, height, font_dir);
+    if (!renderer) return 0;
+    Probe probe(renderer);
+    probe.width = width;
+    probe.height = height;
+    std::shared_ptr<litehtml::document> document = litehtml::document::createFromString(html, &probe);
+    if (!document) {
+        d_render_destroy(renderer);
+        return 0;
+    }
+    document->render(width, litehtml::render_all);
+    std::vector<DFormBox> collected;
+    unsigned int next_form_index = 0;
+    collect_form_boxes(document->root(), false, 0, next_form_index, "", "get", collected);
+    size_t count = collected.size();
+    if (boxes && box_capacity) {
+        size_t copy_count = count < box_capacity ? count : box_capacity;
+        std::memcpy(boxes, collected.data(), copy_count * sizeof(*boxes));
+    }
+    document.reset();
+    d_render_destroy(renderer);
+    return count;
+}
+
+extern "C" size_t distill_litehtml_link_boxes(const char *html, int width, int height,
+                                               const char *font_dir, DLinkBox *boxes,
+                                               size_t box_capacity)
+{
+    if (!html || width <= 0 || height <= 0) return 0;
+    DRenderContext *renderer = d_render_create(width, height, font_dir);
+    if (!renderer) return 0;
+    Probe probe(renderer);
+    probe.width = width;
+    probe.height = height;
+    std::shared_ptr<litehtml::document> document = litehtml::document::createFromString(html, &probe);
+    if (!document) {
+        d_render_destroy(renderer);
+        return 0;
+    }
+    document->render(width, litehtml::render_all);
+    std::vector<DLinkBox> collected;
+    collect_link_boxes(document->root(), collected);
+    size_t count = collected.size();
+    if (boxes && box_capacity) {
+        size_t copy_count = count < box_capacity ? count : box_capacity;
+        std::memcpy(boxes, collected.data(), copy_count * sizeof(*boxes));
+    }
+    document.reset();
+    d_render_destroy(renderer);
+    return count;
 }
