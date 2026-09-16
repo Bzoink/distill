@@ -32,4 +32,8 @@ Example:
 `hosts` and `paths` accept exact values or `*` globs. The `containers` and
 `headings` lists are alternatives, tried in order. `title` names the metadata
 property used to identify the requested entry; `og:title` is the default when
-it is omitted.
+it is omitted. A profile may use `document-h1` when the visible document
+headline is the reliable identifier but `og:title` contains branding or a
+different live-update headline. An explicit profile may promote a full article
+region; the generic matcher continues to require a minority region so ordinary
+Readability articles are not duplicated.

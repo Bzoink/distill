@@ -1,0 +1,12 @@
+{
+  "name": "corpus-article-main",
+  "match": {
+    "hosts": ["127.0.0.1"],
+    "paths": ["/32-profile-article.html"]
+  },
+  "main_content": {
+    "containers": ["main"],
+    "headings": ["h1"],
+    "title": "document-h1"
+  }
+}

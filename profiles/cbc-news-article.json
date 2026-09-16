@@ -1,0 +1,12 @@
+{
+  "name": "cbc-news-article",
+  "match": {
+    "hosts": ["cbc.ca", "*.cbc.ca"],
+    "paths": ["/news/*/*"]
+  },
+  "main_content": {
+    "containers": ["main"],
+    "headings": ["h1"],
+    "title": "document-h1"
+  }
+}

@@ -1,0 +1,12 @@
+{
+  "name": "aljazeera-liveblog",
+  "match": {
+    "hosts": ["aljazeera.com", "*.aljazeera.com"],
+    "paths": ["/news/liveblog/*", "/amp/news/liveblog/*"]
+  },
+  "main_content": {
+    "containers": ["div[role=\"article\"]"],
+    "headings": ["h1"],
+    "title": "document-h1"
+  }
+}

@@ -830,6 +830,58 @@
           "expect": "Ferry timetable"
         }
       ]
+    },
+    {
+      "id": "32-profile-article",
+      "path": "32-profile-article.html",
+      "gate": true,
+      "plan_section": "Phase 1 extraction breadth, main content",
+      "exercises": [
+        "main-content",
+        "profile-headline",
+        "document-h1"
+      ],
+      "why": "A publisher may expose a branded og:title while its visible h1 names the article. An explicit profile must be able to promote the selected article region even when it is the page's dominant prose region.",
+      "assertions": [
+        {
+          "stage": "extract",
+          "path": "main_content.found",
+          "expect": "true"
+        },
+        {
+          "stage": "extract",
+          "path": "main_content.source",
+          "expect": "profile-headline"
+        },
+        {
+          "stage": "extract",
+          "path": "main_content.profile",
+          "expect": "corpus-article-main"
+        },
+        {
+          "stage": "extract",
+          "path": "main_content.matches",
+          "expect": "1"
+        },
+        {
+          "stage": "extract",
+          "path": "main_content.blocks[0].text",
+          "expect": "Harbour Wire — Article"
+        },
+        {
+          "stage": "extract",
+          "path": "main_content.blocks[1].text",
+          "expect": "The harbour authority published its winter operations report on Wednesday morning."
+        },
+        {
+          "stage": "extract",
+          "path": "main_content.blocks",
+          "expect_absent": [
+            "Related stories",
+            "Ferry timetable consultation closes on Friday"
+          ]
+        }
+      ]
     }
   ],
   "live": [

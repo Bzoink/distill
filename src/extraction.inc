@@ -388,6 +388,40 @@ static char *meta_value(lxb_dom_node_t *root, const char *property)
     free(metas.items); return d_strdup("");
 }
 
+/* Some publishers put a branded or currently-updated headline in og:title,
+   while the document's h1 names the article region that should be kept. A
+   profile can opt into the visible headline without teaching the matcher a
+   site-specific rule. */
+static char *profile_title_value(lxb_dom_node_t *root, const char *source)
+{
+    if (source && d_ieq(source, "document-h1")) {
+        /* Prefer the heading inside <main>; many publishers use a short site
+           masthead h1 before the article's actual h1. */
+        NodeVec mains = find_selector(root, "main");
+        for (size_t i = 0; i < mains.length; ++i) {
+            NodeVec main_headings = find_selector(mains.items[i], "h1");
+            for (size_t h = 0; h < main_headings.length; ++h) {
+                char *text = compact_text(main_headings.items[h]);
+                if (*text) {
+                    free(main_headings.items); free(mains.items); return text;
+                }
+                free(text);
+            }
+            free(main_headings.items);
+        }
+        free(mains.items);
+        NodeVec headings = find_selector(root, "h1");
+        for (size_t i = 0; i < headings.length; ++i) {
+            char *text = compact_text(headings.items[i]);
+            if (*text) { free(headings.items); return text; }
+            free(text);
+        }
+        free(headings.items);
+        return d_strdup("");
+    }
+    return meta_value(root, source && *source ? source : "og:title");
+}
+
 static char *json_quote(const char *value)
 {
     DBuffer out; dbuf_init(&out); dbuf_puts(&out, "\"");
@@ -942,7 +976,7 @@ static MainContent main_content_by_headline(lxb_dom_node_t *root,
     MainContent item = {0};
     const char *title_source = profile && profile->title_source && *profile->title_source
                                    ? profile->title_source : "og:title";
-    char *wanted = meta_value(root, title_source);
+    char *wanted = profile_title_value(root, title_source);
     if (!*wanted) { free(wanted); return item; }
 
     const char *generic_containers[] = {"article", "*[role=\"article\"]"};
@@ -1321,8 +1355,12 @@ static char *run_extraction(Engine *engine, const char *serialized)
         main_chars = append_main_blocks(engine, &main_blocks, root, item.nodes.items[0], &rejected, &main_first, true);
     dbuf_puts(&main_blocks, "]");
     char *main_blocks_json = dbuf_take(&main_blocks);
+    /* An explicit profile is an authorisation to promote the named region,
+       including a full article page. The generic matcher still requires a
+       minority region so it does not duplicate ordinary Readability output. */
+    bool profile_selected = profile.name && *profile.name && item.source && d_eq(item.source, "profile-headline");
     bool main_found = item.nodes.length && main_chars >= DISTILL_MAIN_CONTENT_FLOOR &&
-                      main_content_is_a_minority(root, &item);
+                      (profile_selected || main_content_is_a_minority(root, &item));
     char *content = sanitize_content(readability.content); char *tables = table_json(root); char *search = search_json(engine, root, &rejected); char *forms = forms_json(engine, root, &rejected); char *videos = videos_json(engine, root, &rejected); char *media = media_json(engine, root, &rejected); char *links = links_json(engine, root, &rejected); char *structured = structured_data_json(engine, root);
     const char *selected = "structured-text"; if (d_eq(shape.kind, "article")) selected = readability.ok ? "readability" : "structured-text"; else if (d_eq(shape.kind, "table")) selected = "table"; else if (d_eq(shape.kind, "search-results")) selected = "search-results"; else if (d_eq(shape.kind, "form")) selected = "form"; else if (d_eq(shape.kind, "video")) selected = "video-metadata"; else if (d_eq(shape.kind, "image-heavy")) selected = "media-reference";
     DBuffer out; dbuf_init(&out); char *page_title = document_title(root);

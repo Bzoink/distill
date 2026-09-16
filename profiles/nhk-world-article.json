@@ -1,0 +1,12 @@
+{
+  "name": "nhk-world-article",
+  "match": {
+    "hosts": ["www3.nhk.or.jp"],
+    "paths": ["/nhkworld/en/news/202*"]
+  },
+  "main_content": {
+    "containers": ["main"],
+    "headings": ["h1"],
+    "title": "document-h1"
+  }
+}
