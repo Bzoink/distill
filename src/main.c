@@ -2248,13 +2248,19 @@ static void append_json_forms(Engine *engine, JSValueConst forms, DBuffer *outpu
                 append_html_escaped(output, *value ? value : "Submit");
                 dbuf_puts(output, "</button>");
             } else {
-                dbuf_puts(output, "<label class=\"form-field\">");
+                char control_id[64];
+                snprintf(control_id, sizeof(control_id), "distill-form-%lld-%lld",
+                         (long long)form_index, (long long)field_index);
+                dbuf_puts(output, "<label class=\"form-field-label\"");
+                append_json_attr(output, "for", control_id);
+                dbuf_puts(output, ">");
                 append_html_escaped(output, *label ? label : name);
-                dbuf_puts(output, "<input");
+                dbuf_puts(output, "</label><input class=\"form-field-input\"");
+                append_json_attr(output, "id", control_id);
                 append_json_attr(output, "type", d_eq(type, "search") ? "search" : "text");
                 append_json_attr(output, "name", name);
                 append_json_attr(output, "value", value);
-                dbuf_puts(output, "></label>");
+                dbuf_puts(output, ">");
             }
             free(label); free(name); free(type); free(value);
             JS_FreeValue(engine->context, field);
@@ -2380,7 +2386,8 @@ static void append_json_links(Engine *engine, JSValueConst links, DBuffer *outpu
     dbuf_puts(output, "</section>");
 }
 
-static char *reader_template(Engine *engine, const char *json, const char *theme)
+static char *reader_template(Engine *engine, const char *json, const char *theme,
+                             bool native_forms)
 {
     JSValue parsed = JS_ParseJSON(engine->context, json, strlen(json), "distill-extraction.json");
     if (JS_IsException(parsed)) {
@@ -2520,7 +2527,10 @@ static char *reader_template(Engine *engine, const char *json, const char *theme
         "table{width:100%;border-collapse:collapse;margin:0 0 1.5em;}th,td{text-align:left;padding:.55em .6em;border-bottom:1px solid var(--border);}"
         ".table-card,.form-card,.video-card,.media-gallery,.result-list{margin:2em 0;padding:1.2em;background:var(--card-background);border:1px solid var(--border);border-radius:5px;}"
         ".result-card{padding:.7em 0;border-bottom:1px solid var(--border);}.result-card h3{margin:0 0 .3em;}"
-        ".form-field{display:block;margin:.8em 0;color:var(--page-text);}.form-field input{display:block;width:100%;box-sizing:border-box;margin-top:.25em;padding:.55em;border:1px solid var(--border);border-radius:3px;background:var(--main-background);color:var(--page-text);}"
+        ".form-card form{margin:0;background:transparent;text-align:left;}"
+        ".form-field-label{display:block;margin:.7em 0 0;color:var(--page-text);text-align:left;}"
+        ".form-field-input{display:block;width:100%;height:28px;box-sizing:border-box;margin:3px 0 0;padding:.55em;border:1px solid var(--border);border-radius:3px;background:var(--main-background);color:var(--page-text);text-align:left;}"
+        ".form-card form>button{margin:.7em 0 0;text-align:left;}"
         "button,.button{display:inline-block;padding:.55em .85em;border:0;border-radius:3px;background:var(--link);color:white;text-decoration:none;font:inherit;}"
         ".video-card h2,.table-card h2,.form-card h2,.media-gallery h2,.result-list h2{margin-top:0;}"
         ".eyebrow,.media-url{font-size:.78em;color:var(--muted);}"
@@ -2535,6 +2545,20 @@ static char *reader_template(Engine *engine, const char *json, const char *theme
         ".link-index .main-content h2{font-size:1.45em;line-height:1.2;margin:1.7em 0 .55em;font-weight:bold;}"
         ".link-index .main-content h3{font-size:1.15em;line-height:1.25;margin:1.35em 0 .45em;font-weight:bold;}"
         ".main-rest{border-top:1px solid var(--border);padding-top:1.1em;margin-top:2.4em;margin-bottom:1.4em;}");
+    if (native_forms)
+        dbuf_puts(&output,
+                  ".form-card form input,.form-card form textarea,"
+                  ".form-card form select,.form-card form button{color:var(--card-background);"
+                  "background:var(--card-background);background-image:none;"
+                  "border-color:var(--card-background);text-shadow:none;}");
+    /* litehtml exposes a form control's content box. Native GTK controls are
+       positioned from that geometry, so remove the source input's padding and
+       border only while it is hidden behind its GTK replacement. Its reported
+       origin is then the control's outer edge: directly below the label and
+       aligned with it on the left. The explicit 28px border-box height stays
+       unchanged, so the following field keeps its reserved vertical space. */
+    if (native_forms)
+        dbuf_puts(&output, ".form-card form input{padding:0;border-width:0;}");
     /* Mirrored rules rather than logical properties: litehtml lays out the
        reader template, and physical sides are what it reliably supports. */
     if (rtl) {
@@ -2879,7 +2903,7 @@ static int run_page(const char *input, uint64_t cap_ms, uint64_t memory_mb,
                     const char *save_media_path, const char *fetch_media_path,
                     int render_width, int render_height,
                     const char *font_dir, const char *template_path,
-                    const char *theme, const char *request_method,
+                    const char *theme, bool native_forms, const char *request_method,
                     const char *request_data, const char *session_file)
 {
     Engine engine = {0};
@@ -3037,7 +3061,7 @@ static int run_page(const char *input, uint64_t cap_ms, uint64_t memory_mb,
     } else if (render_path) {
 #ifdef DISTILL_RENDER
         char *json = run_extraction(&engine, serialized);
-        char *template = reader_template(&engine, json, theme);
+        char *template = reader_template(&engine, json, theme, native_forms);
         bool template_ok = !template_path || write_file_bytes(template_path, template, strlen(template));
         /* Height 0 means "as tall as the content". Measure here rather than
            inside the renderer so the caller is told what it actually got: the
@@ -3065,7 +3089,7 @@ static int run_page(const char *input, uint64_t cap_ms, uint64_t memory_mb,
     } else if (template_path) {
 #ifdef DISTILL_RENDER
         char *json = run_extraction(&engine, serialized);
-        char *template = reader_template(&engine, json, theme);
+        char *template = reader_template(&engine, json, theme, native_forms);
         if (!*template || !write_file_bytes(template_path, template, strlen(template))) {
             fprintf(stderr, "unable to write reader template %s\n", template_path);
             result = 3;
@@ -3102,7 +3126,7 @@ static int run_page(const char *input, uint64_t cap_ms, uint64_t memory_mb,
 
 static void usage(const char *program)
 {
-    fprintf(stderr, "usage: %s --url URL [--dump-dom|--extract|--render FILE|--template FILE|--viewer FILE|--fetch-media FILE] [--media-index N] [--save-media FILE] [--width N] [--height N|0] [--font-dir DIR] [--theme warm|night|paper] [--request-method GET|POST] [--request-data DATA|--request-data-file FILE|-] [--session-file FILE] [--script-cap-ms N] [--memory-limit-mb N] [--max-scripts N]\n", program);
+    fprintf(stderr, "usage: %s --url URL [--dump-dom|--extract|--render FILE|--template FILE|--viewer FILE|--fetch-media FILE] [--media-index N] [--save-media FILE] [--width N] [--height N|0] [--font-dir DIR] [--theme warm|night|paper] [--native-forms] [--request-method GET|POST] [--request-data DATA|--request-data-file FILE|-] [--session-file FILE] [--script-cap-ms N] [--memory-limit-mb N] [--max-scripts N]\n", program);
     fprintf(stderr, "  --height 0            size the render to the content instead of cropping it.\n"
         "  --fetch-media FILE    fetch one image and write its bytes, with no scripts and no\n"
         "                        extraction. The format is taken from the bytes, not the\n"
@@ -3156,7 +3180,7 @@ int main(int argc, char **argv)
     uint64_t cap_ms = 5000, memory_mb = 128, max_scripts = 1000;
     int render_width = 760, render_height = 1100;
     int media_index = 0;
-    bool dump_dom = false, extract = false;
+    bool dump_dom = false, extract = false, native_forms = false;
     for (int i = 1; i < argc; ++i) {
         if (d_eq(argv[i], "--url") && i + 1 < argc) url = argv[++i];
         else if (d_eq(argv[i], "--dump-dom")) dump_dom = true;
@@ -3171,6 +3195,7 @@ int main(int argc, char **argv)
         else if (d_eq(argv[i], "--height") && i + 1 < argc) render_height = (int)strtol(argv[++i], NULL, 10);
         else if (d_eq(argv[i], "--font-dir") && i + 1 < argc) font_dir = argv[++i];
         else if (d_eq(argv[i], "--theme") && i + 1 < argc) theme = argv[++i];
+        else if (d_eq(argv[i], "--native-forms")) native_forms = true;
         else if (d_eq(argv[i], "--request-method") && i + 1 < argc) request_method = argv[++i];
         else if (d_eq(argv[i], "--request-data") && i + 1 < argc) request_data = argv[++i];
         else if (d_eq(argv[i], "--request-data-file") && i + 1 < argc) request_data_file = argv[++i];
@@ -3204,6 +3229,7 @@ int main(int argc, char **argv)
                           render_path, viewer_path, media_index, save_media_path,
                           fetch_media_path,
                           render_width, render_height, font_dir, template_path, theme,
+                          native_forms,
                           request_method, request_data, session_file);
     curl_global_cleanup();
     /* The body may hold a password; do not leave it in freed-but-readable

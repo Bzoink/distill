@@ -127,10 +127,17 @@ static void test_bundled_font_roles_are_available(void)
 int main(void)
 {
     const char *html =
-        /* Matches what the reader emits: block-level controls. */
-        "<!doctype html><style>body{font-size:18px}input{display:block;width:240px}</style>"
-        "<main><form action=\"https://example.test/search\" method=\"get\">"
-        "<label>Query<input type=\"search\" name=\"q\" value=\"reader\"></label>"
+        /* Matches the reader form structure: the label and control are
+           sibling blocks, so the control starts below and at the label's
+           left edge instead of becoming inline label content. */
+        "<!doctype html><style>html,body{margin:0}body{font-size:18px}"
+        ".form-field-label{display:block;text-align:left}"
+        ".form-field-input{display:block;width:240px;height:28px;margin:3px 0 0;"
+        "padding:10px;border:1px solid #000}.form-card form input{padding:0;border-width:0}</style>"
+        "<main class=\"form-card\"><form action=\"https://example.test/search\" method=\"get\">"
+        "<label class=\"form-field-label\" for=\"query\">Query</label>"
+        "<input id=\"query\" class=\"form-field-input\" type=\"search\""
+        " name=\"q\" value=\"reader\">"
         "<input type=\"hidden\" name=\"token\" value=\"keep\">"
         "<button type=\"submit\" name=\"go\">Search</button></form></main>";
     size_t count = distill_litehtml_form_boxes(html, 760, 800, NULL, NULL, 0);
@@ -139,17 +146,37 @@ int main(void)
     assert(distill_litehtml_form_boxes(html, 760, 800, NULL, boxes, 3) == 3);
     assert(strcmp(boxes[0].type, "search") == 0);
     assert(strcmp(boxes[0].name, "q") == 0);
-    /* get_placement reports the content box, and an empty text input has no
-       content, so its height is 0 however it is styled. Width is what the
-       shell positions from; it substitutes a minimum height. A control with
-       content, such as the button below, does report a height. */
+    /* The reader gives every input the same explicit height as its GTK
+       overlay. That makes litehtml reserve the vertical space rather than
+       putting the next label where an empty input's zero-height content box
+       would be. */
     assert(boxes[0].width > 0);
+    assert(boxes[0].height == 28);
+    assert(boxes[0].x == 0);
+    assert(boxes[0].y > 18);
     assert(strcmp(boxes[1].type, "hidden") == 0);
     assert(strcmp(boxes[1].value, "keep") == 0);
     assert(strcmp(boxes[2].tag, "button") == 0);
     assert(strcmp(boxes[2].value, "Search") == 0);
     assert(boxes[2].width > 0 && boxes[2].height > 0);
     assert(strcmp(boxes[2].action, "https://example.test/search") == 0);
+
+    /* An input's explicit height must become part of the next field's layout;
+       otherwise the GTK entry (which has a real allocation) covers the next
+       label even though the painted template looks correct on its own. */
+    const char *stacked_fields =
+        "<!doctype html><style>html,body{margin:0}body{font-size:18px}"
+        ".form-field-label{display:block;margin:.7em 0 0;text-align:left}"
+        ".form-field-input{display:block;width:240px;height:28px;margin:3px 0 0}</style>"
+        "<form><label class=\"form-field-label\">First</label>"
+        "<input class=\"form-field-input\" name=\"first\">"
+        "<label class=\"form-field-label\">Second</label>"
+        "<input class=\"form-field-input\" name=\"second\"></form>";
+    DFormBox stacked[2] = {0};
+    assert(distill_litehtml_form_boxes(stacked_fields, 760, 800, NULL, stacked, 2) == 2);
+    assert(stacked[0].height == 28 && stacked[1].height == 28);
+    assert(stacked[0].x == 0 && stacked[1].x == 0);
+    assert(stacked[1].y >= stacked[0].y + stacked[0].height + 20);
 
     /* Links are found by asking the laid-out document what is under a point,
        not by collecting rectangles. An inline anchor has no single placement --

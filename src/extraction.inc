@@ -1261,7 +1261,7 @@ static char *forms_json(Engine *engine, lxb_dom_node_t *root, size_t *rejected)
                 lxb_dom_element_t *field = lxb_dom_interface_element(fields.items[f]); char *name = attr_value(field, "name"); char *type_raw = attr_value(field, "type"); char *type = d_lower(type_raw); free(type_raw); if (!*type) { free(type); type = d_strdup(d_eq(tags[t], "button") ? "submit" : tags[t]); }
                 char *value = attr_value(field, "value"); if (!*value) { free(value); value = compact_text(fields.items[f]); }
                 char *id = attr_value(field, "id"); char *label = d_strdup(""); NodeVec labels = find_selector(root, "label");
-                for (size_t l = 0; l < labels.length; ++l) { char *for_id = attr_value(lxb_dom_interface_element(labels.items[l]), "for"); if ((*id && d_eq(id, for_id)) || labels.items[l]->parent == fields.items[f]->parent) { free(label); label = compact_text(labels.items[l]); free(for_id); break; } free(for_id); }
+                for (size_t l = 0; l < labels.length; ++l) { char *for_id = attr_value(lxb_dom_interface_element(labels.items[l]), "for"); if ((*id && d_eq(id, for_id)) || labels.items[l] == fields.items[f]->parent) { free(label); label = compact_text(labels.items[l]); free(for_id); break; } free(for_id); }
                 free(labels.items); free(id); if (!first_field) dbuf_puts(&out, ","); first_field = false;
                 char *ql = json_quote(label), *qn = json_quote(name), *qt = json_quote(type), *qv = json_quote(value); dbuf_printf(&out, "{\"label\":%s,\"name\":%s,\"type\":%s,\"value\":%s}", ql, qn, qt, qv); free(ql); free(qn); free(qt); free(qv); free(label); free(name); free(type); free(value);
             }

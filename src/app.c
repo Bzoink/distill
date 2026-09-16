@@ -112,6 +112,7 @@ struct App {
     GtkWidget *section_items[PAGE_SECTION_COUNT];
     GtkWidget *settings_button;
     GtkWidget *theme_items[3];
+    GtkCssProvider *form_css_provider;
     GtkWidget *status;
     GtkWidget *drawing_area;
     GtkWidget *event_box;
@@ -194,6 +195,120 @@ static void select_theme_id(App *app, const char *theme)
             gtk_check_menu_item_set_active(GTK_CHECK_MENU_ITEM(app->theme_items[i]), TRUE);
     }
     app->updating_theme = false;
+}
+
+static bool valid_theme_id(const char *theme)
+{
+    return theme && (strcmp(theme, "warm") == 0 ||
+                     strcmp(theme, "night") == 0 ||
+                     strcmp(theme, "paper") == 0);
+}
+
+static void update_form_theme(App *app, const char *theme)
+{
+    if (!app || !app->window) return;
+    if (!app->form_css_provider) {
+        app->form_css_provider = gtk_css_provider_new();
+        GdkScreen *screen = gtk_widget_get_screen(app->window);
+        if (screen)
+            gtk_style_context_add_provider_for_screen(
+                screen, GTK_STYLE_PROVIDER(app->form_css_provider),
+                GTK_STYLE_PROVIDER_PRIORITY_APPLICATION);
+    }
+
+    const char *entry_text = "#282622";
+    const char *entry_background = "#ffffff";
+    const char *border = "#cfc7bb";
+    const char *focus_border = "#165d7a";
+    const char *button_text = "#ffffff";
+    const char *button_background = "#165d7a";
+    const char *button_border = "#0f4a63";
+    const char *button_hover = "#1d708f";
+    if (theme && strcmp(theme, "night") == 0) {
+        entry_text = "#e7e2d8";
+        entry_background = "#202326";
+        border = "#454b50";
+        focus_border = "#78b9cf";
+        button_text = "#17191b";
+        button_background = "#78b9cf";
+        button_border = "#9ed1df";
+        button_hover = "#9ed1df";
+    } else if (theme && strcmp(theme, "paper") == 0) {
+        entry_text = "#332d24";
+        entry_background = "#ffffff";
+        border = "#d1c1a8";
+        focus_border = "#79533b";
+        button_background = "#79533b";
+        button_border = "#5f402d";
+        button_hover = "#936b4f";
+    }
+
+    char *css = g_strdup_printf(
+        ".distill-form-entry{color:%s;background-color:%s;background-image:none;"
+        "min-height:0;border:1px solid %s;border-radius:3px;padding:2px 6px;}"
+        ".distill-form-entry:focus{border-color:%s;}"
+        ".distill-form-button{color:%s;background-color:%s;background-image:none;"
+        "border:1px solid %s;border-radius:3px;padding:6px 12px;}"
+        ".distill-form-button:hover{background-color:%s;}",
+        entry_text, entry_background, border, focus_border,
+        button_text, button_background, button_border, button_hover);
+    GError *error = NULL;
+    gtk_css_provider_load_from_data(app->form_css_provider, css, -1, &error);
+    if (error) {
+        g_warning("forms: unable to apply theme: %s", error->message);
+        g_error_free(error);
+    }
+    g_free(css);
+}
+
+static char *browser_settings_path(void)
+{
+    return g_build_filename(g_get_user_config_dir(), "distill", "settings.ini", NULL);
+}
+
+static char *load_saved_theme(void)
+{
+    char *path = browser_settings_path();
+    GKeyFile *settings = g_key_file_new();
+    GError *error = NULL;
+    char *theme = NULL;
+    if (g_key_file_load_from_file(settings, path, G_KEY_FILE_NONE, &error)) {
+        theme = g_key_file_get_string(settings, "browser", "theme", &error);
+        if (!valid_theme_id(theme)) {
+            g_free(theme);
+            theme = NULL;
+        }
+    }
+    if (error) g_error_free(error);
+    if (!theme) theme = g_strdup("warm");
+    g_key_file_free(settings);
+    g_free(path);
+    return theme;
+}
+
+static void save_theme(const char *theme)
+{
+    if (!valid_theme_id(theme)) return;
+    char *directory = g_build_filename(g_get_user_config_dir(), "distill", NULL);
+    if (g_mkdir_with_parents(directory, 0700) != 0) {
+        g_warning("settings: unable to create %s: %s", directory, g_strerror(errno));
+        g_free(directory);
+        return;
+    }
+    char *path = g_build_filename(directory, "settings.ini", NULL);
+    GKeyFile *settings = g_key_file_new();
+    g_key_file_set_string(settings, "browser", "theme", theme);
+    GError *error = NULL;
+    gsize length = 0;
+    gchar *data = g_key_file_to_data(settings, &length, &error);
+    if (!data || !g_file_set_contents(path, data, (gssize)length, &error))
+        g_warning("settings: unable to save %s: %s", path,
+                  error ? error->message : "unknown error");
+    if (error) g_error_free(error);
+    g_free(data);
+    g_key_file_free(settings);
+    g_free(path);
+    g_free(directory);
 }
 
 /* Rebuilding the litehtml document resets the adjustment while GTK lays out
@@ -435,6 +550,7 @@ static bool run_engine(const LoadRequest *request, const char *template_path,
     add_arg(arguments, "0");
     add_arg(arguments, "--theme");
     add_arg(arguments, request->theme);
+    add_arg(arguments, "--native-forms");
     if (request->method && *request->method) {
         add_arg(arguments, "--request-method");
         add_arg(arguments, request->method);
@@ -1055,10 +1171,23 @@ static gboolean overlay_motion_notify(GtkWidget *widget, GdkEventMotion *event,
 
 static bool is_hidden(const DFormBox *box)
 {
-    return strcasecmp(box->type, "hidden") == 0 || box->height <= 0 || box->width <= 0;
+    /* Reader inputs have an explicit 28px layout height, and
+       add_native_controls retains the same fallback for any control that
+       still reports a zero-height replaced-element box. Only discard controls
+       that are explicitly hidden or have no horizontal placement at all. */
+    return strcasecmp(box->type, "hidden") == 0 || box->width <= 0;
 }
 
 static void form_submit(App *app, const FormControl *submit_control);
+
+static gboolean form_control_button_press(GtkWidget *widget, GdkEventButton *event,
+                                          gpointer opaque)
+{
+    (void)opaque;
+    if (event->type == GDK_BUTTON_PRESS && event->button == 1)
+        gtk_widget_grab_focus(widget);
+    return FALSE;
+}
 
 static void submit_clicked(GtkWidget *widget, gpointer opaque)
 {
@@ -1084,19 +1213,28 @@ static void add_native_controls(App *app)
         if (is_hidden(box)) continue;
         if (strcasecmp(box->type, "submit") == 0 || strcasecmp(box->tag, "button") == 0) {
             control->widget = gtk_button_new_with_label(box->value[0] ? box->value : "Submit");
+            gtk_style_context_add_class(gtk_widget_get_style_context(control->widget),
+                                         "distill-form-button");
             g_signal_connect(control->widget, "clicked", G_CALLBACK(submit_clicked), control);
         } else {
             control->widget = gtk_entry_new();
             gtk_entry_set_text(GTK_ENTRY(control->widget), box->value);
             gtk_entry_set_placeholder_text(GTK_ENTRY(control->widget), box->name);
+            gtk_entry_set_alignment(GTK_ENTRY(control->widget), 0.0);
             if (strcasecmp(box->type, "password") == 0)
                 gtk_entry_set_visibility(GTK_ENTRY(control->widget), FALSE);
+            gtk_style_context_add_class(gtk_widget_get_style_context(control->widget),
+                                         "distill-form-entry");
             g_signal_connect(control->widget, "activate", G_CALLBACK(submit_clicked), control);
         }
+        gtk_widget_set_can_focus(control->widget, TRUE);
+        gtk_widget_set_focus_on_click(control->widget, TRUE);
+        g_signal_connect(control->widget, "button-press-event",
+                         G_CALLBACK(form_control_button_press), NULL);
         g_object_set_data(G_OBJECT(control->widget), "distill-app", app);
         gtk_widget_set_size_request(control->widget,
                                     box->width > 20 ? box->width : 120,
-                                    box->height > 20 ? box->height : 34);
+                                    box->height > 20 ? box->height : 28);
         gtk_fixed_put(GTK_FIXED(app->form_layer), control->widget, box->x, box->y);
         gtk_widget_show(control->widget);
     }
@@ -1515,9 +1653,12 @@ static void theme_changed(GtkCheckMenuItem *item, gpointer opaque)
     if (!gtk_check_menu_item_get_active(item)) return;
     App *app = opaque;
     if (app->updating_theme || app->loading) return;
-    const DAppPage *page = d_app_history_current(&app->history);
     const char *theme = g_object_get_data(G_OBJECT(item), "distill-theme-id");
-    if (!theme || !page || strcmp(theme, page->theme) == 0) return;
+    if (!valid_theme_id(theme)) return;
+    save_theme(theme);
+    update_form_theme(app, theme);
+    const DAppPage *page = d_app_history_current(&app->history);
+    if (!page || strcmp(theme, page->theme) == 0) return;
     app_begin_load(app, page->url, NULL, NULL, true);
 }
 
@@ -1551,7 +1692,7 @@ static GtkWidget *make_sections_button(App *app)
 static GtkWidget *make_settings_button(App *app)
 {
     static const char *theme_ids[] = {"warm", "night", "paper"};
-    static const char *theme_labels[] = {"Warm light", "Night", "Paper"};
+    static const char *theme_labels[] = {"Warm (Light)", "Night (Dark)", "Paper (Light)"};
 
     GtkWidget *menu = gtk_menu_new();
     GtkWidget *external = gtk_menu_item_new_with_label("Open externally");
@@ -1607,6 +1748,14 @@ static void app_destroy(GtkWidget *widget, gpointer opaque)
     app->document = NULL;
     app->surface = NULL;
     clear_controls(app);
+    if (app->form_css_provider) {
+        GdkScreen *screen = gtk_widget_get_screen(app->window);
+        if (screen)
+            gtk_style_context_remove_provider_for_screen(
+                screen, GTK_STYLE_PROVIDER(app->form_css_provider));
+        g_object_unref(app->form_css_provider);
+        app->form_css_provider = NULL;
+    }
     d_app_history_clear(&app->history, page_dispose);
     if (app->page_media) g_ptr_array_free(app->page_media, TRUE);
     if (app->viewer_file) { unlink(app->viewer_file); g_free(app->viewer_file); }
@@ -1617,6 +1766,7 @@ static void app_destroy(GtkWidget *widget, gpointer opaque)
 static void app_activate(GtkApplication *application, gpointer opaque)
 {
     const char *initial_url = opaque;
+    char *saved_theme = load_saved_theme();
     App *app = g_new0(App, 1);
     app->application = G_APPLICATION(application);
     app->references = 1;
@@ -1654,6 +1804,9 @@ static void app_activate(GtkApplication *application, gpointer opaque)
     gtk_box_pack_start(GTK_BOX(toolbar), app->section_button, FALSE, FALSE, 0);
     app->settings_button = make_settings_button(app);
     gtk_box_pack_start(GTK_BOX(toolbar), app->settings_button, FALSE, FALSE, 0);
+    update_form_theme(app, saved_theme);
+    select_theme_id(app, saved_theme);
+    g_free(saved_theme);
 
     GtkWidget *scrolled = gtk_scrolled_window_new(NULL, NULL);
     gtk_scrolled_window_set_policy(GTK_SCROLLED_WINDOW(scrolled), GTK_POLICY_AUTOMATIC, GTK_POLICY_AUTOMATIC);
@@ -1685,8 +1838,10 @@ static void app_activate(GtkApplication *application, gpointer opaque)
     gtk_container_add(GTK_CONTAINER(app->event_box), app->drawing_area);
     gtk_container_add(GTK_CONTAINER(overlay), app->event_box);
     app->form_layer = gtk_fixed_new();
+    gtk_widget_set_can_focus(app->form_layer, FALSE);
     gtk_widget_set_size_request(app->form_layer, PAGE_WIDTH, PAGE_HEIGHT);
     gtk_overlay_add_overlay(GTK_OVERLAY(overlay), app->form_layer);
+    gtk_overlay_set_overlay_pass_through(GTK_OVERLAY(overlay), app->form_layer, FALSE);
 
     app->status = gtk_label_new("Ready");
     gtk_widget_set_halign(app->status, GTK_ALIGN_START);

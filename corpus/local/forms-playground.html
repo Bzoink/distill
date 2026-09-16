@@ -1,0 +1,111 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>Forms playground</title>
+<style>
+  :root { color-scheme: light; font: 16px/1.5 sans-serif; }
+  body { max-width: 760px; margin: 2rem auto; padding: 0 1.25rem; color: #252525; }
+  h1 { margin-bottom: .35rem; }
+  h2 { margin-top: 2rem; border-bottom: 1px solid #ccc; padding-bottom: .25rem; }
+  form { border: 1px solid #ccc; border-radius: .4rem; padding: 1rem; margin: 1rem 0; }
+  label, fieldset { display: block; margin: .8rem 0; }
+  fieldset { border: 1px solid #ddd; }
+  input, select, textarea, button { box-sizing: border-box; font: inherit; margin-top: .25rem; padding: .4rem; }
+  label > input, label > textarea, label > select { display: block; width: 100%; }
+  input[type="checkbox"], input[type="radio"] { width: auto; margin-right: .4rem; }
+  .choices label { display: inline-block; margin-right: 1rem; }
+  .actions { display: flex; gap: .6rem; align-items: center; }
+  .hint { color: #555; }
+</style>
+
+<h1>Forms playground</h1>
+<div class="hint">A local page for testing Distill's form extraction, native controls,
+  labels, GET/POST handling, and hidden fields.</div>
+<div class="hint">Test checklist: click and type in each field, move with Tab and Shift+Tab,
+  switch between Warm (Light) and Night (Dark), then submit a GET or POST form.</div>
+
+  <h2>1. Common text controls · GET</h2>
+  <form action="https://httpbin.org/get" method="get">
+    <label for="q">Search words</label>
+    <input id="q" name="q" type="search" value="reader forms">
+
+    <label for="email">Email address</label>
+    <input id="email" name="email" type="email" value="reader@example.test">
+
+    <label for="count">Number of pages</label>
+    <input id="count" name="count" type="number" value="3">
+
+    <label for="website">Website</label>
+    <input id="website" name="website" type="url" placeholder="https://example.test">
+
+    <div class="actions">
+      <input type="submit" value="Send GET">
+      <input type="reset" value="Reset fields">
+    </div>
+  </form>
+
+  <h2>2. Credentials and hidden state · POST</h2>
+  <form action="https://httpbin.org/post" method="post">
+    <label>Username
+      <input name="username" type="text" value="tonym">
+    </label>
+
+    <label for="password">Password</label>
+    <input id="password" name="password" type="password" value="not-a-real-password">
+
+    <label for="message">Message</label>
+    <textarea id="message" name="message" rows="4">A message with spaces and &amp; symbols.</textarea>
+
+    <input type="hidden" name="csrf_token" value="test-token-123">
+    <input type="hidden" name="origin" value="forms-playground">
+
+    <div class="actions">
+      <button type="submit" name="action" value="send">Send POST</button>
+    </div>
+  </form>
+
+  <h2>3. Choices and lists</h2>
+  <form action="https://httpbin.org/post" method="post">
+    <fieldset class="choices">
+      <legend>Preferred reading mode</legend>
+      <label><input type="radio" name="mode" value="focused" checked> Focused</label>
+      <label><input type="radio" name="mode" value="overview"> Overview</label>
+      <label><input type="radio" name="mode" value="original"> Original</label>
+    </fieldset>
+
+    <fieldset class="choices">
+      <legend>Topics</legend>
+      <label><input type="checkbox" name="topic" value="technology" checked> Technology</label>
+      <label><input type="checkbox" name="topic" value="sport"> Sport</label>
+      <label><input type="checkbox" name="topic" value="culture"> Culture</label>
+    </fieldset>
+
+    <label for="frequency">Delivery frequency</label>
+    <select id="frequency" name="frequency">
+      <option value="never">Never</option>
+      <option value="weekly" selected>Once a week</option>
+      <option value="daily">Every day</option>
+    </select>
+
+    <div class="actions">
+      <button type="submit">Save choices</button>
+    </div>
+  </form>
+
+  <h2>4. Labels, buttons, and edge cases</h2>
+  <form action="https://httpbin.org/get" method="get">
+    <label for="associated">Label associated with an id</label>
+    <input id="associated" name="associated" type="text" value="explicit label">
+
+    <label>Wrapping label
+      <input name="wrapped" type="text" value="parent label">
+    </label>
+
+    <input name="disabled" type="text" value="disabled value" disabled>
+    <input name="required" type="text" placeholder="required field" required>
+
+    <div class="actions">
+      <button type="submit" name="button_submit" value="yes">Button submit</button>
+      <input type="submit" name="input_submit" value="Input submit">
+      <button type="reset">Reset</button>
+    </div>
+  </form>
