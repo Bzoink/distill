@@ -290,6 +290,44 @@ extern "C" int distill_litehtml_document_link_at(DLiteHtmlDocument *document,
     return 0;
 }
 
+static litehtml::element::const_ptr choice_input_in_label(const litehtml::element::const_ptr &element)
+{
+    if (!element) return nullptr;
+    const char *tag = element->get_tagName();
+    const char *type = element->get_attr("type", "");
+    if (tag && !std::strcmp(tag, "input") &&
+        (!std::strcmp(type, "checkbox") || !std::strcmp(type, "radio"))) return element;
+    for (const auto &child : element->children()) {
+        litehtml::element::const_ptr choice = choice_input_in_label(child);
+        if (choice) return choice;
+    }
+    return nullptr;
+}
+
+extern "C" int distill_litehtml_document_choice_id_at(DLiteHtmlDocument *document,
+                                                        int x, int y,
+                                                        char *id_out, size_t id_capacity)
+{
+    if (id_out && id_capacity) id_out[0] = '\0';
+    if (!document || !document->document || !document->probe) return 0;
+    litehtml::position::vector redraw;
+    document->document->on_mouse_over(x, y, x, y, redraw);
+    litehtml::element::const_ptr over = document->document->get_over_element();
+    for (litehtml::element::const_ptr element = over; element; element = element->parent()) {
+        const char *tag = element->get_tagName();
+        if (!tag || std::strcmp(tag, "label")) continue;
+        litehtml::element::const_ptr input = choice_input_in_label(element);
+        const char *id = input ? input->get_attr("id", "") : "";
+        if (!id || !*id) return 0;
+        if (id_out && id_capacity) {
+            std::strncpy(id_out, id, id_capacity - 1);
+            id_out[id_capacity - 1] = '\0';
+        }
+        return 1;
+    }
+    return 0;
+}
+
 extern "C" int distill_litehtml_document_content_height(const DLiteHtmlDocument *document)
 {
     return document ? document->content_height : 0;
@@ -374,6 +412,54 @@ static bool is_form_control(const char *tag)
                    !std::strcmp(tag, "select") || !std::strcmp(tag, "textarea"));
 }
 
+/* DFormBox crosses the C++ layout/GTK boundary, so select choices travel in a
+   compact string rather than leaking litehtml nodes into C. Values and labels
+   come from our own reader template; replace the two separators if a page
+   happens to include them in an option. */
+static void append_option_piece(char *destination, size_t capacity, size_t *used,
+                                const char *text)
+{
+    if (!destination || !capacity || !used) return;
+    for (const unsigned char *p = (const unsigned char *)(text ? text : ""); *p; ++p) {
+        if (*used + 1 >= capacity) return;
+        destination[(*used)++] = (*p == 0x1e || *p == 0x1f) ? ' ' : (char)*p;
+    }
+    destination[*used] = '\0';
+}
+
+static void append_option_separator(char *destination, size_t capacity, size_t *used,
+                                    char separator)
+{
+    if (!destination || !capacity || !used || *used + 1 >= capacity) return;
+    destination[(*used)++] = separator;
+    destination[*used] = '\0';
+}
+
+static void collect_select_options(const litehtml::element::ptr &element, DFormBox *box,
+                                   size_t *used)
+{
+    if (!element || !box || !used) return;
+    const char *tag = element->get_tagName();
+    if (tag && !std::strcmp(tag, "option")) {
+        const char *raw_value = element->get_attr("value", "");
+        litehtml::string label;
+        element->get_text(label);
+        const char *value = raw_value && *raw_value ? raw_value : label.c_str();
+        bool selected = !std::strcmp(element->get_attr("data-distill-selected", ""), "1");
+        if (selected || !*box->value) {
+            copy_box_string(box->value, sizeof(box->value), value);
+        }
+        append_option_piece(box->options, sizeof(box->options), used, value);
+        append_option_separator(box->options, sizeof(box->options), used, '\x1f');
+        append_option_piece(box->options, sizeof(box->options), used, label.c_str());
+        append_option_separator(box->options, sizeof(box->options), used, '\x1f');
+        append_option_piece(box->options, sizeof(box->options), used, selected ? "1" : "0");
+        append_option_separator(box->options, sizeof(box->options), used, '\x1e');
+    }
+    for (const auto &child : element->children())
+        collect_select_options(child, box, used);
+}
+
 static void collect_form_boxes(const litehtml::element::ptr &element,
                                bool in_form, unsigned int form_index,
                                unsigned int &next_form_index, const char *action,
@@ -400,13 +486,30 @@ static void collect_form_boxes(const litehtml::element::ptr &element,
         box.height = position.height;
         box.form_index = child_form_index;
         copy_box_string(box.tag, sizeof(box.tag), tag);
-        copy_box_string(box.type, sizeof(box.type), element->get_attr("type", "text"));
+        const char *distill_type = element->get_attr("data-distill-type", "");
+        copy_box_string(box.type, sizeof(box.type),
+                        distill_type && *distill_type ? distill_type : element->get_attr("type", "text"));
+        copy_box_string(box.id, sizeof(box.id), element->get_attr("id", ""));
         copy_box_string(box.name, sizeof(box.name), element->get_attr("name", ""));
         copy_box_string(box.value, sizeof(box.value), element->get_attr("value", ""));
-        if (!box.value[0] && tag && !std::strcmp(tag, "button")) {
+        copy_box_string(box.placeholder, sizeof(box.placeholder),
+                        element->get_attr("placeholder", ""));
+        box.checked = !std::strcmp(element->get_attr("data-distill-checked", ""), "1");
+        box.disabled = !std::strcmp(element->get_attr("data-distill-disabled", ""), "1");
+        box.required = !std::strcmp(element->get_attr("data-distill-required", ""), "1");
+        if (tag && !std::strcmp(tag, "textarea")) {
             litehtml::string text;
             element->get_text(text);
             copy_box_string(box.value, sizeof(box.value), text.c_str());
+        }
+        if (tag && !std::strcmp(tag, "select")) {
+            size_t used = 0;
+            collect_select_options(element, &box, &used);
+        }
+        if (tag && !std::strcmp(tag, "button")) {
+            litehtml::string text;
+            element->get_text(text);
+            copy_box_string(box.caption, sizeof(box.caption), text.c_str());
         }
         copy_box_string(box.action, sizeof(box.action), child_action.c_str());
         copy_box_string(box.method, sizeof(box.method), child_method.c_str());

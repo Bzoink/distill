@@ -1938,6 +1938,14 @@ static char *json_property_string(Engine *engine, JSValueConst object, const cha
     return text;
 }
 
+static bool json_property_bool(Engine *engine, JSValueConst object, const char *name)
+{
+    JSValue value = JS_GetPropertyStr(engine->context, object, name);
+    bool result = JS_ToBool(engine->context, value);
+    JS_FreeValue(engine->context, value);
+    return result;
+}
+
 static void append_html_escaped(DBuffer *output, const char *text)
 {
     for (const char *cursor = text ? text : ""; *cursor; ++cursor) {
@@ -2214,6 +2222,35 @@ static void append_json_results(Engine *engine, JSValueConst results, DBuffer *o
     dbuf_puts(output, "</section>");
 }
 
+static void append_form_metadata(DBuffer *output, bool checked, bool disabled, bool required)
+{
+    if (checked) append_json_attr(output, "data-distill-checked", "1");
+    if (disabled) append_json_attr(output, "data-distill-disabled", "1");
+    if (required) append_json_attr(output, "data-distill-required", "1");
+}
+
+static void append_json_select_options(Engine *engine, JSValueConst options, DBuffer *output)
+{
+    int64_t count = json_array_length(engine, options);
+    for (int64_t i = 0; i < count; ++i) {
+        JSValue option = JS_GetPropertyUint32(engine->context, options, (uint32_t)i);
+        char *value = json_property_string(engine, option, "value");
+        char *label = json_property_string(engine, option, "label");
+        bool selected = json_property_bool(engine, option, "selected");
+        bool disabled = json_property_bool(engine, option, "disabled");
+        dbuf_puts(output, "<option");
+        append_json_attr(output, "value", value);
+        if (selected) append_json_attr(output, "data-distill-selected", "1");
+        if (disabled) append_json_attr(output, "data-distill-disabled", "1");
+        dbuf_puts(output, ">");
+        append_html_escaped(output, label);
+        dbuf_puts(output, "</option>");
+        free(value);
+        free(label);
+        JS_FreeValue(engine->context, option);
+    }
+}
+
 static void append_json_forms(Engine *engine, JSValueConst forms, DBuffer *output)
 {
     int64_t form_count = json_array_length(engine, forms);
@@ -2236,33 +2273,84 @@ static void append_json_forms(Engine *engine, JSValueConst forms, DBuffer *outpu
             char *name = json_property_string(engine, field, "name");
             char *type = json_property_string(engine, field, "type");
             char *value = json_property_string(engine, field, "value");
+            char *caption = json_property_string(engine, field, "caption");
+            char *placeholder = json_property_string(engine, field, "placeholder");
+            bool checked = json_property_bool(engine, field, "checked");
+            bool disabled = json_property_bool(engine, field, "disabled");
+            bool required = json_property_bool(engine, field, "required");
+            JSValue options = JS_GetPropertyStr(engine->context, field, "options");
+            char control_id[64];
+            snprintf(control_id, sizeof(control_id), "distill-form-%lld-%lld",
+                     (long long)form_index, (long long)field_index);
             if (d_eq(type, "hidden")) {
                 dbuf_puts(output, "<input type=\"hidden\"");
                 append_json_attr(output, "name", name);
                 append_json_attr(output, "value", value);
                 dbuf_puts(output, ">");
-            } else if (d_eq(type, "submit") || d_eq(type, "button")) {
-                dbuf_puts(output, "<button type=\"submit\"");
+            } else if (d_eq(type, "submit") || d_eq(type, "reset") || d_eq(type, "button")) {
+                dbuf_puts(output, "<button");
+                append_json_attr(output, "class", d_eq(type, "submit") ? "form-submit" : "form-button");
+                append_json_attr(output, "type", d_eq(type, "submit") ? "submit" : "button");
+                append_json_attr(output, "data-distill-type", type);
                 append_json_attr(output, "name", name);
+                append_json_attr(output, "value", value);
+                append_form_metadata(output, checked, disabled, required);
                 dbuf_puts(output, ">");
-                append_html_escaped(output, *value ? value : "Submit");
+                append_html_escaped(output, *caption ? caption : (*value ? value : "Submit"));
                 dbuf_puts(output, "</button>");
+            } else if (d_eq(type, "checkbox") || d_eq(type, "radio")) {
+                dbuf_puts(output, "<label class=\"form-choice\"><input class=\"form-choice-input\"");
+                append_json_attr(output, "id", control_id);
+                append_json_attr(output, "type", type);
+                append_json_attr(output, "name", name);
+                append_json_attr(output, "value", value);
+                append_form_metadata(output, checked, disabled, required);
+                dbuf_puts(output, "><span>");
+                append_html_escaped(output, *label ? label : name);
+                dbuf_puts(output, "</span></label>");
+            } else if (d_eq(type, "textarea")) {
+                dbuf_puts(output, "<label class=\"form-field-label\"");
+                append_json_attr(output, "for", control_id);
+                dbuf_puts(output, ">");
+                append_html_escaped(output, *label ? label : name);
+                dbuf_puts(output, "</label><textarea class=\"form-field-textarea\"");
+                append_json_attr(output, "id", control_id);
+                append_json_attr(output, "data-distill-type", "textarea");
+                append_json_attr(output, "name", name);
+                append_json_attr(output, "placeholder", placeholder);
+                append_form_metadata(output, checked, disabled, required);
+                dbuf_puts(output, ">");
+                append_html_escaped(output, value);
+                dbuf_puts(output, "</textarea>");
+            } else if (d_eq(type, "select")) {
+                dbuf_puts(output, "<label class=\"form-field-label\"");
+                append_json_attr(output, "for", control_id);
+                dbuf_puts(output, ">");
+                append_html_escaped(output, *label ? label : name);
+                dbuf_puts(output, "</label><select class=\"form-field-select\"");
+                append_json_attr(output, "id", control_id);
+                append_json_attr(output, "data-distill-type", "select");
+                append_json_attr(output, "name", name);
+                append_form_metadata(output, checked, disabled, required);
+                dbuf_puts(output, ">");
+                append_json_select_options(engine, options, output);
+                dbuf_puts(output, "</select>");
             } else {
-                char control_id[64];
-                snprintf(control_id, sizeof(control_id), "distill-form-%lld-%lld",
-                         (long long)form_index, (long long)field_index);
                 dbuf_puts(output, "<label class=\"form-field-label\"");
                 append_json_attr(output, "for", control_id);
                 dbuf_puts(output, ">");
                 append_html_escaped(output, *label ? label : name);
                 dbuf_puts(output, "</label><input class=\"form-field-input\"");
                 append_json_attr(output, "id", control_id);
-                append_json_attr(output, "type", d_eq(type, "search") ? "search" : "text");
+                append_json_attr(output, "type", *type ? type : "text");
                 append_json_attr(output, "name", name);
                 append_json_attr(output, "value", value);
+                append_json_attr(output, "placeholder", placeholder);
+                append_form_metadata(output, checked, disabled, required);
                 dbuf_puts(output, ">");
             }
-            free(label); free(name); free(type); free(value);
+            free(label); free(name); free(type); free(value); free(caption); free(placeholder);
+            JS_FreeValue(engine->context, options);
             JS_FreeValue(engine->context, field);
         }
         dbuf_puts(output, "</form></section>");
@@ -2530,7 +2618,12 @@ static char *reader_template(Engine *engine, const char *json, const char *theme
         ".form-card form{margin:0;background:transparent;text-align:left;}"
         ".form-field-label{display:block;margin:.7em 0 0;color:var(--page-text);text-align:left;}"
         ".form-field-input{display:block;width:100%;height:28px;box-sizing:border-box;margin:3px 0 0;padding:.55em;border:1px solid var(--border);border-radius:3px;background:var(--main-background);color:var(--page-text);text-align:left;}"
-        ".form-card form>button{margin:.7em 0 0;text-align:left;}"
+        ".form-field-textarea{display:block;width:100%;height:104px;box-sizing:border-box;margin:3px 0 0;padding:.55em;border:1px solid var(--border);border-radius:3px;background:var(--main-background);color:var(--page-text);font:inherit;text-align:left;resize:none;}"
+        ".form-field-select{display:block;width:100%;height:28px;box-sizing:border-box;margin:3px 0 0;padding:0 .35em;border:1px solid var(--border);border-radius:3px;background:var(--main-background);color:var(--page-text);font:inherit;text-align:left;}"
+        ".form-choice{display:block;margin:.55em 0 0;color:var(--page-text);text-align:left;}"
+        ".form-choice-input{display:inline-block;width:18px;height:18px;box-sizing:border-box;margin:0 .45em 0 0;padding:0;vertical-align:middle;}"
+        ".form-choice span{vertical-align:middle;}"
+        ".form-card form>button{margin:.7em .45em 0 0;text-align:left;}"
         "button,.button{display:inline-block;padding:.55em .85em;border:0;border-radius:3px;background:var(--link);color:white;text-decoration:none;font:inherit;}"
         ".video-card h2,.table-card h2,.form-card h2,.media-gallery h2,.result-list h2{margin-top:0;}"
         ".eyebrow,.media-url{font-size:.78em;color:var(--muted);}"
@@ -2552,13 +2645,13 @@ static char *reader_template(Engine *engine, const char *json, const char *theme
                   "background:var(--card-background);background-image:none;"
                   "border-color:var(--card-background);text-shadow:none;}");
     /* litehtml exposes a form control's content box. Native GTK controls are
-       positioned from that geometry, so remove the source input's padding and
-       border only while it is hidden behind its GTK replacement. Its reported
-       origin is then the control's outer edge: directly below the label and
-       aligned with it on the left. The explicit 28px border-box height stays
-       unchanged, so the following field keeps its reserved vertical space. */
+       positioned from that geometry, so remove the source control's padding
+       and border only while it is hidden behind its GTK replacement. Its
+       reported origin is then the outer edge that GTK must occupy. Explicit
+       border-box dimensions still reserve the following field's space. */
     if (native_forms)
-        dbuf_puts(&output, ".form-card form input{padding:0;border-width:0;}");
+        dbuf_puts(&output,
+                  ".form-card form input,.form-card form textarea,.form-card form select{padding:0;border-width:0;}");
     /* Mirrored rules rather than logical properties: litehtml lays out the
        reader template, and physical sides are what it reliably supports. */
     if (rtl) {
@@ -2586,10 +2679,12 @@ static char *reader_template(Engine *engine, const char *json, const char *theme
             append_json_blocks(engine, blocks, &output, true);
             append_json_table(engine, tables, &output);
             append_json_results(engine, results, &output);
-            append_json_forms(engine, forms, &output);
             append_json_videos(engine, videos, &output);
             append_json_media(engine, media, &output);
         }
+        /* Forms are separate interactive content, not text blocks. Keep them
+           available even when the reader selected the whole page as main. */
+        append_json_forms(engine, forms, &output);
     } else if (d_eq(shape_kind, "article") && *content) {
         dbuf_puts(&output, content);
     } else if (d_eq(shape_kind, "docs")) {

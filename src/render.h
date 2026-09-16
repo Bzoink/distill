@@ -49,10 +49,20 @@ typedef struct {
     unsigned int form_index;
     char tag[16];
     char type[32];
+    char id[64];
     char name[128];
     char value[512];
+    char caption[512];
+    char placeholder[256];
+    /* Each select choice is value, label, selectedness, separated by ASCII
+       unit/record separators. The renderer owns the markup; this compact C
+       ABI avoids exposing litehtml's C++ tree to the GTK shell. */
+    char options[4096];
     char action[2048];
     char method[16];
+    bool checked;
+    bool disabled;
+    bool required;
 } DFormBox;
 
 /* Hit-test data for links in the rendered reader template. */
@@ -116,6 +126,10 @@ size_t distill_litehtml_document_form_boxes(const DLiteHtmlDocument *document,
    the point is over a link. Answers for inline anchors, which have no box. */
 int distill_litehtml_document_link_at(DLiteHtmlDocument *document, int x, int y,
                                       char *href_out, size_t href_capacity);
+/* Returns the native input ID when a point belongs to a checkbox/radio label.
+   The GTK shell uses this to give the rendered label its normal click target. */
+int distill_litehtml_document_choice_id_at(DLiteHtmlDocument *document, int x, int y,
+                                           char *id_out, size_t id_capacity);
 
 size_t distill_litehtml_document_link_boxes(const DLiteHtmlDocument *document,
                                             DLinkBox *boxes, size_t box_capacity);

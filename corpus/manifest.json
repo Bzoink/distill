@@ -882,6 +882,23 @@
           ]
         }
       ]
+    },
+    {
+      "id": "33-logout-session",
+      "path": "account",
+      "gate": true,
+      "plan_section": "Sessions",
+      "exercises": ["session-file", "login", "logout", "cookie-expiry", "cross-run-cookies"],
+      "why": "Logging out is not just navigation to a signed-out page: it must expire the persistent cookie. The login and logout steps run in separate engine processes through one private session file; the final Account request proves the expired cookie was persisted.",
+      "session": [
+        {"path": "/login"},
+        {"path": "/login", "method": "POST", "data": "user=corpus&password=fixture-password&token=form-token-1"},
+        {"path": "/logout", "method": "POST"}
+      ],
+      "assertions": [
+        {"stage": "dom", "selector": "#content", "expect": "SIGNED-OUT"},
+        {"stage": "dom", "selector": "#content", "expect_absent": ["SIGNED-IN-AS-corpus", "LOGIN-REJECTED"]}
+      ]
     }
   ],
   "live": [

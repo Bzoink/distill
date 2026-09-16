@@ -28,6 +28,26 @@ the C23 Arm A extractor and checks the Phase 1 assertions and golden contracts.
 These are CI conditions, not judgement calls. `serve.py` can also be run alone
 (`./serve.py -p 8731`) to poke at a fixture by hand.
 
+### Native form lab
+
+Run the local server and open `http://127.0.0.1:8731/forms-lab.html` in
+Distill with native forms enabled:
+
+```sh
+./serve.py -p 8731
+../build/distill-gtk --url http://127.0.0.1:8731/forms-lab.html --native-forms
+```
+
+The lab covers GET and POST submission, hidden and disabled fields, text,
+password, multiline text, radios, checkboxes, a select menu, required fields,
+and reset controls. Every submission opens a local echo page showing the exact
+successful fields received by the server.
+
+For the session flow, follow the **Open the local sign-in form** link in that
+lab. Sign in as `corpus` / `fixture-password`; the Account page confirms the
+session and offers **Sign out**. Visiting Account again after logout shows
+`SIGNED-OUT`.
+
 `--extract` emits a versioned JSON contract containing the final URL and base
 URL, shape/confidence, selected extractor, Readability metadata/content, block
 text, tables, search results, forms, video metadata, media references, links,
@@ -275,7 +295,7 @@ asked only "did anything get drawn" passed the whole time.
 
 ## Sessions
 
-`27-login-session` is the only fixture whose subject is what happens *between*
+`27-login-session` and `33-logout-session` exercise what happens *between*
 runs. Each navigation is a separate engine process, so a session that lives in
 one process is no session at all: sign in, click a link, and you are signed
 out.
@@ -286,6 +306,10 @@ token arrive together; `/account` returns `SIGNED-IN-AS-corpus` only when a
 valid session cookie is present, and `401 SIGNED-OUT` otherwise. The two steps
 run as separate processes sharing nothing but a `--session-file`, and the
 assertion is simply that the third process reaches the gated page.
+
+`33-logout-session` signs in, posts the Account page's sign-out form, and then
+opens Account in a fourth process. It passes only when the cookie expiry sent
+by `/logout` survives that process boundary and Account reports `SIGNED-OUT`.
 
 The fixture fails without its `session` steps — dropping them yields
 `SIGNED-OUT` — so it tests the mechanism rather than the server.

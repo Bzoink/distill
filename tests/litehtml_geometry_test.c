@@ -157,9 +157,59 @@ int main(void)
     assert(strcmp(boxes[1].type, "hidden") == 0);
     assert(strcmp(boxes[1].value, "keep") == 0);
     assert(strcmp(boxes[2].tag, "button") == 0);
-    assert(strcmp(boxes[2].value, "Search") == 0);
+    assert(strcmp(boxes[2].caption, "Search") == 0);
     assert(boxes[2].width > 0 && boxes[2].height > 0);
     assert(strcmp(boxes[2].action, "https://example.test/search") == 0);
+
+    /* The GTK shell receives a compact representation of every native control
+       it needs to instantiate. In particular, a select retains option IDs and
+       selectedness rather than becoming an entry containing all option text. */
+    const char *native_controls =
+        "<!doctype html><style>html,body{margin:0}textarea,select{display:block;width:240px;height:28px}"
+        "textarea{height:72px}input[type=checkbox],input[type=radio]{width:18px;height:18px}</style>"
+        "<form><textarea data-distill-type=\"textarea\" name=\"message\""
+        " placeholder=\"Write here\">First line\nSecond line</textarea>"
+        "<select data-distill-type=\"select\" name=\"frequency\">"
+        "<option value=\"never\">Never</option>"
+        "<option value=\"weekly\" data-distill-selected=\"1\">Weekly</option></select>"
+        "<input type=\"checkbox\" name=\"topics\" value=\"tech\" data-distill-checked=\"1\">"
+        "<input type=\"radio\" name=\"mode\" value=\"focus\" data-distill-required=\"1\"></form>";
+    DFormBox native[4] = {0};
+    assert(distill_litehtml_form_boxes(native_controls, 760, 800, NULL, native, 4) == 4);
+    assert(strcmp(native[0].type, "textarea") == 0);
+    assert(strcmp(native[0].value, "First line\nSecond line") == 0);
+    assert(strcmp(native[0].placeholder, "Write here") == 0);
+    assert(strcmp(native[1].type, "select") == 0);
+    assert(strcmp(native[1].value, "weekly") == 0);
+    assert(strstr(native[1].options, "weekly\x1f" "Weekly\x1f" "1") != NULL);
+    assert(strcmp(native[2].type, "checkbox") == 0 && native[2].checked);
+    assert(strcmp(native[3].type, "radio") == 0 && native[3].required);
+
+    /* Choice labels are rendered by litehtml while their indicators are GTK
+       overlays. Hitting either label must identify the input it controls. */
+    const char *choice_page =
+        "<!doctype html><style>html,body{margin:0}body{font-size:18px}"
+        ".form-choice{display:block;margin:10px 0}.form-choice-input{width:18px;height:18px;"
+        "vertical-align:middle;margin:0 8px 0 0}.form-choice span{vertical-align:middle}</style>"
+        "<form><label class=\"form-choice\"><input id=\"choice-checkbox\""
+        " class=\"form-choice-input\" type=\"checkbox\"><span>Technology</span></label>"
+        "<label class=\"form-choice\"><input id=\"choice-radio\""
+        " class=\"form-choice-input\" type=\"radio\"><span>Focused</span></label></form>";
+    DLiteHtmlDocument *choice_document =
+        distill_litehtml_document_create(choice_page, 760, 300, NULL);
+    assert(choice_document);
+    bool found_checkbox = false, found_radio = false;
+    for (int y = 0; y < 180 && !(found_checkbox && found_radio); y += 2) {
+        for (int x = 0; x < 300; x += 2) {
+            char id[64] = {0};
+            if (!distill_litehtml_document_choice_id_at(choice_document, x, y, id, sizeof(id)))
+                continue;
+            if (!strcmp(id, "choice-checkbox")) found_checkbox = true;
+            if (!strcmp(id, "choice-radio")) found_radio = true;
+        }
+    }
+    assert(found_checkbox && found_radio);
+    distill_litehtml_document_destroy(choice_document);
 
     /* An input's explicit height must become part of the next field's layout;
        otherwise the GTK entry (which has a real allocation) covers the next

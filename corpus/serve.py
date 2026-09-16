@@ -14,13 +14,14 @@ lying) declaration stays authoritative -- see local/08-messy.html.
 """
 
 import argparse
+from html import escape
 import json
 import os
 import sys
 import threading
 import time
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
-from urllib.parse import urlparse, parse_qs
+from urllib.parse import urlparse, parse_qs, parse_qsl
 
 ROOT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "local")
 
@@ -72,6 +73,10 @@ class CorpusHandler(SimpleHTTPRequestHandler):
             self.wfile.write(page)
             return
 
+        if route.path == "/logout":
+            self.send_error(405, "Sign out requires POST")
+            return
+
         if route.path == "/account":
             cookies = self.headers.get("Cookie", "")
             signed_in = f"{SESSION_COOKIE}={SESSION_VALUE}" in cookies
@@ -82,6 +87,8 @@ class CorpusHandler(SimpleHTTPRequestHandler):
                    "<p>The session cookie sent with this request was issued to a "
                    "different process. Reaching this page at all is the assertion: "
                    "it means the login outlived the run that performed it.</p>"
+                   "<form method=\"post\" action=\"/logout\">"
+                   "<button type=\"submit\">Sign out</button></form>"
                    if signed_in else
                    "<p id=\"content\">SIGNED-OUT</p>"
                    "<p>No valid session cookie accompanied this request.</p>")
@@ -119,6 +126,10 @@ class CorpusHandler(SimpleHTTPRequestHandler):
 
         if route.path == "/health":
             self._json({"ok": True, "root": ROOT})
+            return
+
+        if route.path == "/forms-echo":
+            self._form_echo("GET", route.query)
             return
 
         if route.path == "/redirect":
@@ -163,6 +174,17 @@ class CorpusHandler(SimpleHTTPRequestHandler):
                 self.end_headers()
                 self.wfile.write(page)
             return
+        if route.path == "/logout":
+            # Expiring the same path-scoped cookie makes the following /account
+            # request prove that logout survived a separate reader process.
+            self.send_response(303)
+            self.send_header("Location", "/login")
+            self.send_header("Set-Cookie",
+                             f"{SESSION_COOKIE}=; Path=/; Max-Age=0; HttpOnly")
+            self.send_header("Content-Length", "0")
+            self.send_header("Cache-Control", "no-store")
+            self.end_headers()
+            return
         if route.path == "/network-contract":
             try:
                 length = max(0, int(self.headers.get("Content-Length", "0")))
@@ -170,6 +192,14 @@ class CorpusHandler(SimpleHTTPRequestHandler):
                 length = 0
             body = self.rfile.read(length).decode("utf-8", errors="replace")
             self._request_contract(body)
+            return
+        if route.path == "/forms-echo":
+            try:
+                length = max(0, int(self.headers.get("Content-Length", "0")))
+            except ValueError:
+                length = 0
+            body = self.rfile.read(length).decode("utf-8", errors="replace")
+            self._form_echo("POST", body)
             return
         self.send_error(405)
 
@@ -193,6 +223,34 @@ class CorpusHandler(SimpleHTTPRequestHandler):
         self.send_header("Cache-Control", "no-store")
         self.end_headers()
         self.wfile.write(response)
+
+    def _form_echo(self, method, encoded):
+        """Show successful form controls exactly as the server received them.
+
+        This is a manual test endpoint, not an API: an HTML response makes the
+        GTK reader's normal navigation path prove both GET and POST submission.
+        """
+        pairs = parse_qsl(encoded, keep_blank_values=True)
+        rows = "".join(
+            f"<tr><td>{escape(name)}</td><td>{escape(value)}</td></tr>"
+            for name, value in pairs
+        ) or "<tr><td colspan=\"2\">No successful controls were submitted.</td></tr>"
+        page = f"""<!doctype html><meta charset=\"utf-8\">
+<title>Form submission received</title><main>
+<h1>Form submission received</h1>
+<p id=\"content\">{escape(method)} request received by the local form lab.</p>
+<table><caption>Successful controls</caption><thead><tr><th>Name</th><th>Value</th></tr></thead>
+<tbody>{rows}</tbody></table>
+<h2>Encoded request</h2><pre>{escape(encoded or "(empty)")}</pre>
+<p><a href=\"/forms-lab.html\">Return to the form lab</a></p>
+</main>"""
+        body = page.encode("utf-8")
+        self.send_response(200)
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+        self.wfile.write(body)
 
     def _json(self, payload):
         body = json.dumps(payload).encode("utf-8")

@@ -1243,6 +1243,34 @@ static char *search_json(Engine *engine, lxb_dom_node_t *root, size_t *rejected)
     free(links.items); dbuf_puts(&out, "]"); return dbuf_take(&out);
 }
 
+static void append_form_options_json(lxb_dom_node_t *select, DBuffer *out)
+{
+    NodeVec options = find_selector(select, "option");
+    dbuf_puts(out, "[");
+    for (size_t i = 0; i < options.length; ++i) {
+        lxb_dom_element_t *option = lxb_dom_interface_element(options.items[i]);
+        char *value = attr_value(option, "value");
+        char *label = compact_text(options.items[i]);
+        if (!*value) {
+            free(value);
+            value = d_strdup(label);
+        }
+        if (i) dbuf_puts(out, ",");
+        char *quoted_value = json_quote(value);
+        char *quoted_label = json_quote(label);
+        dbuf_printf(out, "{\"value\":%s,\"label\":%s,\"selected\":%s,\"disabled\":%s}",
+                    quoted_value, quoted_label,
+                    has_attr(option, "selected") ? "true" : "false",
+                    has_attr(option, "disabled") ? "true" : "false");
+        free(quoted_value);
+        free(quoted_label);
+        free(value);
+        free(label);
+    }
+    free(options.items);
+    dbuf_puts(out, "]");
+}
+
 static char *forms_json(Engine *engine, lxb_dom_node_t *root, size_t *rejected)
 {
     DBuffer out; dbuf_init(&out); dbuf_puts(&out, "["); bool first_form = true; NodeVec forms = find_selector(root, "form");
@@ -1258,12 +1286,22 @@ static char *forms_json(Engine *engine, lxb_dom_node_t *root, size_t *rejected)
             NodeVec fields = find_selector(forms.items[i], tags[t]);
             for (size_t f = 0; f < fields.length; ++f) {
                 if (hidden_node(root, fields.items[f])) continue;
-                lxb_dom_element_t *field = lxb_dom_interface_element(fields.items[f]); char *name = attr_value(field, "name"); char *type_raw = attr_value(field, "type"); char *type = d_lower(type_raw); free(type_raw); if (!*type) { free(type); type = d_strdup(d_eq(tags[t], "button") ? "submit" : tags[t]); }
-                char *value = attr_value(field, "value"); if (!*value) { free(value); value = compact_text(fields.items[f]); }
+                lxb_dom_element_t *field = lxb_dom_interface_element(fields.items[f]); char *name = attr_value(field, "name"); char *type_raw = attr_value(field, "type"); char *type = d_lower(type_raw); free(type_raw); if (!*type) { free(type); type = d_strdup(d_eq(tags[t], "button") ? "submit" : d_eq(tags[t], "input") ? "text" : tags[t]); }
+                char *value = attr_value(field, "value"); if (!*value) { free(value); value = d_eq(tags[t], "textarea") ? node_text(fields.items[f]) : compact_text(fields.items[f]); }
+                char *caption = compact_text(fields.items[f]);
+                char *placeholder = attr_value(field, "placeholder");
                 char *id = attr_value(field, "id"); char *label = d_strdup(""); NodeVec labels = find_selector(root, "label");
                 for (size_t l = 0; l < labels.length; ++l) { char *for_id = attr_value(lxb_dom_interface_element(labels.items[l]), "for"); if ((*id && d_eq(id, for_id)) || labels.items[l] == fields.items[f]->parent) { free(label); label = compact_text(labels.items[l]); free(for_id); break; } free(for_id); }
                 free(labels.items); free(id); if (!first_field) dbuf_puts(&out, ","); first_field = false;
-                char *ql = json_quote(label), *qn = json_quote(name), *qt = json_quote(type), *qv = json_quote(value); dbuf_printf(&out, "{\"label\":%s,\"name\":%s,\"type\":%s,\"value\":%s}", ql, qn, qt, qv); free(ql); free(qn); free(qt); free(qv); free(label); free(name); free(type); free(value);
+                char *ql = json_quote(label), *qn = json_quote(name), *qt = json_quote(type), *qv = json_quote(value), *qc = json_quote(caption), *qp = json_quote(placeholder);
+                dbuf_printf(&out, "{\"label\":%s,\"name\":%s,\"type\":%s,\"value\":%s,\"caption\":%s,\"placeholder\":%s,\"checked\":%s,\"disabled\":%s,\"required\":%s,\"options\":", ql, qn, qt, qv, qc, qp,
+                            has_attr(field, "checked") ? "true" : "false",
+                            has_attr(field, "disabled") ? "true" : "false",
+                            has_attr(field, "required") ? "true" : "false");
+                if (d_eq(tags[t], "select")) append_form_options_json(fields.items[f], &out);
+                else dbuf_puts(&out, "[]");
+                dbuf_puts(&out, "}");
+                free(ql); free(qn); free(qt); free(qv); free(qc); free(qp); free(label); free(name); free(type); free(value); free(caption); free(placeholder);
             }
             free(fields.items);
         }

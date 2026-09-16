@@ -247,10 +247,19 @@ static void update_form_theme(App *app, const char *theme)
         ".distill-form-entry{color:%s;background-color:%s;background-image:none;"
         "min-height:0;border:1px solid %s;border-radius:3px;padding:2px 6px;}"
         ".distill-form-entry:focus{border-color:%s;}"
+        ".distill-form-textarea,.distill-form-select{color:%s;background-color:%s;"
+        "background-image:none;border:1px solid %s;border-radius:3px;}"
+        ".distill-form-textarea text{color:%s;background-color:%s;}"
+        /* Checkbox and radio boxes are placed using litehtml's exact inline
+           rectangle. Remove GTK's theme padding so their indicator starts at
+           that rectangle rather than being inset from the label's left edge. */
+        ".distill-form-choice{color:%s;padding:0;margin:0;min-width:0;min-height:0;}"
+        ".distill-form-choice check{margin:0;padding:0;min-width:0;min-height:0;}"
         ".distill-form-button{color:%s;background-color:%s;background-image:none;"
         "border:1px solid %s;border-radius:3px;padding:6px 12px;}"
         ".distill-form-button:hover{background-color:%s;}",
         entry_text, entry_background, border, focus_border,
+        entry_text, entry_background, border, entry_text, entry_background, entry_text,
         button_text, button_background, button_border, button_hover);
     GError *error = NULL;
     gtk_css_provider_load_from_data(app->form_css_provider, css, -1, &error);
@@ -1138,11 +1147,14 @@ static void open_link(App *app, const char *uri)
     }
 }
 
+static bool activate_choice_at(App *app, int x, int y);
+
 static gboolean page_button_press(GtkWidget *widget, GdkEventButton *event, gpointer opaque)
 {
     App *app = opaque;
     if (event->type != GDK_BUTTON_PRESS || event->button != 1) return FALSE;
-    return activate_link_at(app, event->x, document_y(app, widget, event->y));
+    int y = document_y(app, widget, event->y);
+    return activate_choice_at(app, event->x, y) || activate_link_at(app, event->x, y);
 }
 
 static gboolean page_motion_notify(GtkWidget *widget, GdkEventMotion *event,
@@ -1158,7 +1170,8 @@ static gboolean overlay_button_press(GtkWidget *widget, GdkEventButton *event,
 {
     App *app = opaque;
     if (event->type != GDK_BUTTON_PRESS || event->button != 1) return FALSE;
-    return activate_link_at(app, event->x, document_y(app, widget, event->y));
+    int y = document_y(app, widget, event->y);
+    return activate_choice_at(app, event->x, y) || activate_link_at(app, event->x, y);
 }
 
 static gboolean overlay_motion_notify(GtkWidget *widget, GdkEventMotion *event,
@@ -1205,23 +1218,165 @@ static size_t find_form_control_count(const App *app, unsigned int form_index)
     return count;
 }
 
+static bool form_type_is(const DFormBox *box, const char *type)
+{
+    return box && type && strcasecmp(box->type, type) == 0;
+}
+
+static bool form_control_is_submit(const FormControl *control)
+{
+    return control && form_type_is(&control->box, "submit");
+}
+
+static bool form_control_is_choice(const FormControl *control)
+{
+    return control && (form_type_is(&control->box, "checkbox") ||
+                       form_type_is(&control->box, "radio"));
+}
+
+static bool activate_choice_at(App *app, int x, int y)
+{
+    char id[64];
+    if (!app || !app->document ||
+        !distill_litehtml_document_choice_id_at(app->document, x, y, id, sizeof(id))) return false;
+    for (size_t i = 0; i < app->control_count; ++i) {
+        FormControl *control = &app->controls[i];
+        if (!form_control_is_choice(control) || control->box.disabled ||
+            strcmp(control->box.id, id) != 0 || !GTK_IS_TOGGLE_BUTTON(control->widget)) continue;
+        if (form_type_is(&control->box, "radio"))
+            gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(control->widget), TRUE);
+        else
+            gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(control->widget),
+                                         !gtk_toggle_button_get_active(GTK_TOGGLE_BUTTON(control->widget)));
+        gtk_widget_grab_focus(control->widget);
+        return true;
+    }
+    return false;
+}
+
+static GtkRadioButton *radio_anchor(const App *app, size_t before,
+                                    const FormControl *control)
+{
+    if (!app || !control || !form_type_is(&control->box, "radio")) return NULL;
+    for (size_t i = 0; i < before; ++i) {
+        const FormControl *candidate = &app->controls[i];
+        if (candidate->box.form_index != control->box.form_index ||
+            !form_type_is(&candidate->box, "radio") ||
+            strcmp(candidate->box.name, control->box.name) != 0 ||
+            !GTK_IS_RADIO_BUTTON(candidate->widget)) continue;
+        return GTK_RADIO_BUTTON(candidate->widget);
+    }
+    return NULL;
+}
+
+static void select_initial_option(GtkComboBoxText *combo, const char *options,
+                                  const char *initial_value)
+{
+    int active = -1;
+    int index = 0;
+    for (const char *cursor = options ? options : ""; *cursor;) {
+        const char *end = strchr(cursor, '\x1e');
+        size_t length = end ? (size_t)(end - cursor) : strlen(cursor);
+        char *record = g_strndup(cursor, length);
+        gchar **parts = g_strsplit(record, "\x1f", 3);
+        if (parts[0] && parts[1]) {
+            gtk_combo_box_text_append(combo, parts[0], parts[1]);
+            if (parts[2] && strcmp(parts[2], "1") == 0) active = index;
+            else if (active < 0 && initial_value && *initial_value &&
+                     strcmp(parts[0], initial_value) == 0) active = index;
+            ++index;
+        }
+        g_strfreev(parts);
+        g_free(record);
+        if (!end) break;
+        cursor = end + 1;
+    }
+    if (active >= 0) gtk_combo_box_set_active(GTK_COMBO_BOX(combo), active);
+    else if (index > 0) gtk_combo_box_set_active(GTK_COMBO_BOX(combo), 0);
+}
+
+static void reset_select_option(GtkComboBox *combo, const char *initial_value)
+{
+    if (!combo) return;
+    if (!initial_value || !*initial_value ||
+        !gtk_combo_box_set_active_id(combo, initial_value))
+        gtk_combo_box_set_active(combo, 0);
+}
+
+static void reset_control(FormControl *control)
+{
+    if (!control || !control->widget || control->box.disabled) return;
+    if (GTK_IS_ENTRY(control->widget)) {
+        gtk_entry_set_text(GTK_ENTRY(control->widget), control->box.value);
+    } else if (GTK_IS_TEXT_VIEW(control->widget)) {
+        GtkTextBuffer *buffer = gtk_text_view_get_buffer(GTK_TEXT_VIEW(control->widget));
+        gtk_text_buffer_set_text(buffer, control->box.value, -1);
+    } else if (GTK_IS_COMBO_BOX(control->widget)) {
+        reset_select_option(GTK_COMBO_BOX(control->widget), control->box.value);
+    } else if (GTK_IS_TOGGLE_BUTTON(control->widget)) {
+        gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(control->widget), control->box.checked);
+    }
+}
+
+static void reset_clicked(GtkWidget *widget, gpointer opaque)
+{
+    (void)widget;
+    FormControl *reset = opaque;
+    App *app = reset && reset->widget
+        ? g_object_get_data(G_OBJECT(reset->widget), "distill-app") : NULL;
+    if (!app || !reset) return;
+    for (size_t i = 0; i < app->control_count; ++i)
+        if (app->controls[i].box.form_index == reset->box.form_index)
+            reset_control(&app->controls[i]);
+}
+
 static void add_native_controls(App *app)
 {
     for (size_t i = 0; i < app->form_count; ++i) {
         FormControl *control = &app->controls[i];
         const DFormBox *box = &control->box;
         if (is_hidden(box)) continue;
-        if (strcasecmp(box->type, "submit") == 0 || strcasecmp(box->tag, "button") == 0) {
-            control->widget = gtk_button_new_with_label(box->value[0] ? box->value : "Submit");
+        if (form_type_is(box, "submit") || form_type_is(box, "reset") ||
+            form_type_is(box, "button")) {
+            control->widget = gtk_button_new_with_label(box->caption[0] ? box->caption :
+                                                         (box->value[0] ? box->value : "Submit"));
             gtk_style_context_add_class(gtk_widget_get_style_context(control->widget),
                                          "distill-form-button");
-            g_signal_connect(control->widget, "clicked", G_CALLBACK(submit_clicked), control);
+            if (form_type_is(box, "submit"))
+                g_signal_connect(control->widget, "clicked", G_CALLBACK(submit_clicked), control);
+            else if (form_type_is(box, "reset"))
+                g_signal_connect(control->widget, "clicked", G_CALLBACK(reset_clicked), control);
+        } else if (form_type_is(box, "checkbox")) {
+            control->widget = gtk_check_button_new();
+            gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(control->widget), box->checked);
+            gtk_style_context_add_class(gtk_widget_get_style_context(control->widget),
+                                         "distill-form-choice");
+        } else if (form_type_is(box, "radio")) {
+            GtkRadioButton *anchor = radio_anchor(app, i, control);
+            control->widget = anchor ? gtk_radio_button_new_from_widget(anchor)
+                                     : gtk_radio_button_new(NULL);
+            gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(control->widget), box->checked);
+            gtk_style_context_add_class(gtk_widget_get_style_context(control->widget),
+                                         "distill-form-choice");
+        } else if (form_type_is(box, "select")) {
+            control->widget = gtk_combo_box_text_new();
+            select_initial_option(GTK_COMBO_BOX_TEXT(control->widget), box->options, box->value);
+            gtk_style_context_add_class(gtk_widget_get_style_context(control->widget),
+                                         "distill-form-select");
+        } else if (form_type_is(box, "textarea")) {
+            control->widget = gtk_text_view_new();
+            GtkTextBuffer *buffer = gtk_text_view_get_buffer(GTK_TEXT_VIEW(control->widget));
+            gtk_text_buffer_set_text(buffer, box->value, -1);
+            gtk_text_view_set_wrap_mode(GTK_TEXT_VIEW(control->widget), GTK_WRAP_WORD_CHAR);
+            gtk_style_context_add_class(gtk_widget_get_style_context(control->widget),
+                                         "distill-form-textarea");
         } else {
             control->widget = gtk_entry_new();
             gtk_entry_set_text(GTK_ENTRY(control->widget), box->value);
-            gtk_entry_set_placeholder_text(GTK_ENTRY(control->widget), box->name);
+            gtk_entry_set_placeholder_text(GTK_ENTRY(control->widget),
+                                           box->placeholder[0] ? box->placeholder : box->name);
             gtk_entry_set_alignment(GTK_ENTRY(control->widget), 0.0);
-            if (strcasecmp(box->type, "password") == 0)
+            if (form_type_is(box, "password"))
                 gtk_entry_set_visibility(GTK_ENTRY(control->widget), FALSE);
             gtk_style_context_add_class(gtk_widget_get_style_context(control->widget),
                                          "distill-form-entry");
@@ -1232,10 +1387,21 @@ static void add_native_controls(App *app)
         g_signal_connect(control->widget, "button-press-event",
                          G_CALLBACK(form_control_button_press), NULL);
         g_object_set_data(G_OBJECT(control->widget), "distill-app", app);
-        gtk_widget_set_size_request(control->widget,
-                                    box->width > 20 ? box->width : 120,
-                                    box->height > 20 ? box->height : 28);
-        gtk_fixed_put(GTK_FIXED(app->form_layer), control->widget, box->x, box->y);
+        gtk_widget_set_sensitive(control->widget, !box->disabled);
+        /* Entries need a usable fallback when CSS supplied no size. A choice
+           already has an exact 18px inline rectangle; enlarging it to the
+           entry fallback moves the GTK indicator away from the painted label. */
+        int control_width = form_control_is_choice(control)
+            ? (box->width > 0 ? box->width : 18)
+            : (box->width > 20 ? box->width : 120);
+        int control_height = form_control_is_choice(control)
+            ? (box->height > 0 ? box->height : 18)
+            : (box->height > 20 ? box->height : 28);
+        gtk_widget_set_size_request(control->widget, control_width, control_height);
+        /* GTK's check/radio glyph is visually inset from its allocation. Lift
+           the overlay slightly to meet the baseline of the painted label. */
+        int control_y = box->y - (form_control_is_choice(control) ? 4 : 0);
+        gtk_fixed_put(GTK_FIXED(app->form_layer), control->widget, box->x, control_y);
         gtk_widget_show(control->widget);
     }
 }
@@ -1276,7 +1442,60 @@ static const char *control_value(const FormControl *control, char **owned)
     *owned = NULL;
     if (!control->widget) return control->box.value;
     if (GTK_IS_ENTRY(control->widget)) return gtk_entry_get_text(GTK_ENTRY(control->widget));
+    if (GTK_IS_TEXT_VIEW(control->widget)) {
+        GtkTextBuffer *buffer = gtk_text_view_get_buffer(GTK_TEXT_VIEW(control->widget));
+        GtkTextIter start, end;
+        gtk_text_buffer_get_bounds(buffer, &start, &end);
+        *owned = gtk_text_buffer_get_text(buffer, &start, &end, FALSE);
+        return *owned;
+    }
+    if (GTK_IS_COMBO_BOX(control->widget)) {
+        const char *value = gtk_combo_box_get_active_id(GTK_COMBO_BOX(control->widget));
+        return value ? value : "";
+    }
+    if (GTK_IS_TOGGLE_BUTTON(control->widget))
+        return gtk_toggle_button_get_active(GTK_TOGGLE_BUTTON(control->widget))
+            ? control->box.value : "";
     return control->box.value;
+}
+
+static bool radio_group_is_active(const App *app, const FormControl *radio)
+{
+    if (!app || !radio) return false;
+    for (size_t i = 0; i < app->control_count; ++i) {
+        const FormControl *candidate = &app->controls[i];
+        if (candidate->box.form_index != radio->box.form_index ||
+            !form_type_is(&candidate->box, "radio") ||
+            strcmp(candidate->box.name, radio->box.name) != 0 ||
+            !GTK_IS_TOGGLE_BUTTON(candidate->widget)) continue;
+        if (gtk_toggle_button_get_active(GTK_TOGGLE_BUTTON(candidate->widget))) return true;
+    }
+    return false;
+}
+
+static bool form_control_is_empty(const App *app, const FormControl *control)
+{
+    if (!control) return true;
+    if (form_type_is(&control->box, "radio")) return !radio_group_is_active(app, control);
+    if (form_control_is_choice(control))
+        return !control->widget || !gtk_toggle_button_get_active(GTK_TOGGLE_BUTTON(control->widget));
+    char *owned = NULL;
+    const char *value = control_value(control, &owned);
+    bool empty = !value || !*value;
+    g_free(owned);
+    return empty;
+}
+
+static bool form_control_is_successful(const FormControl *control,
+                                       const FormControl *submit_control)
+{
+    if (!control || control->box.disabled || !control->box.name[0]) return false;
+    if (form_control_is_submit(control)) return control == submit_control;
+    if (form_type_is(&control->box, "reset") || form_type_is(&control->box, "button"))
+        return false;
+    if (form_control_is_choice(control))
+        return control->widget && gtk_toggle_button_get_active(GTK_TOGGLE_BUTTON(control->widget));
+    return true;
 }
 
 static char *append_query(const char *action, const char *data)
@@ -1301,10 +1520,22 @@ static void form_submit(App *app, const FormControl *submit_control)
     const char *method = submit_control->box.method[0] ? submit_control->box.method : "get";
     for (size_t i = 0; i < app->control_count; ++i) {
         const FormControl *control = &app->controls[i];
-        if (control->box.form_index != form_index) continue;
-        if (strcasecmp(control->box.type, "submit") == 0 || strcasecmp(control->box.tag, "button") == 0) {
-            if (control != submit_control) continue;
+        if (control->box.form_index != form_index || control->box.disabled ||
+            !control->box.required || form_control_is_submit(control) ||
+            form_type_is(&control->box, "reset") || form_type_is(&control->box, "button")) continue;
+        if (form_control_is_empty(app, control)) {
+            char *message = g_strdup_printf("Complete required field: %s",
+                                            control->box.name[0] ? control->box.name : "field");
+            set_status(app, message);
+            g_free(message);
+            dbuf_free(&data);
+            return;
         }
+    }
+    for (size_t i = 0; i < app->control_count; ++i) {
+        const FormControl *control = &app->controls[i];
+        if (control->box.form_index != form_index) continue;
+        if (!form_control_is_successful(control, submit_control)) continue;
         char *owned = NULL;
         const char *value = control_value(control, &owned);
         append_form_pair(&data, control->box.name, value);
