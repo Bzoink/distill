@@ -206,11 +206,20 @@ static char *compact_text(lxb_dom_node_t *node)
     char *raw = node_text(node);
     DBuffer out; dbuf_init(&out);
     bool space = false;
-    for (size_t i = 0; raw[i]; ++i) {
-        if (d_isspace(raw[i])) { if (out.length) space = true; continue; }
+    size_t length = strlen(raw);
+    for (size_t i = 0; i < length;) {
+        size_t whitespace = 0;
+        const unsigned char *current = (const unsigned char *)raw + i;
+        if (d_isspace((char)*current)) whitespace = 1;
+        else if (i + 1 < length && current[0] == 0xc2 && current[1] == 0xa0) whitespace = 2;
+        else if (i + 2 < length && current[0] == 0xe2 && current[1] == 0x80 &&
+                 ((current[2] >= 0x80 && current[2] <= 0x8a) || current[2] == 0xaf)) whitespace = 3;
+        else if (i + 2 < length && current[0] == 0xe3 && current[1] == 0x80 && current[2] == 0x80) whitespace = 3;
+        if (whitespace) { if (out.length) space = true; i += whitespace; continue; }
         if (space && out.length) dbuf_puts(&out, " ");
         space = false;
         dbuf_append(&out, raw + i, 1);
+        ++i;
     }
     free(raw);
     return dbuf_take(&out);
@@ -964,34 +973,53 @@ static bool main_content_try_headline(lxb_dom_node_t *root, const StringVec *pro
     return false;
 }
 
-/* Without a selector the page still says what it is about. og:title names the
-   requested item and a stream marks each item with a heading inside its entry
-   container. Some streams use one <article> per item; others use one outer
-   <article> and a semantic marker on each entry. A document holding a single
-   article is simply an article: hoisting it would move nothing, and claiming
-   to have found a needle in a haystack of one is worse than saying nothing. */
+/* The page still says what it is about even when it provides no usable
+   selector. og:title or the document h1 names the requested item, and a
+   semantic region containing that visible heading is strong evidence for the
+   main content. Streams without such a heading fall through to JSON-LD. */
 static MainContent main_content_by_headline(lxb_dom_node_t *root,
                                             const MainContentProfile *profile)
 {
     MainContent item = {0};
-    const char *title_source = profile && profile->title_source && *profile->title_source
-                                   ? profile->title_source : "og:title";
-    char *wanted = profile_title_value(root, title_source);
-    if (!*wanted) { free(wanted); return item; }
-
-    const char *generic_containers[] = {"article", "*[role=\"article\"]"};
     const StringVec *profile_containers = profile && profile->containers.length ? &profile->containers : NULL;
-    if (profile_containers)
-        main_content_try_headline(root, profile_containers, NULL, 0, false, wanted,
-                                  profile ? &profile->headings : NULL, &item,
-                                  "profile-headline", profile->name);
-    if (!item.nodes.length)
+    if (profile_containers) {
+        const char *title_source = profile->title_source && *profile->title_source
+                                       ? profile->title_source : "og:title";
+        char *wanted = profile_title_value(root, title_source);
+        if (*wanted)
+            main_content_try_headline(root, profile_containers, NULL, 0, false, wanted,
+                                      &profile->headings, &item,
+                                      "profile-headline", profile->name);
+        if (item.nodes.length) {
+            item.selector = d_strdup("");
+            item.title = wanted;
+            return item;
+        }
+        free(wanted);
+    }
+
+    /* Most article pages expose one semantic region, not a stream of sibling
+       candidates. A matching visible headline is strong evidence there, so
+       these generic candidates do not need the old multiple-candidate guard. */
+    const char *generic_containers[] = {
+        "article", "*[role=\"article\"]", "main", "*[role=\"main\"]",
+        "section", "*[itemprop=\"articleBody\"]",
+        "*[data-selector=\"content-wrapper\"]"
+    };
+    const char *title_sources[] = {"og:title", "document-h1"};
+    for (size_t t = 0; t < sizeof(title_sources) / sizeof(title_sources[0]); ++t) {
+        char *wanted = profile_title_value(root, title_sources[t]);
+        if (!*wanted) { free(wanted); continue; }
         main_content_try_headline(root, NULL, generic_containers,
                                   sizeof(generic_containers) / sizeof(generic_containers[0]),
-                                  true, wanted, NULL, &item, "article-headline", NULL);
-    if (!item.nodes.length) { free(wanted); return item; }
-    item.selector = d_strdup("");
-    item.title = wanted;
+                                  false, wanted, NULL, &item, "article-headline", NULL);
+        if (item.nodes.length) {
+            item.selector = d_strdup("");
+            item.title = wanted;
+            return item;
+        }
+        free(wanted);
+    }
     return item;
 }
 
@@ -999,6 +1027,20 @@ static MainContent find_main_content(Engine *engine, lxb_dom_node_t *root,
                                      const MainContentProfile *profile)
 {
     MainContent item = {0};
+    /* An explicit site profile identifies the requested article region. Give
+       that authorisation precedence over page-controlled JSON-LD hasPart
+       selectors, which often point only at a paywall or ad wrapper. */
+    if (profile && profile->containers.length) {
+        item = main_content_by_headline(root, profile);
+        if (item.nodes.length) return item;
+        free_main_content(&item);
+    }
+    /* Prefer a visible semantic headline over page-controlled JSON-LD
+       hasPart selectors. The latter often point only at a paywall or ad
+       wrapper; retaining it as a fallback preserves liveblog extraction. */
+    item = main_content_by_headline(root, NULL);
+    if (item.nodes.length) return item;
+    free_main_content(&item);
     char *selector = d_strdup(""), *title = d_strdup("");
     NodeVec scripts = find_selector(root, "script");
     for (size_t i = 0; i < scripts.length && !*selector; ++i) {
@@ -1023,7 +1065,7 @@ static MainContent find_main_content(Engine *engine, lxb_dom_node_t *root,
     free(scripts.items);
     /* The selector is page-controlled and may name a region this document does
        not have, or use syntax the matcher does not implement. Either way the
-       result is no match, and the article fallback still gets its turn. */
+       result is no match. */
     if (*selector) {
         NodeVec matched = find_selector(root, selector);
         for (size_t i = 0; i < matched.length; ++i)
@@ -1039,7 +1081,7 @@ static MainContent find_main_content(Engine *engine, lxb_dom_node_t *root,
         item.nodes = (NodeVec){0};
     }
     free(selector); free(title);
-    return main_content_by_headline(root, profile);
+    return (MainContent){0};
 }
 
 /* A permalinked item commonly appears twice -- pinned at the top of the stream
@@ -1355,12 +1397,22 @@ static char *run_extraction(Engine *engine, const char *serialized)
         main_chars = append_main_blocks(engine, &main_blocks, root, item.nodes.items[0], &rejected, &main_first, true);
     dbuf_puts(&main_blocks, "]");
     char *main_blocks_json = dbuf_take(&main_blocks);
-    /* An explicit profile is an authorisation to promote the named region,
-       including a full article page. The generic matcher still requires a
-       minority region so it does not duplicate ordinary Readability output. */
+    /* An explicit profile authorises promotion of the named region, including
+       a full article page. A generic headline match is also strong enough to
+       identify a short article or video, while ordinary selector matches keep
+       the existing prose-floor and minority-region safeguards. */
     bool profile_selected = profile.name && *profile.name && item.source && d_eq(item.source, "profile-headline");
-    bool main_found = item.nodes.length && main_chars >= DISTILL_MAIN_CONTENT_FLOOR &&
-                      (profile_selected || main_content_is_a_minority(root, &item));
+    /* A profile or matching visible headline may identify a short video or
+       paywalled article whose text is below the normal prose floor. */
+    /* Image-heavy pages often have a perfectly valid <main><h1>, but their
+       media registry is the content the reader must render. Do not let the
+       headline promotion hide that shape-specific output. */
+    bool headline_selected = item.source && d_eq(item.source, "article-headline") &&
+                             !d_eq(shape.kind, "image-heavy");
+    bool main_found = item.nodes.length &&
+                      ((profile_selected || headline_selected) ? main_chars > 0 :
+                       main_chars >= DISTILL_MAIN_CONTENT_FLOOR &&
+                       main_content_is_a_minority(root, &item));
     char *content = sanitize_content(readability.content); char *tables = table_json(root); char *search = search_json(engine, root, &rejected); char *forms = forms_json(engine, root, &rejected); char *videos = videos_json(engine, root, &rejected); char *media = media_json(engine, root, &rejected); char *links = links_json(engine, root, &rejected); char *structured = structured_data_json(engine, root);
     const char *selected = "structured-text"; if (d_eq(shape.kind, "article")) selected = readability.ok ? "readability" : "structured-text"; else if (d_eq(shape.kind, "table")) selected = "table"; else if (d_eq(shape.kind, "search-results")) selected = "search-results"; else if (d_eq(shape.kind, "form")) selected = "form"; else if (d_eq(shape.kind, "video")) selected = "video-metadata"; else if (d_eq(shape.kind, "image-heavy")) selected = "media-reference";
     DBuffer out; dbuf_init(&out); char *page_title = document_title(root);

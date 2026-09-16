@@ -1,0 +1,12 @@
+{
+  "name": "elpais-article",
+  "match": {
+    "hosts": ["elpais.com", "*.elpais.com"],
+    "paths": ["/202*", "/mexico/202*", "/en/*"]
+  },
+  "main_content": {
+    "containers": ["article#main-content", "main.mw"],
+    "headings": ["h1"],
+    "title": "document-h1"
+  }
+}

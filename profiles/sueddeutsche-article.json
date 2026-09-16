@@ -1,0 +1,12 @@
+{
+  "name": "sueddeutsche-article",
+  "match": {
+    "hosts": ["sueddeutsche.de", "*.sueddeutsche.de"],
+    "paths": ["/projekte/artikel/*", "/*/202*/*"]
+  },
+  "main_content": {
+    "containers": ["article", "main"],
+    "headings": ["h1"],
+    "title": "document-h1"
+  }
+}

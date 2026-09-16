@@ -65,3 +65,77 @@ browser baseline was an unreachable-page message rather than the article.
   direct article URLs returned verification or a different homepage response.
 - The `document-h1` title source prefers an h1 inside `<main>`, which avoids
   mistaking a short site masthead such as “News” for NHK's article headline.
+
+## North American sources
+
+These 20 additional North American sources were checked on 16 September 2026
+using direct article pages. The percentage is the same diagnostic coverage
+measure as above. The profiled articles were rerun with profiles disabled and
+their main-content block boundaries compared before removing a profile.
+
+| # | Journal and tested article | Browser scan | Distill | Main-content handling | Brief note |
+|---:|---|---|---|---|---|
+| 21 | [ABC News](https://abcnews.com/US/helicopter-crashes-los-angeles-site-earlier-fatal-bus/story?id=136481785) | article, 77.6% | article | Generic C | The profile-disabled run selected the same visible article headline and effective region; live navigation text changed between captures. |
+| 22 | [CBS News](https://www.cbsnews.com/news/todd-blanche-obama-concerns-targeting-trump-critics/) | article, 80.9% | article | Generic C | The profile-disabled run produced the same headline and article block sequence as the profiled run. |
+| 23 | [Fox News](https://www.foxnews.com/politics/exclusive-inside-vance-intimate-capitol-hill-huddle-republicans-confront-tough-midterm-terrain) | article, 97.7% | article | Generic C | The profile-disabled run produced the same headline and article block sequence as the profiled run. |
+| 24 | [USA Today](https://www.usatoday.com/story/shopping/2026/08/21/submit-products-editors-picks-2026-2027/91336627007/) | article, 93.8% | article | Generic C | The profile-disabled run produced the same headline and article block sequence as the profiled run. |
+| 25 | [NBC Los Angeles](https://www.nbclosangeles.com/news/national-international/trump-slams-supreme-court-mail-ballots/3942302/) | **Timeout** | article | Generic C | Chromium still timed out, but the profile-disabled Distill run selected the same article region; later related-story text changed between captures. |
+| 26 | [Washington Post](https://www.washingtonpost.com/the-seven/2026/09/15/7-things-know-tuesday-sept-15/) | **Error page** | **Error** | Not available | Chromium reported an HTTP/2 unreachable-page error and Distill could not load the page; no profile was added. |
+| 27 | [The New York Times](https://www.nytimes.com/2026/09/15/us/politics/ai-polls-midterms.html) | challenge shell | **Challenge** | Not available | The page exposed access/challenge content rather than a stable article to Distill. |
+| 28 | [Axios](https://www.axios.com/2026/09/15/trump-supreme-court-justices-mail-voting) | challenge shell | **Challenge** | Not available | Access protection prevented a meaningful article comparison; no profile was added. |
+| 29 | [ProPublica](https://www.propublica.org/article/propublica-and-the-connecticut-mirror-win-pulitzer-prize-for-local-reporting) | article, 97.8% | article | Generic C | The profile-disabled run produced the same headline and article block sequence as the profiled run. |
+| 30 | [The Texas Tribune](https://www.texastribune.org/2026/09/04/texas-ken-paxton-personal-financial-disclosures-ethics-law-us-senate-race/) | article, 96.0% | article | Generic C | The profile-disabled run produced the same headline and article block sequence as the profiled run. |
+| 31 | [PBS NewsHour](https://www.pbs.org/video/trump-agenda-1784238182/) | video article, 85.0% | video article | Generic C | The profile-disabled run produced the same headline and article block sequence as the profiled run. |
+| 32 | [Los Angeles Times](https://www.latimes.com/politics/story/2026-08-30/midterm-election-senate-control-alaska-iowa-maine-michigan-ohio-texas) | **Access denied** | article | Not found; no safe profile | Chromium received an access-denied page, while Distill received article text whose headline sat outside the article/main candidates; no safe profile was added. |
+| 33 | [Minnesota Star Tribune](https://www.startribune.com/minnesota-star-tribune-cuts-jobs-and-pursues-nonprofit-ownership-structure/601852356) | article | **Security checkpoint** | Not available | Distill received a Vercel security checkpoint instead of the article; no profile was added. |
+| 34 | [The Boston Globe](https://www.bostonglobe.com/2026/09/14/business/boston-housing-supply/) | article, 4.3% | video shell | Not available | The response exposed a video/article shell without a usable h1 region; no profile improved it. |
+| 35 | [Global News](https://globalnews.ca/news/11894575/canso-spaceport-project-criticism/) | article, 67.9% | article | Generic C | The profile-disabled run produced the same headline and article block sequence as the profiled run. |
+| 36 | [CityNews Toronto](https://toronto.citynews.ca/2026/07/27/toronto-police-us-consulate-shots-fired-suspect/) | article, 86.2% | article | Generic C | The profile-disabled run produced the same headline and article block sequence as the profiled run. |
+| 37 | [CTV News](https://www.ctvnews.ca/ottawa/article/how-athletes-featured-on-ctv-news-ottawa-performed-in-sundays-ironman/) | article, 1.6% | video shell | Not found; no safe profile | A confirmed direct article URL loaded, but Distill received a video/article shell without a matching headline region; no profile improved it. |
+| 38 | [The Daily Beast](https://www.thedailybeast.com/trump-humiliated-as-poll-reveals-brutal-republican-revolt/) | article, 2.2% | video shell | Not found; no safe profile | Distill's DOM did not retain a matching h1/article region; the low overlap is not a matcher score. |
+| 39 | [KTVZ](https://ktvz.com/politics/cnn-us-politics/2026/09/15/whats-next-for-mail-voting-after-the-supreme-court-ruled-against-trump/) | article, 96.7% | article | Generic C | The profile-disabled run produced the same headline and article block sequence as the profiled run. |
+| 40 | [Voice of America](https://www.voanews.com/a/trump-vows-accountability-for-those-who-pursued-him-in-court-cases-/8011522.html) | article, 95.5% | article | Generic C | The profile-disabled run produced the same headline and article block sequence as the profiled run. |
+
+The North American profiles tested here were removed after the generic C
+matcher reproduced their article boundaries. No North American site-specific
+condition was added to the C matcher. The failed or challenge cases remain
+recorded so they can be retried later when the publisher exposes the article
+response.
+
+## European sources
+
+These 20 additional European sources were checked on 16 September 2026 using
+direct article pages. The percentage is the same diagnostic coverage measure
+as above. The first pass used declarative profiles as probes; each accessible
+article was then rerun with profiles disabled. Profiles were removed when the
+generic matcher produced the same article-headline selection. Challenge,
+empty-render, and timeout results are recorded as such.
+
+| # | Journal and tested article | Browser scan | Distill | Main-content handling | Brief note |
+|---:|---|---|---|---|---|
+| 41 | [BBC News](https://www.bbc.com/news/articles/c62ezg7gkzwo) | article, 94.0% | article | Generic C | With profiles disabled, the visible h1 inside `<article>` was selected as `article-headline`. |
+| 42 | [Sky News](https://news.sky.com/story/starmer-latest-burnham-streeting-rayner-leadership-quit-cabinet-resign-labour-local-elections-12593360?postid=10392375) | access-denied shell | access-denied shell | Not available | Both captures were denied by the publisher before article content was exposed; no profile was added. |
+| 43 | [Financial Times](https://www.ft.com/content/2b780776-d8f3-4bd3-9daa-f601b5d4206a) | security-verification page | security challenge | Not available | The direct article returned verification rather than content; no profile was added. |
+| 44 | [The Independent](https://www.independent.co.uk/news/uk/home-news/dwp-benefits-pension-payment-september-cost-of-living-b2807701.html) | article, 64.1% | article | Generic C | With profiles disabled, the matching visible h1 in the article region was selected as `article-headline`. |
+| 45 | [The Irish Times](https://www.irishtimes.com/ireland/2026/09/15/man-killed-30s-and-woman-injured-after-m4-collision-in-co-meath/) | article, 2.6% | title-only article shell | Not found; no safe profile | Chromium saw the article, but Distill retained only the title/meta shell and no usable h1, main, or article region. |
+| 46 | [POLITICO Europe](https://www.politico.eu/article/protests-georgia-poll-confirms-russia-meddling-irregularities-denounced-election-results/) | article, 95.6% | article | Generic C | With profiles disabled, the matching visible h1 in the article region was selected as `article-headline`. |
+| 47 | [Le Monde](https://www.lemonde.fr/en/politics/article/2026/09/15/oil-prices-and-rising-interest-rates-push-french-public-finances-further-into-red_6757548_5.html) | bot challenge | bot page | Not available | Chromium and Distill received access-protection responses, not the article. |
+| 48 | [Le Figaro](https://www.lefigaro.fr/international/guerre-au-moyen-orient-la-chine-prete-a-defendre-les-interets-legitimes-de-l-iran-20260916) | video article, 23.3% | video article | Generic C | With profiles disabled, the matching visible h1 was selected as `article-headline`, including this short video page. |
+| 49 | [RFI](https://www.rfi.fr/en/podcasts/the-sound-kitchen/20240824-promises-promises-the-sound-kitchen-20240824) | article, 97.1% | article | Generic C | With profiles disabled, the matching visible h1 in the article region was selected as `article-headline`. |
+| 50 | [El País](https://elpais.com/mexico/2026-08-31/mexico-lleva-ocho-periodistas-asesinados-en-lo-que-va-de-2026.html) | bot/redirect shell | security challenge | **Profile retained: `elpais-article`** | The profile is retained because the current no-profile run was blocked before article content was exposed; its requirement could not be disproven. |
+| 51 | [El Mundo](https://www.elmundo.es/internacional/2026/09/16/6aaa5b84fc6c837f578b4585.html) | article, 61.1% | article | Generic C | With profiles disabled, the matching visible h1 selected the primary article as `article-headline`. |
+| 52 | [Corriere della Sera](https://www.corriere.it/cronache/26_agosto_30/barbara-palombelli-intervista-1ed4f729-3f84-4da8-97e8-a98b4a5d9xlk.shtml) | article, 79.1% | article | Generic C | With profiles disabled, the matching visible h1 in the article region was selected as `article-headline`. |
+| 53 | [la Repubblica](https://www.repubblica.it/esteri/2026/07/01/diretta/guerra_ucraina_russia_news_oggi-425443554/) | live article, 92.7% | live article | Generic C | With profiles disabled, the matching visible h1 was selected as `article-headline`. |
+| 54 | [Frankfurter Allgemeine Zeitung](https://www.faz.net/aktuell/politik/ausland/kriegsverbrechen-in-kosovo-thaci-zu-25-jahren-verurteilt-accg-201229090.html) | article, 59.0% | article | Generic C | With profiles disabled, the matching visible h1 in the neutral `content-wrapper` region was selected as `article-headline`. |
+| 55 | [Süddeutsche Zeitung](https://www.sueddeutsche.de/projekte/artikel/muenchen/muenchen-bayern-sz-lokalkjournalismus-reportagen-2026-e152013/) | article, 5.3% | extraction timeout | **Profile attempted: `sueddeutsche-article`** | The direct project/article DOM loaded, but Distill timed out during extraction even with an extended budget; profile improvement is unverified. |
+| 56 | [Neue Zürcher Zeitung](https://www.nzz.ch/schweiz/daenemark-gilt-als-musterland-fuer-eine-asylpolitik-ohne-kompromisse-was-beat-jans-von-mette-frederiksen-lernen-kann-und-was-nicht-ld.10023403) | article, 87.7% | article | Generic C | With profiles disabled, Unicode-space normalization let the matching visible h1 select the article as `article-headline`. |
+| 57 | [De Standaard](https://www.standaard.be/media-en-cultuur/via-deze-knop-krijgt-u-voortaan-meer-de-standaard-nieuws-te-zien-op-google/151706718.html) | Cloudflare page | security challenge | Not available | Both captures were blocked before the article could be compared; no profile was added. |
+| 58 | [NOS](https://nos.nl/artikel/2631034-invloedrijke-senator-mcconnell-na-gezondheidsproblemen-terug-in-congres) | article, 88.2% | article | Generic C | With profiles disabled, the matching visible h1 in `main` was selected as `article-headline`. |
+| 59 | [Aftenposten](https://www.aftenposten.no/verden/i/JOqj67/ukraina-angrep-russisk-oljeraffineri-og-militaerbase) | article, 59.7% | article | Generic C | With profiles disabled, the matching visible h1 in `<article>` was selected as `article-headline`. |
+| 60 | [Público](https://www.publico.pt/2026/09/15/local/noticia/lisboa-emel-lanca-nova-aplicacao-bicicletas-partilhadas-gira-2188107) | 403 page | security challenge | Not available | The direct article returned a 403/challenge response to the captures; no profile was added. |
+
+The remaining European profiles are declarative JSON files in `profiles/`;
+the generic matcher now recognizes a matching visible headline within common
+semantic article regions, including ARIA roles, `articleBody`, and a neutral
+`content-wrapper` marker, before consulting low-content JSON-LD paywall
+selectors. No European site-specific condition was added to C.

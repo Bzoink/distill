@@ -372,6 +372,8 @@ def browser_command(browser, url, budget, profile, dump_path=None, screenshot_pa
 
 
 def write_text(path, value):
+    if isinstance(value, bytes):
+        value = value.decode("utf-8", errors="replace")
     path.write_text(value or "", encoding="utf-8")
 
 
@@ -382,7 +384,10 @@ def write_json(path, value):
 def site_report(site, browser, engine, output, timeout, budget, cap_ms, screenshots):
     output.mkdir(parents=True, exist_ok=True)
     url = site["url"]
-    with tempfile.TemporaryDirectory(prefix="distill-reference-") as profile:
+    # Chromium may leave a profile lock briefly after a timeout (notably on
+    # bot-protected pages). The capture result is still useful, so do not let
+    # best-effort temporary-profile cleanup hide that diagnostic.
+    with tempfile.TemporaryDirectory(prefix="distill-reference-", ignore_cleanup_errors=True) as profile:
         reference_result = run_command(
             browser_command(browser, url, budget, profile, dump_path=output / "reference.dom.html"),
             timeout,
