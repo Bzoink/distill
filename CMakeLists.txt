@@ -1,6 +1,8 @@
 cmake_minimum_required(VERSION 3.20)
 project(distill LANGUAGES C CXX)
 
+include(GNUInstallDirs)
+
 # The production application and all bespoke code are C23. C++ remains enabled
 # only for the litehtml-facing adapter, which is linked into the probe target.
 set(CMAKE_C_STANDARD 23)
@@ -68,7 +70,11 @@ add_library(distill-render-core STATIC src/render.c src/shaper.c src/image.c)
 target_link_libraries(distill-render-core PUBLIC PkgConfig::DISTILL_RENDER PkgConfig::DISTILL_IMAGE)
 
 add_executable(distill src/main.c src/litehtml_probe.cpp)
-target_compile_definitions(distill PRIVATE DISTILL_SOURCE_DIR="${CMAKE_SOURCE_DIR}" DISTILL_RENDER=1)
+target_compile_definitions(distill PRIVATE
+    DISTILL_SOURCE_DIR="${CMAKE_SOURCE_DIR}"
+    DISTILL_INSTALL_PROFILE_DIR="${CMAKE_INSTALL_FULL_DATADIR}/distill/profiles"
+    DISTILL_RENDER=1
+)
 target_include_directories(distill PRIVATE
     "${EXTERNAL_PREFIX}/include"
     ${CURL_INCLUDE_DIRS}
@@ -91,6 +97,8 @@ set_target_properties(distill PROPERTIES
 )
 
 install(TARGETS distill RUNTIME DESTINATION bin)
+install(DIRECTORY profiles/ DESTINATION ${CMAKE_INSTALL_DATADIR}/distill/profiles
+        FILES_MATCHING PATTERN "*.json")
 
 if(DISTILL_GTK_FOUND)
     add_executable(distill-gtk src/app.c src/app_state.c src/litehtml_probe.cpp)

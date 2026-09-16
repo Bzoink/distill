@@ -1,0 +1,12 @@
+{
+  "name": "aftonbladet-liveblog",
+  "match": {
+    "hosts": ["aftonbladet.se", "*.aftonbladet.se"],
+    "paths": ["/nyheter/a/*/aftonbladet-direkt"]
+  },
+  "main_content": {
+    "containers": ["li[data-testid=\"liveblog-entry\"]"],
+    "headings": ["h1", "h2", "h3"],
+    "title": "og:title"
+  }
+}

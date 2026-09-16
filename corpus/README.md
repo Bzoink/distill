@@ -236,8 +236,9 @@ first version:
   most of the document, and refusing to promote it is the correct answer.
 
 Without a selector there is a second route — an `og:title` that matches the
-heading of one `<article>` among several. It is a fallback, and the same
-proportion guard applies to it.
+heading of one entry among several. The entry may be an `<article>`, or a
+semantic liveblog wrapper such as `li[data-testid="liveblog-entry"]`. It is a
+fallback, and the same proportion guard applies to it.
 
 ## Media references and viewer mode
 

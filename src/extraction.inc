@@ -3,11 +3,33 @@
 #include <lexbor/html/interfaces/document.h>
 #include <lexbor/html/serialize.h>
 
+#include <dirent.h>
+
 typedef struct {
     lxb_dom_node_t **items;
     size_t length;
     size_t capacity;
 } NodeVec;
+
+typedef struct {
+    char **items;
+    size_t length;
+    size_t capacity;
+} StringVec;
+
+static void string_vec_push(StringVec *vec, char *value)
+{
+    d_vec_reserve((void **)&vec->items, &vec->capacity, vec->length,
+                  sizeof(*vec->items), vec->length + 1);
+    vec->items[vec->length++] = value;
+}
+
+static void string_vec_free(StringVec *vec)
+{
+    for (size_t i = 0; i < vec->length; ++i) free(vec->items[i]);
+    free(vec->items);
+    *vec = (StringVec){0};
+}
 
 typedef struct { char *type; char *text; } ExtractBlock;
 typedef struct { char *caption; NodeVec rows; } ExtractTable;
@@ -556,12 +578,34 @@ typedef struct {
     char *source;     /* how it was located */
     char *selector;   /* the selector that matched, when there was one */
     char *title;      /* the item's own headline */
+    char *profile;    /* the profile that supplied the locator, when any */
 } MainContent;
+
+typedef struct {
+    char *name;
+    StringVec hosts;
+    StringVec paths;
+    StringVec containers;
+    StringVec headings;
+    char *title_source;
+} MainContentProfile;
 
 static void free_main_content(MainContent *item)
 {
     free(item->nodes.items); free(item->source); free(item->selector); free(item->title);
+    free(item->profile);
     *item = (MainContent){0};
+}
+
+static void free_main_content_profile(MainContentProfile *profile)
+{
+    free(profile->name);
+    string_vec_free(&profile->hosts);
+    string_vec_free(&profile->paths);
+    string_vec_free(&profile->containers);
+    string_vec_free(&profile->headings);
+    free(profile->title_source);
+    *profile = (MainContentProfile){0};
 }
 
 static const char *after_scheme(const char *url)
@@ -692,42 +736,233 @@ static bool json_ld_find_selector(Engine *engine, JSValueConst value,
     return false;
 }
 
-/* Without a selector the page still says what it is about. og:title names the
-   requested item and a stream marks each item with <article>, so an article
-   whose own heading is that title is the item. A document holding a single
-   article is simply an article: hoisting it would move nothing, and claiming
-   to have found a needle in a haystack of one is worse than saying nothing. */
-static MainContent main_content_by_article(lxb_dom_node_t *root)
+static void profile_strings_from_json(Engine *engine, JSValueConst object,
+                                      const char *name, StringVec *out)
 {
-    MainContent item = {0};
-    NodeVec articles = find_selector(root, "article");
-    char *wanted = meta_value(root, "og:title");
-    if (articles.length >= 2 && *wanted) {
-        const char *headings[] = {"h1", "h2", "h3"};
-        for (size_t a = 0; a < articles.length; ++a) {
-            if (hidden_node(root, articles.items[a])) continue;
-            bool match = false;
-            for (size_t h = 0; h < 3 && !match; ++h) {
-                NodeVec found = find_selector(articles.items[a], headings[h]);
-                for (size_t i = 0; i < found.length && !match; ++i) {
-                    char *text = compact_text(found.items[i]);
-                    match = *text && d_eq(text, wanted);
-                    free(text);
-                }
-                free(found.items);
-            }
-            if (match) node_vec_push(&item.nodes, articles.items[a]);
+    JSValue value = JS_GetPropertyStr(engine->context, object, name);
+    if (JS_IsString(value)) {
+        string_vec_push(out, js_string(engine->context, value));
+    } else if (JS_IsArray(value)) {
+        int64_t count = json_array_length_for_context(engine->context, value);
+        for (int64_t i = 0; i < count; ++i) {
+            JSValue item = JS_GetPropertyUint32(engine->context, value, (uint32_t)i);
+            if (JS_IsString(item)) string_vec_push(out, js_string(engine->context, item));
+            JS_FreeValue(engine->context, item);
         }
     }
-    free(articles.items);
+    JS_FreeValue(engine->context, value);
+}
+
+static bool profile_glob_matches(const char *value, const char *pattern, bool fold_case)
+{
+    if (!value || !pattern) return false;
+    while (*pattern) {
+        if (*pattern == '*') {
+            ++pattern;
+            if (!*pattern) return true;
+            for (const char *cursor = value;; ++cursor) {
+                if (profile_glob_matches(cursor, pattern, fold_case)) return true;
+                if (!*cursor) break;
+            }
+            return false;
+        }
+        char actual = *value++, wanted = *pattern++;
+        if (fold_case) {
+            if (actual >= 'A' && actual <= 'Z') actual = (char)(actual - 'A' + 'a');
+            if (wanted >= 'A' && wanted <= 'Z') wanted = (char)(wanted - 'A' + 'a');
+        }
+        if (actual != wanted) return false;
+        if (!actual) return true;
+    }
+    return *value == 0;
+}
+
+static bool profile_value_matches(const char *value, const StringVec *patterns,
+                                  bool fold_case)
+{
+    if (!patterns->length) return true;
+    for (size_t i = 0; i < patterns->length; ++i)
+        if (profile_glob_matches(value, patterns->items[i], fold_case)) return true;
+    return false;
+}
+
+static bool profile_matches_url(const MainContentProfile *profile, const char *url)
+{
+    char *host = d_lower(url_cookie_domain(url));
+    char *path = url_path(url);
+    bool matches = profile_value_matches(host, &profile->hosts, true) &&
+                   profile_value_matches(path, &profile->paths, false);
+    free(host);
+    free(path);
+    return matches;
+}
+
+static char *profile_file_stem(const char *name)
+{
+    const char *dot = strrchr(name, '.');
+    return dot && d_ieq(dot, ".json") ? d_strndup(name, (size_t)(dot - name)) : d_strdup(name);
+}
+
+static bool profile_from_json(Engine *engine, JSValueConst value, const char *filename,
+                              const char *url, MainContentProfile *out)
+{
+    if (!JS_IsObject(value)) return false;
+    MainContentProfile candidate = {0};
+    candidate.name = json_ld_string(engine, value, "name");
+    if (!*candidate.name) { free(candidate.name); candidate.name = profile_file_stem(filename); }
+
+    JSValue match = JS_GetPropertyStr(engine->context, value, "match");
+    if (JS_IsObject(match)) {
+        profile_strings_from_json(engine, match, "hosts", &candidate.hosts);
+        profile_strings_from_json(engine, match, "paths", &candidate.paths);
+    }
+    bool matches = profile_matches_url(&candidate, url);
+    JS_FreeValue(engine->context, match);
+    if (!matches) { free_main_content_profile(&candidate); return false; }
+
+    JSValue main = JS_GetPropertyStr(engine->context, value, "main_content");
+    if (JS_IsObject(main)) {
+        profile_strings_from_json(engine, main, "containers", &candidate.containers);
+        profile_strings_from_json(engine, main, "headings", &candidate.headings);
+        candidate.title_source = json_ld_string(engine, main, "title");
+    }
+    JS_FreeValue(engine->context, main);
+    if (!candidate.containers.length) {
+        free_main_content_profile(&candidate);
+        return false;
+    }
+    *out = candidate;
+    return true;
+}
+
+static char *main_content_profile_directory(void)
+{
+    const char *configured = getenv("DISTILL_PROFILE_DIR");
+    if (configured && *configured) return d_strdup(configured);
+    char *source = d_cat2(DISTILL_SOURCE_DIR, "/profiles");
+    if (access(source, R_OK) == 0) return source;
+    free(source);
+#ifdef DISTILL_INSTALL_PROFILE_DIR
+    char *installed = d_strdup(DISTILL_INSTALL_PROFILE_DIR);
+    if (access(installed, R_OK) == 0) return installed;
+    free(installed);
+#endif
+    return d_strdup("");
+}
+
+static bool main_content_profile_load(Engine *engine, const char *url,
+                                      MainContentProfile *out)
+{
+    char *directory = main_content_profile_directory();
+    if (!*directory) { free(directory); return false; }
+    DIR *handle = opendir(directory);
+    if (!handle) { free(directory); return false; }
+    bool found = false;
+    struct dirent *entry;
+    while (!found && (entry = readdir(handle))) {
+        const char *name = entry->d_name;
+        size_t length = strlen(name);
+        if (length < 6 || !d_ieq(name + length - 5, ".json")) continue;
+        char *path = d_cat3(directory, "/", name);
+        size_t body_length = 0;
+        char *body = d_read_file(path, &body_length);
+        free(path);
+        if (!body || !body_length) { free(body); continue; }
+        JSValue parsed = JS_ParseJSON(engine->context, body, body_length, name);
+        if (JS_IsException(parsed)) {
+            JS_FreeValue(engine->context, JS_GetException(engine->context));
+        } else {
+            found = profile_from_json(engine, parsed, name, url, out);
+        }
+        JS_FreeValue(engine->context, parsed);
+        free(body);
+    }
+    closedir(handle);
+    free(directory);
+    return found;
+}
+
+static bool main_content_candidate_matches(lxb_dom_node_t *root, lxb_dom_node_t *candidate,
+                                            const char *wanted, const StringVec *headings)
+{
+    if (hidden_node(root, candidate)) return false;
+    const char *defaults[] = {"h1", "h2", "h3"};
+    const char *const *selectors = headings && headings->length ? (const char *const *)headings->items : defaults;
+    size_t count = headings && headings->length ? headings->length : sizeof(defaults) / sizeof(defaults[0]);
+    for (size_t h = 0; h < count; ++h) {
+        NodeVec found = find_selector(candidate, selectors[h]);
+        for (size_t i = 0; i < found.length; ++i) {
+            char *text = compact_text(found.items[i]);
+            bool match = *text && d_eq(text, wanted);
+            free(text);
+            if (match) { free(found.items); return true; }
+        }
+        free(found.items);
+    }
+    return false;
+}
+
+static bool main_content_try_headline(lxb_dom_node_t *root, const StringVec *profile_containers,
+                                       const char *const *generic_containers,
+                                       size_t generic_count, bool require_multiple,
+                                       const char *wanted, const StringVec *headings,
+                                       MainContent *item, const char *source,
+                                       const char *profile_name)
+{
+    size_t count = profile_containers ? profile_containers->length : generic_count;
+    for (size_t s = 0; s < count; ++s) {
+        const char *selector = profile_containers ? profile_containers->items[s] : generic_containers[s];
+        NodeVec candidates = find_selector(root, selector);
+        if (require_multiple && candidates.length < 2) {
+            free(candidates.items);
+            continue;
+        }
+        for (size_t i = 0; i < candidates.length; ++i)
+            if (main_content_candidate_matches(root, candidates.items[i], wanted, headings))
+                node_vec_push(&item->nodes, candidates.items[i]);
+        free(candidates.items);
+        if (item->nodes.length) {
+            item->source = d_strdup(source);
+            item->profile = profile_name ? d_strdup(profile_name) : d_strdup("");
+            return true;
+        }
+    }
+    return false;
+}
+
+/* Without a selector the page still says what it is about. og:title names the
+   requested item and a stream marks each item with a heading inside its entry
+   container. Some streams use one <article> per item; others use one outer
+   <article> and a semantic marker on each entry. A document holding a single
+   article is simply an article: hoisting it would move nothing, and claiming
+   to have found a needle in a haystack of one is worse than saying nothing. */
+static MainContent main_content_by_headline(lxb_dom_node_t *root,
+                                            const MainContentProfile *profile)
+{
+    MainContent item = {0};
+    const char *title_source = profile && profile->title_source && *profile->title_source
+                                   ? profile->title_source : "og:title";
+    char *wanted = meta_value(root, title_source);
+    if (!*wanted) { free(wanted); return item; }
+
+    const char *generic_containers[] = {"article", "*[role=\"article\"]"};
+    const StringVec *profile_containers = profile && profile->containers.length ? &profile->containers : NULL;
+    if (profile_containers)
+        main_content_try_headline(root, profile_containers, NULL, 0, false, wanted,
+                                  profile ? &profile->headings : NULL, &item,
+                                  "profile-headline", profile->name);
+    if (!item.nodes.length)
+        main_content_try_headline(root, NULL, generic_containers,
+                                  sizeof(generic_containers) / sizeof(generic_containers[0]),
+                                  true, wanted, NULL, &item, "article-headline", NULL);
     if (!item.nodes.length) { free(wanted); return item; }
-    item.source = d_strdup("article-headline");
     item.selector = d_strdup("");
     item.title = wanted;
     return item;
 }
 
-static MainContent find_main_content(Engine *engine, lxb_dom_node_t *root)
+static MainContent find_main_content(Engine *engine, lxb_dom_node_t *root,
+                                     const MainContentProfile *profile)
 {
     MainContent item = {0};
     char *selector = d_strdup(""), *title = d_strdup("");
@@ -770,7 +1005,7 @@ static MainContent find_main_content(Engine *engine, lxb_dom_node_t *root)
         item.nodes = (NodeVec){0};
     }
     free(selector); free(title);
-    return main_content_by_article(root);
+    return main_content_by_headline(root, profile);
 }
 
 /* A permalinked item commonly appears twice -- pinned at the top of the stream
@@ -792,13 +1027,18 @@ static bool main_content_holds(const MainContent *item, lxb_dom_node_t *node)
    element on each branch so that a list item containing a paragraph is one
    block rather than the same words twice. Returns the characters emitted. */
 static size_t append_main_blocks(Engine *engine, DBuffer *out, lxb_dom_node_t *root,
-                                 lxb_dom_node_t *node, size_t *rejected, bool *first)
+                                 lxb_dom_node_t *node, size_t *rejected, bool *first,
+                                 bool at_item_root)
 {
     if (!node) return 0;
     if (is_element(node)) {
         if (hidden_node(root, node)) return 0;
         char *tag = node_tag(node);
-        if (block_tag(tag)) {
+        /* An entry wrapper can itself be a <li>. Do not collapse that wrapper
+           into one reader-list-item; its heading and paragraphs are the
+           readable blocks the promoted item is meant to preserve. */
+        bool entry_list_wrapper = at_item_root && d_eq(tag, "li");
+        if (block_tag(tag) && !entry_list_wrapper) {
             size_t chars = 0;
             char *text = compact_text(node);
             if (*text) {
@@ -817,7 +1057,7 @@ static size_t append_main_blocks(Engine *engine, DBuffer *out, lxb_dom_node_t *r
     }
     size_t chars = 0;
     for (lxb_dom_node_t *child = node->first_child; child; child = child->next)
-        chars += append_main_blocks(engine, out, root, child, rejected, first);
+        chars += append_main_blocks(engine, out, root, child, rejected, first, false);
     return chars;
 }
 
@@ -1070,13 +1310,15 @@ static char *run_extraction(Engine *engine, const char *serialized)
     lxb_html_serialize_tree_str(root, &filtered);
     const char *readability_input = filtered.data ? (const char *)filtered.data : serialized;
     ExtractShape shape = shape_for(root); ReadabilityFields readability = run_readability(engine, readability_input); size_t rejected = 0;
+    MainContentProfile profile = {0};
+    main_content_profile_load(engine, engine->source_url, &profile);
     /* Locate the requested item before anything renders, so the block list can
        say which of its entries have already been shown at the top. */
-    MainContent item = find_main_content(engine, root);
+    MainContent item = find_main_content(engine, root, &profile);
     DBuffer main_blocks; dbuf_init(&main_blocks); dbuf_puts(&main_blocks, "[");
     bool main_first = true; size_t main_chars = 0;
     if (item.nodes.length)
-        main_chars = append_main_blocks(engine, &main_blocks, root, item.nodes.items[0], &rejected, &main_first);
+        main_chars = append_main_blocks(engine, &main_blocks, root, item.nodes.items[0], &rejected, &main_first, true);
     dbuf_puts(&main_blocks, "]");
     char *main_blocks_json = dbuf_take(&main_blocks);
     bool main_found = item.nodes.length && main_chars >= DISTILL_MAIN_CONTENT_FLOOR &&
@@ -1090,10 +1332,11 @@ static char *run_extraction(Engine *engine, const char *serialized)
     char *qsource = json_quote(main_found ? item.source : "");
     char *qselector = json_quote(main_found ? item.selector : "");
     char *qmain_title = json_quote(main_found ? item.title : "");
-    dbuf_printf(&out, ",\"main_content\":{\"found\":%s,\"source\":%s,\"selector\":%s,\"title\":%s,\"matches\":%zu,\"blocks\":%s}",
-                main_found ? "true" : "false", qsource, qselector, qmain_title,
+    char *qprofile = json_quote(main_found ? item.profile : "");
+    dbuf_printf(&out, ",\"main_content\":{\"found\":%s,\"source\":%s,\"profile\":%s,\"selector\":%s,\"title\":%s,\"matches\":%zu,\"blocks\":%s}",
+                main_found ? "true" : "false", qsource, qprofile, qselector, qmain_title,
                 main_found ? item.nodes.length : (size_t)0, main_found ? main_blocks_json : "[]");
-    free(qsource); free(qselector); free(qmain_title);
+    free(qsource); free(qprofile); free(qselector); free(qmain_title);
     dbuf_puts(&out, ",\"blocks\":"); append_blocks(engine, &out, root, main_found ? &item : NULL, &rejected); dbuf_printf(&out, ",\"tables\":%s,\"search_results\":%s,\"forms\":%s,\"videos\":%s,\"media\":%s,\"links\":%s,\"structured_data\":%s,\"sanitization\":{\"allowed_schemes\":[\"http\",\"https\",\"mailto\",\"tel\"],\"rejected_uris\":%zu}}", tables, search, forms, videos, media, links, structured, rejected);
-    free(qurl); free(qbase); free(qtitle); free(page_title); free(qkind); free(qevidence); free(qselected); free(content); free(tables); free(search); free(forms); free(videos); free(media); free(links); free(structured); free(shape.kind); free(shape.evidence); free(main_blocks_json); free_main_content(&item); free_readability(&readability); lxb_html_document_destroy(document); return dbuf_take(&out);
+    free(qurl); free(qbase); free(qtitle); free(page_title); free(qkind); free(qevidence); free(qselected); free(content); free(tables); free(search); free(forms); free(videos); free(media); free(links); free(structured); free(shape.kind); free(shape.evidence); free(main_blocks_json); free_main_content(&item); free_main_content_profile(&profile); free_readability(&readability); lxb_html_document_destroy(document); return dbuf_take(&out);
 }

@@ -1584,9 +1584,15 @@ static GtkWidget *make_settings_button(App *app)
     return button;
 }
 
-static GtkWidget *make_button(const char *label, GCallback callback, App *app)
+static GtkWidget *make_navigation_button(const char *icon_name, const char *tooltip,
+                                         GCallback callback, App *app)
 {
-    GtkWidget *button = gtk_button_new_with_label(label);
+    GtkWidget *button = gtk_button_new();
+    GtkWidget *icon = gtk_image_new_from_icon_name(icon_name, GTK_ICON_SIZE_LARGE_TOOLBAR);
+    gtk_image_set_pixel_size(GTK_IMAGE(icon), 26);
+    gtk_button_set_image(GTK_BUTTON(button), icon);
+    gtk_button_set_relief(GTK_BUTTON(button), GTK_RELIEF_NONE);
+    gtk_widget_set_tooltip_text(button, tooltip);
     g_signal_connect(button, "clicked", callback, app);
     return button;
 }
@@ -1631,8 +1637,10 @@ static void app_activate(GtkApplication *application, gpointer opaque)
     gtk_widget_set_margin_bottom(toolbar, 8);
     gtk_box_pack_start(GTK_BOX(root), toolbar, FALSE, FALSE, 0);
 
-    app->back_button = make_button("‹", G_CALLBACK(back_clicked), app);
-    app->forward_button = make_button("›", G_CALLBACK(forward_clicked), app);
+    app->back_button = make_navigation_button("go-previous-symbolic", "Back",
+                                              G_CALLBACK(back_clicked), app);
+    app->forward_button = make_navigation_button("go-next-symbolic", "Forward",
+                                                  G_CALLBACK(forward_clicked), app);
     gtk_widget_set_sensitive(app->back_button, FALSE);
     gtk_widget_set_sensitive(app->forward_button, FALSE);
     gtk_box_pack_start(GTK_BOX(toolbar), app->back_button, FALSE, FALSE, 0);

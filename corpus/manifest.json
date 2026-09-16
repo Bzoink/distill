@@ -726,6 +726,110 @@
           "expect": "Ferry timetable"
         }
       ]
+    },
+    {
+      "id": "30-liveblog-headline",
+      "path": "30-liveblog-headline.html",
+      "gate": true,
+      "plan_section": "Phase 1 extraction breadth, main content",
+      "exercises": [
+        "main-content",
+        "headline-fallback",
+        "entry-wrapper"
+      ],
+      "why": "Some liveblogs put every update inside one outer article and mark each update with a semantic entry wrapper. The requested headline must still select the entry, and the wrapper must not collapse into one list item in the reader.",
+      "assertions": [
+        {
+          "stage": "extract",
+          "path": "main_content.found",
+          "expect": "true"
+        },
+        {
+          "stage": "extract",
+          "path": "main_content.source",
+          "expect": "profile-headline"
+        },
+        {
+          "stage": "extract",
+          "path": "main_content.profile",
+          "expect": "corpus-liveblog-entry"
+        },
+        {
+          "stage": "extract",
+          "path": "main_content.matches",
+          "expect": "1"
+        },
+        {
+          "stage": "extract",
+          "path": "main_content.blocks[0].text",
+          "expect": "Ung kvinna häktad – misstänkt grov misshandel"
+        },
+        {
+          "stage": "extract",
+          "path": "main_content.blocks[1].type",
+          "expect": "p"
+        },
+        {
+          "stage": "extract",
+          "path": "main_content.blocks",
+          "expect_absent": [
+            "Oroligt Wall Street",
+            "Man tvingade sig in"
+          ]
+        },
+        {
+          "stage": "extract",
+          "path": "blocks",
+          "expect": "Oroligt Wall Street"
+        }
+      ]
+    },
+    {
+      "id": "31-generic-headline",
+      "path": "31-generic-headline.html",
+      "gate": true,
+      "plan_section": "Phase 1 extraction breadth, main content",
+      "exercises": [
+        "main-content",
+        "headline-fallback",
+        "generic-container"
+      ],
+      "why": "The generic matcher must continue to locate a requested headline in a stream of ordinary article elements when no site profile matches.",
+      "assertions": [
+        {
+          "stage": "extract",
+          "path": "main_content.found",
+          "expect": "true"
+        },
+        {
+          "stage": "extract",
+          "path": "main_content.source",
+          "expect": "article-headline"
+        },
+        {
+          "stage": "extract",
+          "path": "main_content.matches",
+          "expect": "1"
+        },
+        {
+          "stage": "extract",
+          "path": "main_content.blocks[0].text",
+          "expect": "Tug boats return to the inner harbour"
+        },
+        {
+          "stage": "extract",
+          "path": "main_content.blocks",
+          "expect_absent": [
+            "Ferry timetable",
+            "quiet weekend"
+          ]
+        },
+        {
+          "stage": "extract",
+          "path": "blocks",
+          "expect": "Ferry timetable"
+        }
+      ]
     }
   ],
   "live": [

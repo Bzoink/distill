@@ -513,6 +513,12 @@ def main():
         print(f"app:    {app}\nmode:   Phase 3 desktop shell\n{result.stdout.strip()}\nOK  desktop-shell gate passes")
         return 0
 
+    # The corpus has one profile-only fixture. Keep its profile files separate
+    # from the installed site profiles so tests do not make loopback URLs look
+    # like production sites.
+    if not args.baseline:
+        os.environ.setdefault("DISTILL_PROFILE_DIR", os.path.join(HERE, "profiles"))
+
     manifest = json.load(open(MANIFEST, encoding="utf-8"))
     if args.baseline and args.arm != "a":
         ap.error("--baseline is only valid with the default reference-browser comparison")

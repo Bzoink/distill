@@ -1,0 +1,12 @@
+{
+  "name": "corpus-liveblog-entry",
+  "match": {
+    "hosts": ["127.0.0.1"],
+    "paths": ["/30-liveblog-headline.html"]
+  },
+  "main_content": {
+    "containers": ["li[data-testid=\"liveblog-entry\"]"],
+    "headings": ["h1", "h2", "h3"],
+    "title": "og:title"
+  }
+}
