@@ -411,8 +411,14 @@ reader was drawn at (480 to 760 design pixels, both scaled by zoom), centred
 on its desk: past the top of that span a wider window buys margin and nothing
 else, because the measure is capped for readability, and past the bottom the
 window scrolls rather than squeezing the page further. A width change is a
-re-layout of the template already on disk, not a navigation. A reading-list
-toggle keeps URLs for the session. `distill-app-state` and `distill-litehtml-geometry` CTest
+re-layout of the template already on disk, not a navigation. While a page
+loads, a spinner and a percentage report what the engine is doing: the engine
+writes one `progress PERCENT PHASE` record per step on stdout (`--progress`)
+and the shell reads the pipe as the run happens rather than waiting for it to
+end. The phases -- fetch, scripts, extract, render -- are what is measured;
+the percentage is their weighting, with the fetch band following the bytes
+when the server declares a length and the script band following the settle
+budget it cannot exceed. A reading-list toggle keeps URLs for the session. `distill-app-state` and `distill-litehtml-geometry` CTest
 contracts cover history truncation/replacement and native-control geometry,
 while `corpus/check.py --app` covers the display-free shell model. Phase 4 can
 now widen the interaction and binding surface from evidence.

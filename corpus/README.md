@@ -76,6 +76,14 @@ size. Ctrl+plus and Ctrl+minus step through the levels the menu offers and
 Ctrl+0 returns to 100%; `--self-test` covers the stepping and the fallback for
 a saved level the menu no longer has.
 
+A load reports itself: `distill --progress` writes one `progress PERCENT PHASE`
+line per step to stdout, and the shell spawns the engine with pipes so those
+records arrive while the run is still going, turning into a spinner and a
+percentage on the status line. `--progress` is refused with `--dump-dom` and
+`--extract`, whose artifact is stdout itself. `--self-test` covers the parse,
+including records split across reads, and checks that every phase the engine
+names has a message of its own.
+
 The page width follows the window between 480 and 760 design pixels, both
 scaled by zoom, and the page is centred on the dark desk either side of it.
 Above the span a wider window only adds margin, since the measure is capped;

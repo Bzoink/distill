@@ -14,12 +14,14 @@
 
 #include <errno.h>
 #include <limits.h>
+#include <poll.h>
 #include <stdbool.h>
 #include <stdio.h>
 #include <string.h>
 #include <strings.h>
 #include <sys/types.h>
 #include <sys/stat.h>
+#include <sys/wait.h>
 #include <unistd.h>
 
 #ifndef DISTILL_ENGINE_PATH
@@ -42,6 +44,9 @@ enum {
     /* A resize drag delivers a width per frame and laying the page out again
        is the expensive half of a navigation, so let the drag settle first. */
     RELAYOUT_SETTLE_MS = 120,
+    /* Often enough that the count moves smoothly, rarely enough that a status
+       line is not redrawn for its own sake. */
+    PROGRESS_POLL_MS = 100,
     RENDER_OVERSCAN = 200,
     MAX_FORM_BOXES = 512,
     MAX_LINK_BOXES = 2048,
@@ -134,6 +139,18 @@ typedef struct {
     GtkWidget *widget;
 } FormControl;
 
+/* What the engine has said so far about the run in flight. The load happens
+   on a worker thread and the status line belongs to the main one, so the two
+   meet here instead of reaching into each other: the worker writes what the
+   engine reports, a timer on the main thread reads it, and the box outlives
+   whichever of them finishes first. */
+typedef struct {
+    GMutex lock;
+    int percent;
+    char phase[16];
+    gint references;
+} LoadProgress;
+
 typedef struct {
     char *url;
     char *method;
@@ -141,6 +158,7 @@ typedef struct {
     char *theme;
     int zoom;
     int width;
+    LoadProgress *progress;
     guint serial;
     bool replace_current;
 } LoadRequest;
@@ -169,6 +187,9 @@ struct App {
     GtkWidget *zoom_items[ZOOM_LEVEL_COUNT];
     GtkCssProvider *form_css_provider;
     GtkWidget *status;
+    GtkWidget *spinner;
+    LoadProgress *progress;
+    guint progress_source;
     GtkWidget *drawing_area;
     GtkWidget *event_box;
     GtkWidget *form_layer;
@@ -229,6 +250,104 @@ static void page_dispose(DAppPage *page)
 static void set_status(App *app, const char *message)
 {
     gtk_label_set_text(GTK_LABEL(app->status), message ? message : "");
+}
+
+static LoadProgress *load_progress_new(void)
+{
+    LoadProgress *progress = g_new0(LoadProgress, 1);
+    g_mutex_init(&progress->lock);
+    progress->references = 1;
+    return progress;
+}
+
+static LoadProgress *load_progress_ref(LoadProgress *progress)
+{
+    if (progress) g_atomic_int_inc(&progress->references);
+    return progress;
+}
+
+static void load_progress_unref(LoadProgress *progress)
+{
+    if (!progress || !g_atomic_int_dec_and_test(&progress->references)) return;
+    g_mutex_clear(&progress->lock);
+    g_free(progress);
+}
+
+static void load_progress_set(LoadProgress *progress, int percent, const char *phase)
+{
+    if (!progress) return;
+    g_mutex_lock(&progress->lock);
+    progress->percent = percent;
+    g_strlcpy(progress->phase, phase ? phase : "", sizeof progress->phase);
+    g_mutex_unlock(&progress->lock);
+}
+
+static void load_progress_get(LoadProgress *progress, int *percent, char *phase, size_t size)
+{
+    *percent = 0;
+    if (size) *phase = '\0';
+    if (!progress) return;
+    g_mutex_lock(&progress->lock);
+    *percent = progress->percent;
+    g_strlcpy(phase, progress->phase, size);
+    g_mutex_unlock(&progress->lock);
+}
+
+/* What the reader is told while it waits. The phase is the part the engine
+   actually measures, so it leads; the percentage follows it. */
+static char *loading_message(int percent, const char *phase)
+{
+    const char *doing = "Loading";
+    if (d_eq(phase, "fetch")) doing = "Fetching the page";
+    else if (d_eq(phase, "scripts")) doing = "Running the page's scripts";
+    else if (d_eq(phase, "extract")) doing = "Reading the page";
+    else if (d_eq(phase, "render")) doing = "Laying out the page";
+    else if (d_eq(phase, "done")) doing = "Finishing";
+    if (percent <= 0) return g_strdup_printf("%s\xe2\x80\xa6", doing);
+    return g_strdup_printf("%s\xe2\x80\xa6 %d%%", doing, percent);
+}
+
+static gboolean poll_load_progress(gpointer opaque)
+{
+    App *app = opaque;
+    if (app->closing || !app->loading || !app->progress) {
+        app->progress_source = 0;
+        return G_SOURCE_REMOVE;
+    }
+    int percent = 0;
+    char phase[16];
+    load_progress_get(app->progress, &percent, phase, sizeof phase);
+    char *message = loading_message(percent, phase);
+    set_status(app, message);
+    g_free(message);
+    return G_SOURCE_CONTINUE;
+}
+
+/* The spinner says the run is alive even while the percentage is standing
+   still, which it does whenever a phase cannot measure itself -- a server
+   that declares no length, a page whose scripts are simply thinking. */
+static void start_load_feedback(App *app)
+{
+    if (app->spinner) {
+        gtk_widget_show(app->spinner);
+        gtk_spinner_start(GTK_SPINNER(app->spinner));
+    }
+    if (!app->progress_source)
+        app->progress_source = g_timeout_add(PROGRESS_POLL_MS, poll_load_progress, app);
+}
+
+static void stop_load_feedback(App *app)
+{
+    if (app->progress_source) {
+        g_source_remove(app->progress_source);
+        app->progress_source = 0;
+    }
+    if (app->spinner) {
+        gtk_spinner_stop(GTK_SPINNER(app->spinner));
+        gtk_widget_hide(app->spinner);
+    }
+    load_progress_unref(app->progress);
+    app->progress = NULL;
 }
 
 static const char *active_theme_id(const App *app)
@@ -606,6 +725,7 @@ static void free_load_request(LoadRequest *request)
     g_free(request->method);
     g_free(request->data);
     g_free(request->theme);
+    load_progress_unref(request->progress);
     g_free(request);
 }
 
@@ -696,6 +816,58 @@ static char *write_private_body(const char *data)
     return path;
 }
 
+/* One "progress PERCENT PHASE" record per line. Anything else the engine puts
+   on this pipe is ignored rather than guessed at. */
+static void consume_progress(GString *pending, const char *bytes, size_t length,
+                             LoadProgress *progress)
+{
+    g_string_append_len(pending, bytes, (gssize)length);
+    char *start = pending->str;
+    char *newline;
+    while ((newline = strchr(start, '\n'))) {
+        *newline = '\0';
+        int percent = 0;
+        char phase[16] = "";
+        if (sscanf(start, "progress %d %15s", &percent, phase) == 2)
+            load_progress_set(progress, percent, phase);
+        start = newline + 1;
+    }
+    g_string_erase(pending, 0, (gssize)(start - pending->str));
+}
+
+/* Read both pipes until the engine closes them. Both, because a run with a
+   lot to say on stderr would otherwise fill that pipe and stop with nobody
+   draining it; as it happens rather than at the end, because a progress
+   record that arrives after the page does is no use to anyone. */
+static void read_engine_output(int out_fd, int err_fd, LoadProgress *progress,
+                               GString *diagnostics)
+{
+    GString *pending = g_string_new(NULL);
+    struct pollfd fds[2] = {{out_fd, POLLIN, 0}, {err_fd, POLLIN, 0}};
+    int open_pipes = 2;
+    while (open_pipes > 0) {
+        if (poll(fds, 2, -1) < 0) {
+            if (errno == EINTR) continue;
+            break;
+        }
+        for (int i = 0; i < 2; ++i) {
+            if (fds[i].fd < 0 || !fds[i].revents) continue;
+            char buffer[4096];
+            ssize_t got = read(fds[i].fd, buffer, sizeof buffer);
+            if (got > 0) {
+                if (i == 0) consume_progress(pending, buffer, (size_t)got, progress);
+                else g_string_append_len(diagnostics, buffer, (gssize)got);
+                continue;
+            }
+            if (got < 0 && (errno == EINTR || errno == EAGAIN)) continue;
+            close(fds[i].fd);
+            fds[i].fd = -1;
+            --open_pipes;
+        }
+    }
+    g_string_free(pending, TRUE);
+}
+
 static bool run_engine(const LoadRequest *request, const char *template_path,
                        char **error_message)
 {
@@ -723,6 +895,7 @@ static bool run_engine(const LoadRequest *request, const char *template_path,
     add_arg(arguments, zoom);
     g_free(zoom);
     add_arg(arguments, "--native-forms");
+    add_arg(arguments, "--progress");
     if (request->method && *request->method) {
         add_arg(arguments, "--request-method");
         add_arg(arguments, request->method);
@@ -748,25 +921,41 @@ static bool run_engine(const LoadRequest *request, const char *template_path,
     add_arg(arguments, "5000");
     g_ptr_array_add(arguments, NULL);
 
-    char *stdout_text = NULL;
-    char *stderr_text = NULL;
     GError *error = NULL;
-    gint wait_status = 0;
-    gboolean spawned = g_spawn_sync(NULL, (char **)arguments->pdata, NULL,
-                                    G_SPAWN_SEARCH_PATH, NULL, NULL, &stdout_text,
-                                    &stderr_text, &wait_status, &error);
+    GPid child = 0;
+    gint out_fd = -1, err_fd = -1;
+    /* Spawned with pipes rather than run to completion: the run reports where
+       it has got to while it is still running, and this is the end that
+       listens. The child is not reaped by GLib so its status can be collected
+       here, on the thread that is already waiting for it. */
+    gboolean spawned = g_spawn_async_with_pipes(NULL, (char **)arguments->pdata, NULL,
+                                                G_SPAWN_SEARCH_PATH | G_SPAWN_DO_NOT_REAP_CHILD,
+                                                NULL, NULL, &child, NULL, &out_fd, &err_fd,
+                                                &error);
+    GString *diagnostics = g_string_new(NULL);
+    int wait_status = 0;
+    bool waited = false;
+    if (spawned) {
+        read_engine_output(out_fd, err_fd, request->progress, diagnostics);
+        pid_t reaped;
+        while ((reaped = waitpid(child, &wait_status, 0)) < 0 && errno == EINTR) {}
+        /* A status only means something if it was actually collected: a child
+           lost to someone else's wait must not read as a clean exit. */
+        waited = reaped == (pid_t)child;
+        g_spawn_close_pid(child);
+    }
     if (body_path) {
         unlink(body_path);
         g_free(body_path);
     }
-    bool ok = spawned && g_spawn_check_wait_status(wait_status, &error);
+    bool ok = spawned && waited && g_spawn_check_wait_status(wait_status, &error);
     if (!ok && error_message) {
-        const char *message = error ? error->message : (stderr_text ? stderr_text : "engine failed");
-        *error_message = g_strdup(message ? message : "engine failed");
+        const char *message = error ? error->message
+                                    : (diagnostics->len ? diagnostics->str : "engine failed");
+        *error_message = g_strdup(message && *message ? message : "engine failed");
     }
     if (error) g_error_free(error);
-    g_free(stdout_text);
-    g_free(stderr_text);
+    g_string_free(diagnostics, TRUE);
     g_ptr_array_free(arguments, TRUE);
     g_free(engine);
     return ok;
@@ -1920,18 +2109,22 @@ static void load_done(GObject *source_object, GAsyncResult *result, gpointer opa
         return;
     }
     if (error) {
+        app->loading = false;
+        stop_load_feedback(app);
         set_status(app, error->message);
         g_error_free(error);
-        app->loading = false;
         app_unref(app);
         return;
     }
+    /* A stale result leaves the feedback running: what the status line is
+       describing is the newer run, not this one. */
     if (!loaded || loaded->serial != app->load_serial) {
         if (loaded) free_load_result(loaded);
         app_unref(app);
         return;
     }
     app->loading = false;
+    stop_load_feedback(app);
     if (!loaded->ok) {
         char *message = g_strdup_printf("Load failed: %s", loaded->error ? loaded->error : "engine failed");
         set_status(app, message);
@@ -1988,11 +2181,15 @@ static void app_begin_load(App *app, const char *uri, const char *method,
     request->theme = g_strdup(active_theme_id(app));
     request->zoom = active_zoom(app);
     request->width = reader_page_width(app);
+    request->progress = load_progress_new();
+    load_progress_unref(app->progress);
+    app->progress = load_progress_ref(request->progress);
     request->serial = ++app->load_serial;
     request->replace_current = replace_current;
     app->loading = true;
     app_ref(app);
     set_status(app, "Loading…");
+    start_load_feedback(app);
     GTask *task = g_task_new(NULL, NULL, load_done, app);
     g_task_set_task_data(task, request, (GDestroyNotify)free_load_request);
     g_task_run_in_thread(task, load_worker);
@@ -2297,6 +2494,7 @@ static void app_destroy(GtkWidget *widget, gpointer opaque)
     app->closing = true;
     cancel_reader_scroll_restore(app);
     cancel_relayout(app);
+    stop_load_feedback(app);
     if (app->document) distill_litehtml_document_destroy(app->document);
     app->document = NULL;
     app->surface = NULL;
@@ -2405,12 +2603,19 @@ static void app_activate(GtkApplication *application, gpointer opaque)
     gtk_overlay_set_overlay_pass_through(GTK_OVERLAY(overlay), app->form_layer, FALSE);
     set_surface_size(app, reader_page_width(app), PAGE_HEIGHT);
 
+    GtkWidget *status_row = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 8);
+    gtk_widget_set_margin_start(status_row, 10);
+    gtk_widget_set_margin_top(status_row, 5);
+    gtk_widget_set_margin_bottom(status_row, 5);
+    app->spinner = gtk_spinner_new();
+    /* Shown only while something is running: a spinner that is always there
+       says nothing, and one that is there but still says the wrong thing. */
+    gtk_widget_set_no_show_all(app->spinner, TRUE);
+    gtk_box_pack_start(GTK_BOX(status_row), app->spinner, FALSE, FALSE, 0);
     app->status = gtk_label_new("Ready");
     gtk_widget_set_halign(app->status, GTK_ALIGN_START);
-    gtk_widget_set_margin_start(app->status, 10);
-    gtk_widget_set_margin_top(app->status, 5);
-    gtk_widget_set_margin_bottom(app->status, 5);
-    gtk_box_pack_start(GTK_BOX(root), app->status, FALSE, FALSE, 0);
+    gtk_box_pack_start(GTK_BOX(status_row), app->status, FALSE, FALSE, 0);
+    gtk_box_pack_start(GTK_BOX(root), status_row, FALSE, FALSE, 0);
     gtk_widget_show_all(app->window);
     if (initial_url && *initial_url) app_begin_load(app, initial_url, NULL, NULL, false);
 }
@@ -2815,6 +3020,63 @@ static bool run_width_self_test(void)
     return ok;
 }
 
+/* The pipe hands over whatever it has, which is not whole lines, and the
+   status line is only as truthful as this parse. The phase vocabulary is
+   shared with the engine, so a name that no longer matches shows up here as
+   the fallback text rather than as a wrong description of what is happening. */
+static bool run_progress_self_test(void)
+{
+    bool ok = true;
+    LoadProgress *progress = load_progress_new();
+    GString *pending = g_string_new(NULL);
+    int percent = 0;
+    char phase[16];
+
+    consume_progress(pending, "progress 12 fet", strlen("progress 12 fet"), progress);
+    load_progress_get(progress, &percent, phase, sizeof phase);
+    if (percent != 0) {
+        fprintf(stderr, "progress: half a record was read as a whole one\n");
+        ok = false;
+    }
+    const char *rest = "ch\nprogress 40 scripts\nprogress 75 ex";
+    consume_progress(pending, rest, strlen(rest), progress);
+    load_progress_get(progress, &percent, phase, sizeof phase);
+    if (percent != 40 || strcmp(phase, "scripts") != 0) {
+        fprintf(stderr, "progress: records split across reads did not arrive (%d %s)\n",
+                percent, phase);
+        ok = false;
+    }
+    consume_progress(pending, "tract\n", strlen("tract\n"), progress);
+    load_progress_get(progress, &percent, phase, sizeof phase);
+    if (percent != 75 || strcmp(phase, "extract") != 0) {
+        fprintf(stderr, "progress: the last record did not complete (%d %s)\n",
+                percent, phase);
+        ok = false;
+    }
+    const char *noise = "phase2 scripts=3 cap_hit=false\n";
+    consume_progress(pending, noise, strlen(noise), progress);
+    load_progress_get(progress, &percent, phase, sizeof phase);
+    if (percent != 75 || strcmp(phase, "extract") != 0) {
+        fprintf(stderr, "progress: a line that is not a record moved the count\n");
+        ok = false;
+    }
+    g_string_free(pending, TRUE);
+    load_progress_unref(progress);
+
+    static const char *phases[] = {"fetch", "scripts", "extract", "render", "done"};
+    char *fallback = loading_message(50, "nonsense");
+    for (size_t i = 0; i < sizeof phases / sizeof phases[0]; ++i) {
+        char *message = loading_message(50, phases[i]);
+        if (strcmp(message, fallback) == 0 || !strstr(message, "50%")) {
+            fprintf(stderr, "progress: phase %s has no message of its own\n", phases[i]);
+            ok = false;
+        }
+        g_free(message);
+    }
+    g_free(fallback);
+    return ok;
+}
+
 static int run_state_self_test(void)
 {
     DAppHistory history;
@@ -2828,6 +3090,7 @@ static int run_state_self_test(void)
     d_app_history_clear(&history, NULL);
     ok = run_zoom_self_test() && ok;
     ok = run_width_self_test() && ok;
+    ok = run_progress_self_test() && ok;
     ok = run_coordinate_self_test() && ok;
     ok = run_address_bar_self_test() && ok;
     ok = run_redirect_self_test() && ok;

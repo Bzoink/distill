@@ -148,6 +148,10 @@ struct Engine {
     int async_pending;
     bool load_sent;
     bool cap_hit;
+    /* Progress reporting, off unless the caller asked for it. */
+    bool progress;
+    int progress_percent;
+    const char *progress_phase;
     const char *challenge;
     TimerVec timers;
     ListenerVec listeners;
@@ -159,6 +163,35 @@ static uint64_t clock_ms(void)
     struct timespec now;
     clock_gettime(CLOCK_MONOTONIC, &now);
     return (uint64_t)now.tv_sec * 1000u + (uint64_t)now.tv_nsec / 1000000u;
+}
+
+/* One line per step on stdout: "progress PERCENT PHASE". The caller wanted to
+   know the run is alive and roughly how far along it is, and a one-shot child
+   process cannot say so any other way.
+
+   The percentage is the pipeline's shape, not a measurement: each phase owns
+   a band and moves inside it. What it honestly reports is which phase the run
+   is in and that the phases happen in this order -- the fetch band tracks the
+   bytes when the server declares a length, and the script band tracks the
+   settle budget, which is a real upper bound the run usually beats. */
+#define PROGRESS_FETCH_START 2
+#define PROGRESS_FETCH_END 35
+#define PROGRESS_SCRIPTS_END 75
+#define PROGRESS_EXTRACT_END 85
+
+static void report_progress(Engine *engine, int percent, const char *phase)
+{
+    if (!engine || !engine->progress) return;
+    if (percent < 0) percent = 0;
+    if (percent > 100) percent = 100;
+    /* Never walk backwards: a redirect restarts the transfer and the reader
+       should not watch the page load twice. */
+    if (percent < engine->progress_percent) percent = engine->progress_percent;
+    if (percent == engine->progress_percent && d_eq(phase, engine->progress_phase)) return;
+    engine->progress_percent = percent;
+    engine->progress_phase = phase;
+    printf("progress %d %s\n", percent, phase);
+    fflush(stdout);
 }
 
 static char *js_string(JSContext *ctx, JSValueConst value)
@@ -662,6 +695,23 @@ static size_t response_header_callback(void *ptr, size_t size, size_t count,
     return length;
 }
 
+static int curl_transfer_progress(void *opaque, curl_off_t download_total,
+                                  curl_off_t download_now, curl_off_t upload_total,
+                                  curl_off_t upload_now)
+{
+    (void)upload_total; (void)upload_now;
+    Engine *engine = opaque;
+    /* A server that declares no length gives nothing to divide by; the phase
+       still says what is happening, which is the part that always holds. */
+    if (download_total > 0 && download_now >= 0) {
+        int span = PROGRESS_FETCH_END - PROGRESS_FETCH_START;
+        int percent = PROGRESS_FETCH_START +
+                      (int)((double)span * (double)download_now / (double)download_total);
+        report_progress(engine, percent, "fetch");
+    }
+    return 0;
+}
+
 static bool fetch_sync_request(Engine *engine, const char *url, DBuffer *body,
                                long *status, char **effective_url,
                                const char *request_method, const char *request_data)
@@ -694,6 +744,13 @@ static bool fetch_sync_request(Engine *engine, const char *url, DBuffer *body,
     configure_curl_common(engine, easy, engine->source_url == url ? NULL : engine->source_url);
     bool document_request = d_eq(engine->source_url, url) &&
                             (!request_method || d_ieq(request_method, "GET"));
+    /* Only the page itself reports bytes. A sub-resource fetched later is
+       part of the script phase and has its own band. */
+    if (document_request && engine->progress) {
+        curl_easy_setopt(easy, CURLOPT_NOPROGRESS, 0L);
+        curl_easy_setopt(easy, CURLOPT_XFERINFOFUNCTION, curl_transfer_progress);
+        curl_easy_setopt(easy, CURLOPT_XFERINFODATA, engine);
+    }
     struct curl_slist *headers = default_request_headers(
         document_request ? NULL : engine->source_url, NULL, document_request);
     curl_easy_setopt(easy, CURLOPT_HTTPHEADER, headers);
@@ -1881,6 +1938,16 @@ static void settle(Engine *engine)
         run_timers(engine);
         execute_jobs(engine);
         dispatch_load_if_ready(engine);
+        if (engine->progress && engine->cap_ms) {
+            /* The settle budget is the one bound this phase cannot exceed, so
+               it is what the band is measured against. Settling early -- which
+               is the common case -- simply ends the phase ahead of the bar. */
+            uint64_t elapsed = clock_ms() - engine->started;
+            if (elapsed > engine->cap_ms) elapsed = engine->cap_ms;
+            uint64_t span = PROGRESS_SCRIPTS_END - PROGRESS_FETCH_END;
+            report_progress(engine, PROGRESS_FETCH_END + (int)(span * elapsed / engine->cap_ms),
+                            "scripts");
+        }
         if (clock_ms() - engine->started >= engine->cap_ms) {
             engine->cap_hit = true;
             break;
@@ -3070,7 +3137,8 @@ static int run_page(const char *input, uint64_t cap_ms, uint64_t memory_mb,
                     const char *font_dir, const char *template_path,
                     const char *theme, bool native_forms, int zoom,
                     const char *request_method,
-                    const char *request_data, const char *session_file)
+                    const char *request_data, const char *session_file,
+                    bool progress)
 {
     Engine engine = {0};
 #ifdef DISTILL_RENDER
@@ -3081,6 +3149,7 @@ static int run_page(const char *input, uint64_t cap_ms, uint64_t memory_mb,
     }
 #endif
     engine.cap_ms = cap_ms;
+    engine.progress = progress;
     engine.memory_limit = memory_mb * 1024u * 1024u;
     engine.max_scripts = max_scripts;
     engine.source_url = absolute_input(input);
@@ -3098,6 +3167,7 @@ static int run_page(const char *input, uint64_t cap_ms, uint64_t memory_mb,
     DBuffer html;
     long status = 0;
     char *effective_url = NULL;
+    report_progress(&engine, PROGRESS_FETCH_START, "fetch");
     if (!fetch_sync_request(&engine, engine.source_url, &html, &status, &effective_url,
                             request_method, request_data)) {
         fprintf(stderr, "unable to load %s (status %ld)\n", engine.source_url, status);
@@ -3176,6 +3246,7 @@ static int run_page(const char *input, uint64_t cap_ms, uint64_t memory_mb,
     }
     dbuf_free(&html);
     set_document_base(&engine);
+    report_progress(&engine, PROGRESS_FETCH_END, "scripts");
     if (!engine.challenge) {
         if (!discover_scripts(&engine)) {
             engine_cleanup(&engine);
@@ -3189,6 +3260,7 @@ static int run_page(const char *input, uint64_t cap_ms, uint64_t memory_mb,
     /* The settle cap stops page activity; it must not interrupt our own
        final DOM snapshot or extraction pass. */
     JS_SetInterruptHandler(engine.runtime, NULL, NULL);
+    report_progress(&engine, PROGRESS_SCRIPTS_END, "extract");
     char *serialized = serialize_document(&engine);
     /* Some challenges write their message from script, so the served HTML
        carries no marker and only the settled DOM does. Detecting it here is
@@ -3203,6 +3275,7 @@ static int run_page(const char *input, uint64_t cap_ms, uint64_t memory_mb,
         }
     }
     int result = 0;
+    report_progress(&engine, PROGRESS_EXTRACT_END, "render");
     if (viewer_path) {
 #ifdef DISTILL_RENDER
         char *json = run_extraction(&engine, serialized);
@@ -3280,6 +3353,7 @@ static int run_page(const char *input, uint64_t cap_ms, uint64_t memory_mb,
     /* The output above is still produced so the challenge shell can be
        inspected; the status distinguishes it from a content run. */
     if (result == 0 && engine.challenge) result = 4;
+    report_progress(&engine, 100, "done");
     fprintf(stderr, "%s scripts=%llu cap_hit=%s\n", viewer_path ? "phase2-viewer" : (render_path ? "phase2" : (extract ? "phase1" : "phase0")),
             (unsigned long long)engine.scripts_run, engine.cap_hit ? "true" : "false");
     free(serialized);
@@ -3292,13 +3366,18 @@ static int run_page(const char *input, uint64_t cap_ms, uint64_t memory_mb,
 
 static void usage(const char *program)
 {
-    fprintf(stderr, "usage: %s --url URL [--dump-dom|--extract|--render FILE|--template FILE|--viewer FILE|--fetch-media FILE] [--media-index N] [--save-media FILE] [--width N] [--height N|0] [--font-dir DIR] [--theme warm|night|paper] [--zoom PERCENT] [--native-forms] [--request-method GET|POST] [--request-data DATA|--request-data-file FILE|-] [--session-file FILE] [--script-cap-ms N] [--memory-limit-mb N] [--max-scripts N]\n", program);
+    fprintf(stderr, "usage: %s --url URL [--dump-dom|--extract|--render FILE|--template FILE|--viewer FILE|--fetch-media FILE] [--media-index N] [--save-media FILE] [--width N] [--height N|0] [--font-dir DIR] [--theme warm|night|paper] [--zoom PERCENT] [--native-forms] [--progress] [--request-method GET|POST] [--request-data DATA|--request-data-file FILE|-] [--session-file FILE] [--script-cap-ms N] [--memory-limit-mb N] [--max-scripts N]\n", program);
     fprintf(stderr, "  --height 0            size the render to the content instead of cropping it.\n"
         "  --fetch-media FILE    fetch one image and write its bytes, with no scripts and no\n"
         "                        extraction. The format is taken from the bytes, not the\n"
         "                        served content type, and a non-image is refused.\n");
     fprintf(stderr, "  --zoom PERCENT        reader type size, 50 to 300, default 100. The column and the\n"
         "                        gutters scale with it; the surface width caps both.\n");
+    fprintf(stderr, "  --progress            report \"progress PERCENT PHASE\" on stdout as the run moves\n"
+        "                        through fetch, scripts, extract and render. The phases are\n"
+        "                        what is measured; the percentage is their weighting. Not\n"
+        "                        available with --dump-dom or --extract, whose output is\n"
+        "                        stdout itself.\n");
     fprintf(stderr, "  --session-file FILE   keep cookies across runs, so a login survives the next navigation.\n");
     fprintf(stderr, "                        Created mode 600 and refused if others can read it.\n");
     fprintf(stderr, "  --request-data-file F read the POST body from a file, or from stdin when F is \"-\".\n");
@@ -3349,7 +3428,7 @@ int main(int argc, char **argv)
     int render_width = 760, render_height = 1100;
     int zoom = 100;
     int media_index = 0;
-    bool dump_dom = false, extract = false, native_forms = false;
+    bool dump_dom = false, extract = false, native_forms = false, progress = false;
     for (int i = 1; i < argc; ++i) {
         if (d_eq(argv[i], "--url") && i + 1 < argc) url = argv[++i];
         else if (d_eq(argv[i], "--dump-dom")) dump_dom = true;
@@ -3366,6 +3445,7 @@ int main(int argc, char **argv)
         else if (d_eq(argv[i], "--theme") && i + 1 < argc) theme = argv[++i];
         else if (d_eq(argv[i], "--zoom") && i + 1 < argc) zoom = (int)strtol(argv[++i], NULL, 10);
         else if (d_eq(argv[i], "--native-forms")) native_forms = true;
+        else if (d_eq(argv[i], "--progress")) progress = true;
         else if (d_eq(argv[i], "--request-method") && i + 1 < argc) request_method = argv[++i];
         else if (d_eq(argv[i], "--request-data") && i + 1 < argc) request_data = argv[++i];
         else if (d_eq(argv[i], "--request-data-file") && i + 1 < argc) request_data_file = argv[++i];
@@ -3386,6 +3466,7 @@ int main(int argc, char **argv)
         (fetch_media_path && (dump_dom || extract || render_path || template_path || viewer_path)) ||
         render_width <= 0 || render_height < 0 ||
         zoom < READER_ZOOM_MIN || zoom > READER_ZOOM_MAX ||
+        (progress && (dump_dom || extract)) ||
         ((request_data || request_data_file) && (!request_method || !d_ieq(request_method, "post"))) ||
         (request_method && !d_ieq(request_method, "get") && !d_ieq(request_method, "post"))) {
         usage(argv[0]); return 2;
@@ -3401,7 +3482,7 @@ int main(int argc, char **argv)
                           fetch_media_path,
                           render_width, render_height, font_dir, template_path, theme,
                           native_forms, zoom,
-                          request_method, request_data, session_file);
+                          request_method, request_data, session_file, progress);
     curl_global_cleanup();
     /* The body may hold a password; do not leave it in freed-but-readable
        heap longer than necessary. */
