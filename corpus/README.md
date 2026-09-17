@@ -76,6 +76,14 @@ size. Ctrl+plus and Ctrl+minus step through the levels the menu offers and
 Ctrl+0 returns to 100%; `--self-test` covers the stepping and the fallback for
 a saved level the menu no longer has.
 
+The page width follows the window between 480 and 760 design pixels, both
+scaled by zoom, and the page is centred on the dark desk either side of it.
+Above the span a wider window only adds margin, since the measure is capped;
+below it the window scrolls. Resizing re-lays out the template the shell
+already has rather than fetching anything, and keeps the reading position
+across the reflow. `--self-test` covers the span; the reader template itself
+is width-agnostic, so `--render --width N` shows any point in it.
+
 The address bar takes either a URL or a search. The rule is the one browsers
 converged on, because users have already learned it: a scheme, a path, or a
 dotted host is somewhere to go, and a bare word or anything containing a space

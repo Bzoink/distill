@@ -406,7 +406,13 @@ URL-encoded POST forms back through the engine. Warm, night, and paper themes
 are selectable through the reader template, as are eight zoom levels from 75%
 to 200% (`--zoom`, Ctrl+plus/minus/0), laid out by the engine rather than
 scaled after the fact so the type stays sharp and the native controls keep
-their geometry; a reading-list toggle keeps URLs for the session. `distill-app-state` and `distill-litehtml-geometry` CTest
+their geometry. The page follows the window between a floor and the width the
+reader was drawn at (480 to 760 design pixels, both scaled by zoom), centred
+on its desk: past the top of that span a wider window buys margin and nothing
+else, because the measure is capped for readability, and past the bottom the
+window scrolls rather than squeezing the page further. A width change is a
+re-layout of the template already on disk, not a navigation. A reading-list
+toggle keeps URLs for the session. `distill-app-state` and `distill-litehtml-geometry` CTest
 contracts cover history truncation/replacement and native-control geometry,
 while `corpus/check.py --app` covers the display-free shell model. Phase 4 can
 now widen the interaction and binding surface from evidence.

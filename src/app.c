@@ -31,8 +31,17 @@
 #endif
 
 enum {
-    PAGE_WIDTH = 760,
+    /* The page follows the window between these two, in design pixels that
+       zoom then scales. The upper end is the width the reader was drawn at:
+       the measure is capped for readability, so a wider window buys margin
+       and nothing else. The lower end is where a measure stops being one --
+       a narrower window scrolls the page rather than squeezing it further. */
+    PAGE_WIDTH_DESIGN = 760,
+    PAGE_WIDTH_FLOOR = 480,
     PAGE_HEIGHT = 1400,
+    /* A resize drag delivers a width per frame and laying the page out again
+       is the expensive half of a navigation, so let the drag settle first. */
+    RELAYOUT_SETTLE_MS = 120,
     RENDER_OVERSCAN = 200,
     MAX_FORM_BOXES = 512,
     MAX_LINK_BOXES = 2048,
@@ -60,6 +69,18 @@ static int zoom_level_index(int zoom)
 static bool valid_zoom(int zoom)
 {
     return zoom_level_index(zoom) >= 0;
+}
+
+/* Zoom moves both ends of the span with the design it scales: at 175% the
+   page wants 175% of the room before more of it stops helping. */
+static int clamp_page_width(int available, int zoom)
+{
+    int maximum = (PAGE_WIDTH_DESIGN * zoom + 50) / 100;
+    int minimum = (PAGE_WIDTH_FLOOR * zoom + 50) / 100;
+    if (minimum > maximum) minimum = maximum;
+    if (available < minimum) return minimum;
+    if (available > maximum) return maximum;
+    return available;
 }
 
 static int zoom_step_level(int zoom, int direction)
@@ -119,6 +140,7 @@ typedef struct {
     char *data;
     char *theme;
     int zoom;
+    int width;
     guint serial;
     bool replace_current;
 } LoadRequest;
@@ -151,6 +173,10 @@ struct App {
     GtkWidget *event_box;
     GtkWidget *form_layer;
     GtkAdjustment *vertical_adjustment;
+    GtkAdjustment *horizontal_adjustment;
+    int page_width;
+    int page_height;
+    guint relayout_source;
     cairo_surface_t *surface;
     DLiteHtmlDocument *document;
     int surface_top;
@@ -169,6 +195,10 @@ struct App {
     bool entering_viewer;
     int viewer_index;
     char *viewer_file;
+    /* What the open image is, kept so the viewer can be laid out again when
+       the window changes width. */
+    char *viewer_url;
+    char *viewer_failure;
     double reader_scroll_y;
     guint restore_scroll_source;
     guint load_serial;
@@ -253,6 +283,28 @@ static void select_zoom(App *app, int zoom)
     app->updating_zoom = false;
 }
 
+/* The width to draw at now: what the window offers, held inside the span. */
+static int reader_page_width(const App *app)
+{
+    if (!app) return PAGE_WIDTH_DESIGN;
+    int available = PAGE_WIDTH_DESIGN;
+    if (app->horizontal_adjustment) {
+        double size = gtk_adjustment_get_page_size(app->horizontal_adjustment);
+        if (size > 1.0) available = (int)size;
+    }
+    return clamp_page_width(available, active_zoom(app));
+}
+
+static void set_surface_size(App *app, int width, int height)
+{
+    if (!app) return;
+    if (app->drawing_area) gtk_widget_set_size_request(app->drawing_area, width, height);
+    if (app->event_box) gtk_widget_set_size_request(app->event_box, width, height);
+    if (app->form_layer) gtk_widget_set_size_request(app->form_layer, width, height);
+    app->page_width = width;
+    app->page_height = height;
+}
+
 static bool valid_theme_id(const char *theme)
 {
     return theme && (strcmp(theme, "warm") == 0 ||
@@ -308,6 +360,12 @@ static void update_form_style(App *app, const char *theme, int zoom)
        from whatever the desktop's font is, so zoom moves it without
        overriding a font size the user chose outside this window. */
     char *css = g_strdup_printf(
+        /* The page no longer fills the window, so the space either side of it
+           is the scrolled window's own background rather than something the
+           reader surface painted. It is the desk the page lies on and stays
+           the same dark whatever the reader theme, as it was when the surface
+           drew it. */
+        ".distill-desk,.distill-desk viewport{background-color:#1a1c1f;}"
         ".distill-form-entry,.distill-form-textarea,.distill-form-select,"
         ".distill-form-choice,.distill-form-button{font-size:%d%%;}"
         ".distill-form-entry{color:%s;background-color:%s;background-image:none;"
@@ -650,7 +708,7 @@ static bool run_engine(const LoadRequest *request, const char *template_path,
     add_arg(arguments, "--template");
     add_arg(arguments, template_path);
     add_arg(arguments, "--width");
-    char *width = g_strdup_printf("%d", PAGE_WIDTH);
+    char *width = g_strdup_printf("%d", request->width);
     add_arg(arguments, width);
     g_free(width);
     /* 0 means "as tall as the content". A reader page is as long as what it
@@ -1098,11 +1156,20 @@ static char *viewer_html(App *app, const char *url, const char *file,
     return g_string_free(out, FALSE);
 }
 
+static void forget_viewer_image(App *app)
+{
+    if (app->viewer_file) { unlink(app->viewer_file); g_free(app->viewer_file); app->viewer_file = NULL; }
+    g_free(app->viewer_url);
+    app->viewer_url = NULL;
+    g_free(app->viewer_failure);
+    app->viewer_failure = NULL;
+}
+
 static void leave_viewer(App *app)
 {
     if (!app->viewer_active) return;
     app->viewer_active = false;
-    if (app->viewer_file) { unlink(app->viewer_file); g_free(app->viewer_file); app->viewer_file = NULL; }
+    forget_viewer_image(app);
     const DAppPage *page = d_app_history_current(&app->history);
     if (!page) return;
     char *template = d_read_file(page->template_path, NULL);
@@ -1111,6 +1178,66 @@ static void leave_viewer(App *app)
     collect_page_media(app);
     schedule_reader_scroll_restore(app);
     set_status(app, "Closed the image");
+}
+
+/* Draw the page again at the width the window now offers. This is a layout,
+   not a navigation: the template is already on disk and the image already
+   fetched, so nothing is refetched and no script runs again. */
+static void relayout_page(App *app)
+{
+    if (!app || app->closing || app->loading) return;
+    if (reader_page_width(app) == app->page_width) return;
+    if (app->viewer_active) {
+        if (!app->viewer_url) return;
+        char *html = viewer_html(app, app->viewer_url, app->viewer_file, app->viewer_failure);
+        build_document(app, html);
+        g_free(html);
+        return;
+    }
+    const DAppPage *page = d_app_history_current(&app->history);
+    if (!page) {
+        set_surface_size(app, reader_page_width(app), PAGE_HEIGHT);
+        return;
+    }
+    /* The text reflows, so the same offset is a different place. Carry the
+       position as a fraction of the page and the reader stays where it was
+       rather than jumping forward as the measure narrows. */
+    double fraction = 0.0;
+    if (app->vertical_adjustment && app->page_height > 0)
+        fraction = gtk_adjustment_get_value(app->vertical_adjustment) / app->page_height;
+    char *template = d_read_file(page->template_path, NULL);
+    build_document(app, template ? template : "");
+    free(template);
+    collect_page_media(app);
+    app->reader_scroll_y = fraction * app->page_height;
+    schedule_reader_scroll_restore(app);
+}
+
+static gboolean relayout_timeout(gpointer opaque)
+{
+    App *app = opaque;
+    app->relayout_source = 0;
+    relayout_page(app);
+    return G_SOURCE_REMOVE;
+}
+
+static void cancel_relayout(App *app)
+{
+    if (!app || !app->relayout_source) return;
+    g_source_remove(app->relayout_source);
+    app->relayout_source = 0;
+}
+
+static void viewport_width_changed(GtkAdjustment *adjustment, gpointer opaque)
+{
+    (void)adjustment;
+    App *app = opaque;
+    if (app->closing || app->loading) return;
+    /* Laying the page out changes what the page requests, which brings us
+       back here; comparing against the width in hand is what ends that. */
+    if (reader_page_width(app) == app->page_width) return;
+    cancel_relayout(app);
+    app->relayout_source = g_timeout_add(RELAYOUT_SETTLE_MS, relayout_timeout, app);
 }
 
 /* Where this image sits among the page's images. -1 when the page does not
@@ -1143,6 +1270,10 @@ static void enter_viewer(App *app, const char *url)
     app->viewer_file = file;
     app->viewer_index = index;
     app->viewer_active = true;
+    g_free(app->viewer_url);
+    app->viewer_url = g_strdup(url);
+    g_free(app->viewer_failure);
+    app->viewer_failure = failure ? g_strdup(failure) : NULL;
     char *html = viewer_html(app, url, file, failure);
     build_document(app, html);
     g_free(html);
@@ -1699,6 +1830,7 @@ static void build_document(App *app, const char *template)
     app->surface_top = 0;
     clear_controls(app);
     int page_height = PAGE_HEIGHT;
+    int page_width = reader_page_width(app);
 
     {
         const char *font_dir = *DISTILL_FONT_DIR ? DISTILL_FONT_DIR : getenv("DISTILL_FONT_DIR");
@@ -1709,7 +1841,7 @@ static void build_document(App *app, const char *template)
         }
         int band_height = viewport + RENDER_OVERSCAN * 2;
         if (band_height < PAGE_HEIGHT) band_height = PAGE_HEIGHT;
-        app->document = distill_litehtml_document_create(template, PAGE_WIDTH,
+        app->document = distill_litehtml_document_create(template, page_width,
                                                          band_height, font_dir);
         if (app->document) {
             page_height = distill_litehtml_document_content_height(app->document);
@@ -1735,9 +1867,7 @@ static void build_document(App *app, const char *template)
             }
         }
     }
-    gtk_widget_set_size_request(app->drawing_area, PAGE_WIDTH, page_height);
-    gtk_widget_set_size_request(app->event_box, PAGE_WIDTH, page_height);
-    gtk_widget_set_size_request(app->form_layer, PAGE_WIDTH, page_height);
+    set_surface_size(app, page_width, page_height);
     if (app->vertical_adjustment) gtk_adjustment_set_value(app->vertical_adjustment, 0.0);
     render_visible_band(app);
     update_section_menu(app);
@@ -1768,7 +1898,7 @@ static void load_surface(App *app, const DAppPage *page)
     /* Navigating away is another way out of viewer mode, and the downloaded
        file goes with it rather than waiting for the session to end. */
     app->viewer_active = false;
-    if (app->viewer_file) { unlink(app->viewer_file); g_free(app->viewer_file); app->viewer_file = NULL; }
+    forget_viewer_image(app);
     collect_page_media(app);
     gtk_entry_set_text(GTK_ENTRY(app->url_entry), page->url);
     select_theme_id(app, page->theme);
@@ -1857,6 +1987,7 @@ static void app_begin_load(App *app, const char *uri, const char *method,
     request->data = g_strdup(data ? data : "");
     request->theme = g_strdup(active_theme_id(app));
     request->zoom = active_zoom(app);
+    request->width = reader_page_width(app);
     request->serial = ++app->load_serial;
     request->replace_current = replace_current;
     app->loading = true;
@@ -2165,6 +2296,7 @@ static void app_destroy(GtkWidget *widget, gpointer opaque)
     App *app = opaque;
     app->closing = true;
     cancel_reader_scroll_restore(app);
+    cancel_relayout(app);
     if (app->document) distill_litehtml_document_destroy(app->document);
     app->document = NULL;
     app->surface = NULL;
@@ -2179,7 +2311,7 @@ static void app_destroy(GtkWidget *widget, gpointer opaque)
     }
     d_app_history_clear(&app->history, page_dispose);
     if (app->page_media) g_ptr_array_free(app->page_media, TRUE);
-    if (app->viewer_file) { unlink(app->viewer_file); g_free(app->viewer_file); }
+    forget_viewer_image(app);
     g_application_quit(app->application);
     app_unref(app);
 }
@@ -2236,6 +2368,12 @@ static void app_activate(GtkApplication *application, gpointer opaque)
     app->vertical_adjustment = gtk_scrolled_window_get_vadjustment(GTK_SCROLLED_WINDOW(scrolled));
     g_signal_connect(app->vertical_adjustment, "value-changed",
                      G_CALLBACK(scroll_value_changed), app);
+    /* The horizontal adjustment's page size is the visible width whatever the
+       page requested, which is what the span is measured against. */
+    app->horizontal_adjustment = gtk_scrolled_window_get_hadjustment(GTK_SCROLLED_WINDOW(scrolled));
+    g_signal_connect(app->horizontal_adjustment, "changed",
+                     G_CALLBACK(viewport_width_changed), app);
+    gtk_style_context_add_class(gtk_widget_get_style_context(scrolled), "distill-desk");
     gtk_box_pack_start(GTK_BOX(root), scrolled, TRUE, TRUE, 0);
     GtkWidget *overlay = gtk_overlay_new();
     gtk_widget_add_events(overlay, GDK_BUTTON_PRESS_MASK | GDK_POINTER_MOTION_MASK |
@@ -2250,21 +2388,22 @@ static void app_activate(GtkApplication *application, gpointer opaque)
     gtk_widget_set_can_focus(app->event_box, TRUE);
     gtk_event_box_set_visible_window(GTK_EVENT_BOX(app->event_box), FALSE);
     gtk_event_box_set_above_child(GTK_EVENT_BOX(app->event_box), TRUE);
-    gtk_widget_set_size_request(app->event_box, PAGE_WIDTH, PAGE_HEIGHT);
+    gtk_widget_set_halign(app->event_box, GTK_ALIGN_CENTER);
     gtk_widget_add_events(app->event_box, GDK_BUTTON_PRESS_MASK | GDK_POINTER_MOTION_MASK |
                           GDK_LEAVE_NOTIFY_MASK);
     g_signal_connect(app->event_box, "button-press-event", G_CALLBACK(page_button_press), app);
     g_signal_connect(app->event_box, "motion-notify-event", G_CALLBACK(page_motion_notify), app);
     app->drawing_area = gtk_drawing_area_new();
-    gtk_widget_set_size_request(app->drawing_area, PAGE_WIDTH, PAGE_HEIGHT);
+
     g_signal_connect(app->drawing_area, "draw", G_CALLBACK(draw_page), app);
     gtk_container_add(GTK_CONTAINER(app->event_box), app->drawing_area);
     gtk_container_add(GTK_CONTAINER(overlay), app->event_box);
     app->form_layer = gtk_fixed_new();
     gtk_widget_set_can_focus(app->form_layer, FALSE);
-    gtk_widget_set_size_request(app->form_layer, PAGE_WIDTH, PAGE_HEIGHT);
+    gtk_widget_set_halign(app->form_layer, GTK_ALIGN_CENTER);
     gtk_overlay_add_overlay(GTK_OVERLAY(overlay), app->form_layer);
     gtk_overlay_set_overlay_pass_through(GTK_OVERLAY(overlay), app->form_layer, FALSE);
+    set_surface_size(app, reader_page_width(app), PAGE_HEIGHT);
 
     app->status = gtk_label_new("Ready");
     gtk_widget_set_halign(app->status, GTK_ALIGN_START);
@@ -2583,7 +2722,7 @@ static bool run_media_self_test(void)
         if (write_solid_test_png(source, 600, 400)) {
             char *html = viewer_html(&probe, "https://example.test/photo.png", source, NULL);
             const char *font_dir = *DISTILL_FONT_DIR ? DISTILL_FONT_DIR : getenv("DISTILL_FONT_DIR");
-            int height = distill_litehtml_content_height(html, PAGE_WIDTH, font_dir);
+            int height = distill_litehtml_content_height(html, PAGE_WIDTH_DESIGN, font_dir);
             checked = true;
             if (height < 400) {
                 fprintf(stderr, "viewer: a 600x400 image laid out %d tall\n", height);
@@ -2644,6 +2783,38 @@ static bool run_zoom_self_test(void)
     return ok;
 }
 
+/* The span is the whole feature: a window wider than the design width must
+   stop the page growing, a much narrower one must stop it shrinking, and
+   between the two the page is the window. */
+static bool run_width_self_test(void)
+{
+    bool ok = true;
+    if (clamp_page_width(1920, 100) != PAGE_WIDTH_DESIGN ||
+        clamp_page_width(PAGE_WIDTH_DESIGN, 100) != PAGE_WIDTH_DESIGN) {
+        fprintf(stderr, "width: a wide window does not stop at the design width\n");
+        ok = false;
+    }
+    if (clamp_page_width(320, 100) != PAGE_WIDTH_FLOOR ||
+        clamp_page_width(0, 100) != PAGE_WIDTH_FLOOR) {
+        fprintf(stderr, "width: a narrow window shrinks the page past the floor\n");
+        ok = false;
+    }
+    if (clamp_page_width(600, 100) != 600) {
+        fprintf(stderr, "width: a window inside the span does not set the width\n");
+        ok = false;
+    }
+    if (clamp_page_width(1920, 200) != 2 * PAGE_WIDTH_DESIGN ||
+        clamp_page_width(320, 200) != 2 * PAGE_WIDTH_FLOOR) {
+        fprintf(stderr, "width: zoom does not move both ends of the span\n");
+        ok = false;
+    }
+    if (clamp_page_width(1920, 50) >= clamp_page_width(1920, 100)) {
+        fprintf(stderr, "width: zooming out does not narrow the page\n");
+        ok = false;
+    }
+    return ok;
+}
+
 static int run_state_self_test(void)
 {
     DAppHistory history;
@@ -2656,6 +2827,7 @@ static int run_state_self_test(void)
               d_app_history_forward(&history);
     d_app_history_clear(&history, NULL);
     ok = run_zoom_self_test() && ok;
+    ok = run_width_self_test() && ok;
     ok = run_coordinate_self_test() && ok;
     ok = run_address_bar_self_test() && ok;
     ok = run_redirect_self_test() && ok;

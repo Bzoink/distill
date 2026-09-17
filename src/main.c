@@ -2479,11 +2479,13 @@ static void append_json_links(Engine *engine, JSValueConst links, DBuffer *outpu
     dbuf_puts(output, "</section>");
 }
 
-/* The reader surface is a fixed width, so the type and the column grow
-   together only until the column reaches the surface's edge; past that point
-   the type keeps growing and the column stays put. Every other length in the
-   template is already relative to the body size, so these are the only
-   measurements zoom has to touch. */
+/* The template is laid out at whatever width the surface happens to be -- the
+   desktop shell re-lays it out as its window changes -- so nothing here is
+   computed for one width. The column is a maximum and the side padding the
+   gutter beside it; a surface too narrow for both narrows the column and
+   keeps the gutter, and a wider one centres the pair. Zoom scales them along
+   with the type and the fields; every other length in the template is
+   already relative to the body size. */
 typedef struct {
     int font_size;
     int column;
@@ -2502,35 +2504,26 @@ static int scale_px(int base, int zoom)
     return (int)value;
 }
 
-static ReaderMetrics reader_metrics(int zoom, int width)
+static ReaderMetrics reader_metrics(int zoom)
 {
-    enum { MIN_SIDE_PADDING = 28, MIN_COLUMN = 220 };
     if (zoom < READER_ZOOM_MIN) zoom = READER_ZOOM_MIN;
     if (zoom > READER_ZOOM_MAX) zoom = READER_ZOOM_MAX;
-    if (width < MIN_COLUMN) width = MIN_COLUMN;
-    ReaderMetrics metrics = {
+    return (ReaderMetrics){
         .font_size = scale_px(18, zoom),
         .column = scale_px(612, zoom),
-        .side_padding = scale_px(74, zoom),
+        .side_padding = scale_px(28, zoom),
         .top_padding = scale_px(68, zoom),
         .bottom_padding = scale_px(96, zoom),
         .field_height = scale_px(28, zoom),
         .textarea_height = scale_px(104, zoom),
         .choice_size = scale_px(18, zoom)
     };
-    int room = width - 2 * MIN_SIDE_PADDING;
-    if (room < MIN_COLUMN) room = MIN_COLUMN;
-    if (metrics.column > room) metrics.column = room;
-    int fit = (width - metrics.column) / 2;
-    if (metrics.side_padding > fit) metrics.side_padding = fit;
-    if (metrics.side_padding < 0) metrics.side_padding = 0;
-    return metrics;
 }
 
 static char *reader_template(Engine *engine, const char *json, const char *theme,
-                             bool native_forms, int zoom, int width)
+                             bool native_forms, int zoom)
 {
-    ReaderMetrics metrics = reader_metrics(zoom, width);
+    ReaderMetrics metrics = reader_metrics(zoom);
 
     JSValue parsed = JS_ParseJSON(engine->context, json, strlen(json), "distill-extraction.json");
     if (JS_IsException(parsed)) {
@@ -2654,11 +2647,21 @@ static char *reader_template(Engine *engine, const char *json, const char *theme
     dbuf_puts(&output, muted);
     dbuf_puts(&output,
         "}html,body{margin:0;padding:0;background:var(--page-background);color:var(--page-text);}");
+    /* The measure lives on <body>, which is the one box guaranteed to be a
+       block here: litehtml's master stylesheet has no rule for <main>, which
+       lays out as an inline box, and giving that box the measure instead
+       changes how the margins inside the page collapse. So body is capped at
+       the measure plus its gutters and centred in whatever the surface is,
+       and everything inside it lays out exactly as it did at a fixed width.
+       <html> carries the same background, so the surface stays one colour
+       either side of it. */
     dbuf_printf(&output,
         "body{font-family:\"Source Serif 4\",serif;font-size:%dpx;line-height:1.58;"
+        "max-width:%dpx;margin:0 auto;"
         "padding-top:%dpx;padding-right:%dpx;padding-bottom:%dpx;padding-left:%dpx;}"
         "main{max-width:%dpx;margin:0 auto;background:var(--main-background);}",
-        metrics.font_size, metrics.top_padding, metrics.side_padding,
+        metrics.font_size, metrics.column,
+        metrics.top_padding, metrics.side_padding,
         metrics.bottom_padding, metrics.side_padding, metrics.column);
     dbuf_puts(&output,
         "h1,h2,h3,.eyebrow,.distill-meta,button,input,.button,th{font-family:\"Source Sans 3\",sans-serif;}"
@@ -3224,8 +3227,7 @@ static int run_page(const char *input, uint64_t cap_ms, uint64_t memory_mb,
     } else if (render_path) {
 #ifdef DISTILL_RENDER
         char *json = run_extraction(&engine, serialized);
-        char *template = reader_template(&engine, json, theme, native_forms, zoom,
-                                        render_width);
+        char *template = reader_template(&engine, json, theme, native_forms, zoom);
         bool template_ok = !template_path || write_file_bytes(template_path, template, strlen(template));
         /* Height 0 means "as tall as the content". Measure here rather than
            inside the renderer so the caller is told what it actually got: the
@@ -3253,8 +3255,7 @@ static int run_page(const char *input, uint64_t cap_ms, uint64_t memory_mb,
     } else if (template_path) {
 #ifdef DISTILL_RENDER
         char *json = run_extraction(&engine, serialized);
-        char *template = reader_template(&engine, json, theme, native_forms, zoom,
-                                        render_width);
+        char *template = reader_template(&engine, json, theme, native_forms, zoom);
         if (!*template || !write_file_bytes(template_path, template, strlen(template))) {
             fprintf(stderr, "unable to write reader template %s\n", template_path);
             result = 3;
@@ -3296,8 +3297,8 @@ static void usage(const char *program)
         "  --fetch-media FILE    fetch one image and write its bytes, with no scripts and no\n"
         "                        extraction. The format is taken from the bytes, not the\n"
         "                        served content type, and a non-image is refused.\n");
-    fprintf(stderr, "  --zoom PERCENT        reader type size, 50 to 300, default 100. The column grows with\n"
-        "                        the type until it reaches the surface width.\n");
+    fprintf(stderr, "  --zoom PERCENT        reader type size, 50 to 300, default 100. The column and the\n"
+        "                        gutters scale with it; the surface width caps both.\n");
     fprintf(stderr, "  --session-file FILE   keep cookies across runs, so a login survives the next navigation.\n");
     fprintf(stderr, "                        Created mode 600 and refused if others can read it.\n");
     fprintf(stderr, "  --request-data-file F read the POST body from a file, or from stdin when F is \"-\".\n");
