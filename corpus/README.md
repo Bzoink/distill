@@ -102,10 +102,26 @@ the cluster round-trip and that collecting text leaves link hit-testing alone;
 A load reports itself: `distill --progress` writes one `progress PERCENT PHASE`
 line per step to stdout, and the shell spawns the engine with pipes so those
 records arrive while the run is still going, turning into a spinner and a
-percentage on the status line. `--progress` is refused with `--dump-dom` and
-`--extract`, whose artifact is stdout itself. `--self-test` covers the parse,
-including records split across reads, and checks that every phase the engine
-names has a message of its own.
+percentage on the status line. The same channel carries one `location URL`
+record once the engine knows where the page really came from, which is what
+the address bar shows and what history stores: a redirect means the reader is
+not on the address that was asked for, and reloading the address that merely
+pointed there is a different request. `--progress` is refused with
+`--dump-dom` and `--extract`, whose artifact is stdout itself. `--self-test`
+covers the parse of both records, including ones split across reads, and
+checks that every phase the engine names has a message of its own.
+
+A bare hostname typed in the address bar gets `https://` from the shell, not
+from the reader, and the shell says so by passing `--https-optional`. A host
+that serves no TLS at all -- kp.se is one -- then fails before there is any
+response to read or redirect to follow, and the engine retries that one
+request over http. Only that: an explicit `https://` address, or one that came
+from a link, is an instruction and stands, because stepping it down to
+plaintext would hand the page to anyone able to break the handshake. The
+retry is limited to a connection that never opened, so a certificate the run
+distrusts still fails as one. The default `check.py` mode gates it against the
+corpus server, which speaks http and nothing else and so has exactly that
+shape; `--self-test` gates which inputs count as a guess.
 
 The page width follows the window between 480 and 760 design pixels, both
 scaled by zoom, and the page is centred on the dark desk either side of it.

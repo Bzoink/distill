@@ -183,6 +183,9 @@ typedef struct {
     LoadProgress *progress;
     guint serial;
     bool replace_current;
+    /* The https:// in this URL is the address bar's guess, not the reader's
+       instruction, and the engine may correct it. See resolve_entry_input. */
+    bool https_guessed;
 } LoadRequest;
 
 typedef struct {
@@ -912,10 +915,12 @@ static char *write_private_body(const char *data)
     return path;
 }
 
-/* One "progress PERCENT PHASE" record per line. Anything else the engine puts
-   on this pipe is ignored rather than guessed at. */
+/* One record per line: "progress PERCENT PHASE" while the page is loading, and
+   "location URL" once the engine knows where the page really came from.
+   Anything else the engine puts on this pipe is ignored rather than guessed
+   at. */
 static void consume_progress(GString *pending, const char *bytes, size_t length,
-                             LoadProgress *progress)
+                             LoadProgress *progress, char **location)
 {
     g_string_append_len(pending, bytes, (gssize)length);
     char *start = pending->str;
@@ -926,6 +931,10 @@ static void consume_progress(GString *pending, const char *bytes, size_t length,
         char phase[16] = "";
         if (sscanf(start, "progress %d %15s", &percent, phase) == 2)
             load_progress_set(progress, percent, phase);
+        else if (location && strncmp(start, "location ", 9) == 0 && start[9]) {
+            g_free(*location);
+            *location = g_strdup(start + 9);
+        }
         start = newline + 1;
     }
     g_string_erase(pending, 0, (gssize)(start - pending->str));
@@ -936,7 +945,7 @@ static void consume_progress(GString *pending, const char *bytes, size_t length,
    draining it; as it happens rather than at the end, because a progress
    record that arrives after the page does is no use to anyone. */
 static void read_engine_output(int out_fd, int err_fd, LoadProgress *progress,
-                               GString *diagnostics)
+                               GString *diagnostics, char **location)
 {
     GString *pending = g_string_new(NULL);
     struct pollfd fds[2] = {{out_fd, POLLIN, 0}, {err_fd, POLLIN, 0}};
@@ -951,7 +960,7 @@ static void read_engine_output(int out_fd, int err_fd, LoadProgress *progress,
             char buffer[4096];
             ssize_t got = read(fds[i].fd, buffer, sizeof buffer);
             if (got > 0) {
-                if (i == 0) consume_progress(pending, buffer, (size_t)got, progress);
+                if (i == 0) consume_progress(pending, buffer, (size_t)got, progress, location);
                 else g_string_append_len(diagnostics, buffer, (gssize)got);
                 continue;
             }
@@ -965,7 +974,7 @@ static void read_engine_output(int out_fd, int err_fd, LoadProgress *progress,
 }
 
 static bool run_engine(const LoadRequest *request, const char *template_path,
-                       char **error_message)
+                       char **error_message, char **final_url)
 {
     char *engine = engine_path();
     if (!engine) return false;
@@ -992,6 +1001,7 @@ static bool run_engine(const LoadRequest *request, const char *template_path,
     g_free(zoom);
     add_arg(arguments, "--native-forms");
     add_arg(arguments, "--progress");
+    if (request->https_guessed) add_arg(arguments, "--https-optional");
     if (request->method && *request->method) {
         add_arg(arguments, "--request-method");
         add_arg(arguments, request->method);
@@ -1032,7 +1042,7 @@ static bool run_engine(const LoadRequest *request, const char *template_path,
     int wait_status = 0;
     bool waited = false;
     if (spawned) {
-        read_engine_output(out_fd, err_fd, request->progress, diagnostics);
+        read_engine_output(out_fd, err_fd, request->progress, diagnostics, final_url);
         pid_t reaped;
         while ((reaped = waitpid(child, &wait_status, 0)) < 0 && errno == EINTR) {}
         /* A status only means something if it was actually collected: a child
@@ -1073,8 +1083,21 @@ static void load_worker(GTask *task, gpointer source_object, gpointer task_data,
     if (!result->template_path) {
         result->error = g_strdup("unable to create temporary page files");
     } else {
+        char *final_url = NULL;
         result->ok = run_engine(request, result->template_path,
-                                &result->error);
+                                &result->error, &final_url);
+        /* Record where the page came from, not where the request was aimed.
+           A redirect -- or a scheme the engine had to correct -- means those
+           differ, and reloading or going back to the address that only
+           pointed here would repeat the wrong request. Checked before it is
+           believed: it decides what the address bar shows and what the next
+           navigation resolves against. */
+        if (result->ok && final_url && *final_url && page_uri_allowed(final_url)) {
+            g_free(result->url);
+            result->url = final_url;
+        } else {
+            g_free(final_url);
+        }
     }
     g_task_return_pointer(task, result, (GDestroyNotify)free_load_result);
 }
@@ -1429,7 +1452,8 @@ static bool point_in_box(double x, double y, int box_x, int box_y, int width, in
 static void build_document(App *app, const char *template);
 static void collect_page_media(App *app);
 static void app_navigate(App *app, const char *uri, const char *method,
-                         const char *data, bool replace_current);
+                         const char *data, bool replace_current,
+                         bool https_guessed);
 static void open_link(App *app, const char *uri);
 
 /* Ask the laid-out document, not the collected boxes. Only block-level
@@ -1943,7 +1967,7 @@ static void open_link(App *app, const char *uri)
     if (has_scheme(uri, "mailto") || has_scheme(uri, "tel")) {
         open_external(app, uri);
     } else if (page_uri_allowed(uri)) {
-        app_navigate(app, uri, NULL, NULL, false);
+        app_navigate(app, uri, NULL, NULL, false, false);
     } else {
         open_external(app, uri);
     }
@@ -2428,7 +2452,8 @@ static void form_submit(App *app, const FormControl *submit_control)
     if (strcasecmp(method, "post") == 0) target = g_strdup(action);
     else target = append_query(action, data.data ? data.data : "");
     app_navigate(app, target, strcasecmp(method, "post") == 0 ? "POST" : NULL,
-                 strcasecmp(method, "post") == 0 ? (data.data ? data.data : "") : NULL, false);
+                 strcasecmp(method, "post") == 0 ? (data.data ? data.data : "") : NULL,
+                 false, false);
     g_free(target);
     dbuf_free(&data);
 }
@@ -2596,11 +2621,12 @@ static void load_done(GObject *source_object, GAsyncResult *result, gpointer opa
 }
 
 static void app_begin_load(App *app, const char *uri, const char *method,
-                           const char *data, bool replace_current)
+                           const char *data, bool replace_current,
+                           bool https_guessed)
 {
     char *unwrapped = unwrap_redirect(uri);
     if (unwrapped) {
-        app_begin_load(app, unwrapped, method, data, replace_current);
+        app_begin_load(app, unwrapped, method, data, replace_current, false);
         g_free(unwrapped);
         return;
     }
@@ -2620,6 +2646,7 @@ static void app_begin_load(App *app, const char *uri, const char *method,
     app->progress = load_progress_ref(request->progress);
     request->serial = ++app->load_serial;
     request->replace_current = replace_current;
+    request->https_guessed = https_guessed;
     app->loading = true;
     app_ref(app);
     set_status(app, "Loading…");
@@ -2631,13 +2658,14 @@ static void app_begin_load(App *app, const char *uri, const char *method,
 }
 
 static void app_navigate(App *app, const char *uri, const char *method,
-                         const char *data, bool replace_current)
+                         const char *data, bool replace_current,
+                         bool https_guessed)
 {
     if (app->loading) {
         set_status(app, "A page is still loading");
         return;
     }
-    app_begin_load(app, uri, method, data, replace_current);
+    app_begin_load(app, uri, method, data, replace_current, https_guessed);
 }
 
 /* Does this token name a place, or describe one? The address bar accepts
@@ -2703,9 +2731,12 @@ static bool entry_looks_like_url(const char *text)
     return ok;
 }
 
-/* Turn what was typed into something to fetch. */
-static char *resolve_entry_input(const char *raw)
+/* Turn what was typed into something to fetch. When the scheme is this
+   function's own guess rather than something the reader wrote, it says so:
+   the engine is then allowed to correct it, and only then. */
+static char *resolve_entry_input(const char *raw, bool *https_guessed)
 {
+    if (https_guessed) *https_guessed = false;
     char *text = g_strstrip(g_strdup(raw ? raw : ""));
     if (!*text) { g_free(text); return NULL; }
     if (entry_looks_like_url(text)) {
@@ -2718,6 +2749,7 @@ static char *resolve_entry_input(const char *raw)
            there fails for a reason that has nothing to do with the request. */
         bool loopback = g_ascii_strncasecmp(text, "localhost", 9) == 0 ||
                         g_ascii_strncasecmp(text, "127.0.0.1", 9) == 0;
+        if (https_guessed) *https_guessed = !loopback;
         char *url = g_strconcat(loopback ? "http://" : "https://", text, NULL);
         g_free(text);
         return url;
@@ -2734,12 +2766,13 @@ static char *resolve_entry_input(const char *raw)
 static void url_activate(GtkWidget *widget, gpointer opaque)
 {
     App *app = opaque;
-    char *uri = resolve_entry_input(gtk_entry_get_text(GTK_ENTRY(widget)));
+    bool https_guessed = false;
+    char *uri = resolve_entry_input(gtk_entry_get_text(GTK_ENTRY(widget)), &https_guessed);
     if (!uri) {
         set_status(app, "Type a URL or a search term");
         return;
     }
-    app_navigate(app, uri, NULL, NULL, false);
+    app_navigate(app, uri, NULL, NULL, false, https_guessed);
     g_free(uri);
 }
 
@@ -2787,7 +2820,7 @@ static void theme_changed(GtkCheckMenuItem *item, gpointer opaque)
     update_form_style(app, theme, active_zoom(app));
     const DAppPage *page = d_app_history_current(&app->history);
     if (!page || strcmp(theme, page->theme) == 0) return;
-    app_begin_load(app, page->url, NULL, NULL, true);
+    app_begin_load(app, page->url, NULL, NULL, true, false);
 }
 
 /* Zoom is laid out by the engine, not scaled after the fact, so changing it
@@ -2804,7 +2837,7 @@ static void apply_zoom(App *app, int zoom)
     g_free(message);
     const DAppPage *page = d_app_history_current(&app->history);
     if (!page || page->zoom == zoom) return;
-    app_begin_load(app, page->url, NULL, NULL, true);
+    app_begin_load(app, page->url, NULL, NULL, true, false);
 }
 
 static void zoom_changed(GtkCheckMenuItem *item, gpointer opaque)
@@ -3112,17 +3145,17 @@ static void app_activate(GtkApplication *application, gpointer opaque)
        is what they asked for in general, and only stands in when there is no
        other instruction. */
     if (initial_url && *initial_url) {
-        app_begin_load(app, initial_url, NULL, NULL, false);
+        app_begin_load(app, initial_url, NULL, NULL, false, false);
     } else {
         char *start = start_page_url();
-        if (start) app_begin_load(app, start, NULL, NULL, false);
+        if (start) app_begin_load(app, start, NULL, NULL, false, false);
         g_free(start);
     }
 }
 
 static bool expect_resolved(const char *input, const char *expected)
 {
-    char *got = resolve_entry_input(input);
+    char *got = resolve_entry_input(input, NULL);
     bool ok = (!expected && !got) || (expected && got && strcmp(got, expected) == 0);
     if (!ok) {
         fprintf(stderr, "address bar: %s -> %s, expected %s\n",
@@ -3153,6 +3186,22 @@ static bool run_coordinate_self_test(void)
         fprintf(stderr, "coords: readings must agree at scroll 0\n");
         ok = false;
     }
+    return ok;
+}
+
+/* Which https:// the engine is allowed to step down from. Only the one this
+   function invented for a bare hostname: a scheme the reader wrote, or one
+   that came from a link, is an instruction and stands. */
+static bool expect_guess(const char *input, bool expected)
+{
+    bool guessed = !expected;
+    char *got = resolve_entry_input(input, &guessed);
+    bool ok = guessed == expected;
+    if (!ok) {
+        fprintf(stderr, "address bar: %s -> %s, guessed=%d, expected %d\n",
+                input, got ? got : "(nothing)", (int)guessed, (int)expected);
+    }
+    g_free(got);
     return ok;
 }
 
@@ -3187,7 +3236,18 @@ static bool run_address_bar_self_test(void)
         expect_resolved("192.168.1.10", "https://192.168.1.10") &&
         /* Nothing typed is not a search for nothing. */
         expect_resolved("", NULL) &&
-        expect_resolved("   ", NULL);
+        expect_resolved("   ", NULL) &&
+        /* A bare hostname got its scheme from here, so the engine may correct
+           it when the host turns out to serve no TLS at all. */
+        expect_guess("dn.se", true) &&
+        expect_guess("www.bbc.com/news", true) &&
+        /* Everything else already had one. */
+        expect_guess("https://dn.se", false) &&
+        expect_guess("http://example.com/", false) &&
+        expect_guess("file:///tmp/page.html", false) &&
+        expect_guess("localhost:8080", false) &&
+        expect_guess("kingfisher hunting", false) &&
+        expect_guess("", false);
     g_free(kingfisher); g_free(bare); g_free(punctuated); g_free(version);
     return ok;
 }
@@ -3532,21 +3592,21 @@ static bool run_progress_self_test(void)
     int percent = 0;
     char phase[16];
 
-    consume_progress(pending, "progress 12 fet", strlen("progress 12 fet"), progress);
+    consume_progress(pending, "progress 12 fet", strlen("progress 12 fet"), progress, NULL);
     load_progress_get(progress, &percent, phase, sizeof phase);
     if (percent != 0) {
         fprintf(stderr, "progress: half a record was read as a whole one\n");
         ok = false;
     }
     const char *rest = "ch\nprogress 40 scripts\nprogress 75 ex";
-    consume_progress(pending, rest, strlen(rest), progress);
+    consume_progress(pending, rest, strlen(rest), progress, NULL);
     load_progress_get(progress, &percent, phase, sizeof phase);
     if (percent != 40 || strcmp(phase, "scripts") != 0) {
         fprintf(stderr, "progress: records split across reads did not arrive (%d %s)\n",
                 percent, phase);
         ok = false;
     }
-    consume_progress(pending, "tract\n", strlen("tract\n"), progress);
+    consume_progress(pending, "tract\n", strlen("tract\n"), progress, NULL);
     load_progress_get(progress, &percent, phase, sizeof phase);
     if (percent != 75 || strcmp(phase, "extract") != 0) {
         fprintf(stderr, "progress: the last record did not complete (%d %s)\n",
@@ -3554,12 +3614,43 @@ static bool run_progress_self_test(void)
         ok = false;
     }
     const char *noise = "phase2 scripts=3 cap_hit=false\n";
-    consume_progress(pending, noise, strlen(noise), progress);
+    consume_progress(pending, noise, strlen(noise), progress, NULL);
     load_progress_get(progress, &percent, phase, sizeof phase);
     if (percent != 75 || strcmp(phase, "extract") != 0) {
         fprintf(stderr, "progress: a line that is not a record moved the count\n");
         ok = false;
     }
+    /* The other record on this pipe. It arrives in the middle of the run and
+       decides what the address bar says and where a reload goes, so it has to
+       survive the same splitting the progress records do -- and a line that
+       merely starts with the word must not be mistaken for one. */
+    char *location = NULL;
+    const char *split = "location https://www.exam";
+    consume_progress(pending, split, strlen(split), progress, &location);
+    if (location) {
+        fprintf(stderr, "location: half a record was read as a whole one\n");
+        ok = false;
+    }
+    const char *tail = "ple.com/a\nlocationless\nprogress 85 render\n";
+    consume_progress(pending, tail, strlen(tail), progress, &location);
+    if (!location || strcmp(location, "https://www.example.com/a") != 0) {
+        fprintf(stderr, "location: got %s\n", location ? location : "(nothing)");
+        ok = false;
+    }
+    load_progress_get(progress, &percent, phase, sizeof phase);
+    if (percent != 85) {
+        fprintf(stderr, "location: a location record swallowed the progress after it\n");
+        ok = false;
+    }
+    const char *empty = "location \n";
+    char *before = g_strdup(location);
+    consume_progress(pending, empty, strlen(empty), progress, &location);
+    if (g_strcmp0(before, location) != 0) {
+        fprintf(stderr, "location: an empty record replaced a real one\n");
+        ok = false;
+    }
+    g_free(before);
+    g_free(location);
     g_string_free(pending, TRUE);
     load_progress_unref(progress);
 

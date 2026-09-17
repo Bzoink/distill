@@ -334,6 +334,61 @@ def dump_arm_b(engine, url, cap_ms, timeout_s):
     return r.stdout, None
 
 
+def check_transport(engine, port, cap_ms, timeout_s):
+    """A host that serves no TLS at all.
+
+    This is the shape kp.se has: the address bar guesses https:// for a bare
+    hostname, the handshake never completes, and so there is no response to
+    read and no redirect to follow -- the page is unreachable for the one
+    reason that has nothing to do with the page. The corpus server speaks
+    http and nothing else, which is that shape exactly.
+
+    The guess is the engine's to correct only when it was told the scheme was
+    a guess. Without --https-optional the run must still fail, or an explicit
+    https:// address could be stepped down to plaintext by anyone able to
+    break the handshake.
+    """
+    secure = f"https://127.0.0.1:{port}/09-article.html"
+    plain = f"http://127.0.0.1:{port}/09-article.html"
+    failures = []
+    try:
+        r = subprocess.run([engine, "--url", secure, "--extract",
+                            "--script-cap-ms", str(cap_ms)],
+                           capture_output=True, text=True, timeout=timeout_s)
+        if r.returncode != 2:
+            failures.append(f"https to an http-only host exited {r.returncode}, expected 2")
+    except (subprocess.TimeoutExpired, OSError) as exc:
+        failures.append(f"https to an http-only host: {exc}")
+
+    with tempfile.NamedTemporaryFile(suffix=".html", delete=False) as fh:
+        path = fh.name
+    try:
+        r = subprocess.run([engine, "--url", secure, "--template", path,
+                            "--progress", "--https-optional",
+                            "--script-cap-ms", str(cap_ms)],
+                           capture_output=True, text=True, timeout=timeout_s)
+        if r.returncode != 0:
+            failures.append(f"--https-optional exited {r.returncode}, expected 0: "
+                            f"{r.stderr.strip()[:200]}")
+        else:
+            with open(path, encoding="utf-8") as fh:
+                template = fh.read()
+            if "A careful reader" not in template:
+                failures.append("the fallback loaded something other than the page")
+            # The shell puts this in the address bar and in history; a reload
+            # of the address that only pointed here is a different request.
+            if f"location {plain}" not in r.stdout:
+                failures.append("the run did not report where the page came from")
+    except (subprocess.TimeoutExpired, OSError) as exc:
+        failures.append(f"--https-optional: {exc}")
+    finally:
+        try:
+            os.unlink(path)
+        except OSError:
+            pass
+    return failures
+
+
 def json_path(value, path):
     """Read a small dotted JSON path, with optional numeric array indexes."""
     current = value
@@ -704,6 +759,20 @@ def main():
                     continue
                 print(f"  {name}  {extraction['shape']['kind']} / {extraction['extractor']}"
                       f"  {DIM}{time.time() - t0:.1f}s{RESET}")
+
+        if not (args.baseline or args.extract or args.render or args.viewer
+                or args.bundles) and args.arm == "a":
+            problems = check_transport(engine, port,
+                                       manifest.get("settle_cap_ms", 5000), args.timeout)
+            label = "transport  Scheme fallback"
+            if problems:
+                total_failed += len(problems)
+                gates_failed.append("transport")
+                print(f"  {label}  {RED}fail{RESET}")
+                for problem in problems:
+                    print(f"    {RED}{problem}{RESET}")
+            else:
+                print(f"  {label}  {GREEN}pass{RESET}\n")
 
         if args.live:
             print(f"{DIM}--- live rungs: recorded, never gates ---{RESET}")

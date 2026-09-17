@@ -194,6 +194,18 @@ static void report_progress(Engine *engine, int percent, const char *phase)
     fflush(stdout);
 }
 
+/* Where the page actually came from. A redirect -- or a scheme this run had
+   to correct -- leaves the reader somewhere other than the address that was
+   asked for, and the shell needs the real one: reloading the address that
+   merely pointed here is not the same request. */
+static void report_location(Engine *engine)
+{
+    if (!engine || !engine->progress || !engine->source_url) return;
+    if (strchr(engine->source_url, '\n')) return;
+    printf("location %s\n", engine->source_url);
+    fflush(stdout);
+}
+
 static char *js_string(JSContext *ctx, JSValueConst value)
 {
     size_t length = 0;
@@ -712,9 +724,25 @@ static int curl_transfer_progress(void *opaque, curl_off_t download_total,
     return 0;
 }
 
+/* A connection that was never established. The server said nothing about the
+   page because it never spoke at all, which is a different failure from one
+   it answered with. */
+static bool transport_never_opened(CURLcode result)
+{
+    switch (result) {
+    case CURLE_COULDNT_CONNECT:
+    case CURLE_SSL_CONNECT_ERROR:
+    case CURLE_GOT_NOTHING:
+        return true;
+    default:
+        return false;
+    }
+}
+
 static bool fetch_sync_request(Engine *engine, const char *url, DBuffer *body,
                                long *status, char **effective_url,
-                               const char *request_method, const char *request_data)
+                               const char *request_method, const char *request_data,
+                               CURLcode *transport)
 {
     dbuf_init(body);
     char *path = file_from_url(url);
@@ -771,13 +799,14 @@ static bool fetch_sync_request(Engine *engine, const char *url, DBuffer *body,
     curl_slist_free_all(headers);
     curl_easy_cleanup(easy);
     if (status) *status = code;
+    if (transport) *transport = result;
     return result == CURLE_OK;
 }
 
 static bool fetch_sync(Engine *engine, const char *url, DBuffer *body,
                        long *status, char **effective_url)
 {
-    return fetch_sync_request(engine, url, body, status, effective_url, NULL, NULL);
+    return fetch_sync_request(engine, url, body, status, effective_url, NULL, NULL, NULL);
 }
 
 static void request_vec_push(RequestVec *vec, Request *request)
@@ -3136,7 +3165,7 @@ static int run_page(const char *input, uint64_t cap_ms, uint64_t memory_mb,
                     const char *theme, bool native_forms, int zoom,
                     const char *request_method,
                     const char *request_data, const char *session_file,
-                    bool progress)
+                    bool progress, bool https_optional)
 {
     Engine engine = {0};
 #ifdef DISTILL_RENDER
@@ -3165,9 +3194,34 @@ static int run_page(const char *input, uint64_t cap_ms, uint64_t memory_mb,
     DBuffer html;
     long status = 0;
     char *effective_url = NULL;
+    CURLcode transport = CURLE_OK;
     report_progress(&engine, PROGRESS_FETCH_START, "fetch");
-    if (!fetch_sync_request(&engine, engine.source_url, &html, &status, &effective_url,
-                            request_method, request_data)) {
+    bool loaded = fetch_sync_request(&engine, engine.source_url, &html, &status,
+                                     &effective_url, request_method, request_data,
+                                     &transport);
+    /* The shell guesses https:// for a bare hostname typed in the address bar,
+       the way a browser does, and says so by passing --https-optional. A host
+       with no TLS service at all never opens the connection, so there is no
+       response to read and no redirect to follow: the only thing wrong is the
+       scheme nobody chose deliberately. Try the other one, once.
+
+       Only when the connection never opened. A certificate this run distrusts
+       means a server that does have TLS, and stepping down to plaintext there
+       would be taking an attacker's advice. */
+    if (!loaded && https_optional && transport_never_opened(transport) &&
+        d_starts(engine.source_url, "https://")) {
+        char *plain = d_cat2("http://", engine.source_url + strlen("https://"));
+        dbuf_free(&html);
+        free(effective_url);
+        effective_url = NULL;
+        free(engine.source_url);
+        engine.source_url = plain;
+        free(engine.base_url);
+        engine.base_url = d_strdup(engine.source_url);
+        loaded = fetch_sync_request(&engine, engine.source_url, &html, &status,
+                                    &effective_url, request_method, request_data, NULL);
+    }
+    if (!loaded) {
         fprintf(stderr, "unable to load %s (status %ld)\n", engine.source_url, status);
         dbuf_free(&html);
         engine_cleanup(&engine);
@@ -3180,6 +3234,7 @@ static int run_page(const char *input, uint64_t cap_ms, uint64_t memory_mb,
     if (effective_url && *effective_url) { free(engine.source_url); engine.source_url = effective_url; }
     else free(effective_url);
     free(engine.base_url); engine.base_url = d_strdup(engine.source_url);
+    report_location(&engine);
 #ifdef DISTILL_RENDER
     /* One request and nothing else: no runtime, no scripts, no extraction.
        The shell has no network of its own -- only the engine links libcurl --
@@ -3364,7 +3419,7 @@ static int run_page(const char *input, uint64_t cap_ms, uint64_t memory_mb,
 
 static void usage(const char *program)
 {
-    fprintf(stderr, "usage: %s --url URL [--dump-dom|--extract|--render FILE|--template FILE|--viewer FILE|--fetch-media FILE] [--media-index N] [--save-media FILE] [--width N] [--height N|0] [--font-dir DIR] [--theme warm|night|paper] [--zoom PERCENT] [--native-forms] [--progress] [--request-method GET|POST] [--request-data DATA|--request-data-file FILE|-] [--session-file FILE] [--script-cap-ms N] [--memory-limit-mb N] [--max-scripts N]\n", program);
+    fprintf(stderr, "usage: %s --url URL [--dump-dom|--extract|--render FILE|--template FILE|--viewer FILE|--fetch-media FILE] [--media-index N] [--save-media FILE] [--width N] [--height N|0] [--font-dir DIR] [--theme warm|night|paper] [--zoom PERCENT] [--native-forms] [--progress] [--https-optional] [--request-method GET|POST] [--request-data DATA|--request-data-file FILE|-] [--session-file FILE] [--script-cap-ms N] [--memory-limit-mb N] [--max-scripts N]\n", program);
     fprintf(stderr, "  --height 0            size the render to the content instead of cropping it.\n"
         "  --fetch-media FILE    fetch one image and write its bytes, with no scripts and no\n"
         "                        extraction. The format is taken from the bytes, not the\n"
@@ -3427,6 +3482,7 @@ int main(int argc, char **argv)
     int zoom = 100;
     int media_index = 0;
     bool dump_dom = false, extract = false, native_forms = false, progress = false;
+    bool https_optional = false;
     for (int i = 1; i < argc; ++i) {
         if (d_eq(argv[i], "--url") && i + 1 < argc) url = argv[++i];
         else if (d_eq(argv[i], "--dump-dom")) dump_dom = true;
@@ -3444,6 +3500,7 @@ int main(int argc, char **argv)
         else if (d_eq(argv[i], "--zoom") && i + 1 < argc) zoom = (int)strtol(argv[++i], NULL, 10);
         else if (d_eq(argv[i], "--native-forms")) native_forms = true;
         else if (d_eq(argv[i], "--progress")) progress = true;
+        else if (d_eq(argv[i], "--https-optional")) https_optional = true;
         else if (d_eq(argv[i], "--request-method") && i + 1 < argc) request_method = argv[++i];
         else if (d_eq(argv[i], "--request-data") && i + 1 < argc) request_data = argv[++i];
         else if (d_eq(argv[i], "--request-data-file") && i + 1 < argc) request_data_file = argv[++i];
@@ -3480,7 +3537,8 @@ int main(int argc, char **argv)
                           fetch_media_path,
                           render_width, render_height, font_dir, template_path, theme,
                           native_forms, zoom,
-                          request_method, request_data, session_file, progress);
+                          request_method, request_data, session_file, progress,
+                          https_optional);
     curl_global_cleanup();
     /* The body may hold a password; do not leave it in freed-but-readable
        heap longer than necessary. */

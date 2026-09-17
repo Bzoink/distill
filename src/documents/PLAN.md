@@ -3,7 +3,7 @@
 *A small, C23-rooted stack that runs a page's real JavaScript against a real DOM, pulls out what actually matters, and renders it back — clearly, consistently, on our own terms.*
 
 **Status:** Phase 3 complete — Phase 4 not started
-**Drafted:** 2026-09-14 · **Revised:** 2026-09-15 (Phase 3 implementation)
+**Drafted:** 2026-09-14 · **Revised:** 2026-09-17 (Phase 3 implementation)
 **Origin:** NetSurf JS/rendering gap analysis (see `../netsurf`)
 **Rendered version:** https://claude.ai/code/artifact/fcbd8e5f-f6dc-4abd-a2a4-e7282070cf4a *(predates this revision)*
 
@@ -427,8 +427,16 @@ out of scope, and RTL pages still copy correct text. The browser opens on a
 welcome page that ships with it (`share/welcome.html`), read through the same
 pipeline as anything else rather than drawn specially; Settings chooses what it
 opens with instead -- the current page, the welcome page, or nothing -- and a
-URL on the command line still wins over the setting. A reading-list toggle
-keeps URLs for the session. `distill-app-state` and `distill-litehtml-geometry` CTest
+URL on the command line still wins over the setting. The address bar shows
+where the page came from rather than where the request was aimed: the engine
+reports its final URL on the same channel as its progress, and that is what
+history stores, so back and reload repeat the request that worked. The
+`https://` the shell puts in front of a bare hostname is its own guess and is
+marked as one (`--https-optional`); a host that serves no TLS at all fails
+before any redirect can be seen, and the engine retries that request over
+http. An address the reader wrote, or one that came from a link, is never
+stepped down, and neither is a connection that opened with a certificate the
+run distrusts. A reading-list toggle keeps URLs for the session. `distill-app-state` and `distill-litehtml-geometry` CTest
 contracts cover history truncation/replacement and native-control geometry,
 while `corpus/check.py --app` covers the display-free shell model. Phase 4 can
 now widen the interaction and binding surface from evidence.
