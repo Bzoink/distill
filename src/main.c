@@ -2731,13 +2731,12 @@ static char *reader_template(Engine *engine, const char *json, const char *theme
         metrics.top_padding, metrics.side_padding,
         metrics.bottom_padding, metrics.side_padding, metrics.column);
     dbuf_puts(&output,
-        "h1,h2,h3,.eyebrow,.distill-meta,button,input,.button,th{font-family:\"Source Sans 3\",sans-serif;}"
+        "h1,h2,h3,.eyebrow,button,input,.button,th{font-family:\"Source Sans 3\",sans-serif;}"
         "h1{font-size:2.35em;line-height:1.08;letter-spacing:-.025em;margin:0 0 1.1em;color:var(--heading-text);}"
         "h2{font-size:1.45em;line-height:1.2;margin:1.7em 0 .55em;color:var(--heading-text);}"
         "h3{font-size:1.15em;line-height:1.25;margin:1.35em 0 .45em;color:var(--heading-text);}"
         ".link-index h2,.link-index h3{font-size:1em;line-height:1.35;margin:0 0 .55em;font-weight:600;}"
         ".link-index p,.link-index ul,.link-index ol{line-height:1.35;margin:0 0 .55em;}"
-        ".link-index .distill-meta{margin-bottom:1.1em;}"
         "p,ul,ol,pre,blockquote{margin:0 0 1.05em;}"
         "a{color:var(--link);}pre,code{font-family:\"Source Code Pro\",monospace;}pre{padding:1em;overflow:hidden;white-space:pre-wrap;overflow-wrap:anywhere;background:var(--pre-background);border-radius:4px;font-size:.86em;line-height:1.45;}"
         "blockquote{margin-left:1.2em;padding-left:1em;border-left:3px solid var(--border);color:var(--muted);}"
@@ -2767,7 +2766,6 @@ static char *reader_template(Engine *engine, const char *json, const char *theme
         ".section-anchor{display:block;width:1px;height:1px;overflow:hidden;}"
         ".media-item{margin:0 0 .75em;}"
         ".reader-list-item{padding-left:1em;}"
-        ".distill-meta{font-size:.8em;color:var(--muted);margin-bottom:2.6em;}"
         /* The promoted item keeps article spacing even when the page around it
            is a dense index, because it is being read, not scanned. */
         ".main-content{margin:0 0 1em;}"
@@ -2806,7 +2804,7 @@ static char *reader_template(Engine *engine, const char *json, const char *theme
     dbuf_puts(&output, "><h1>");
     const char *heading = *main_heading ? main_heading : (*title ? title : "Untitled page");
     append_html_escaped(&output, heading);
-    dbuf_puts(&output, "</h1><p class=\"distill-meta\">Rendered by Distill</p>");
+    dbuf_puts(&output, "</h1>");
     if (main_found) {
         dbuf_puts(&output, "<section class=\"main-content\">");
         append_json_blocks(engine, main_blocks, &output, false);
