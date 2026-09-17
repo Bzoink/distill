@@ -8,6 +8,10 @@ typedef struct {
     char *url;
     char *template_path;
     char *theme;
+    /* The zoom the template was laid out at. A history entry replays a file
+       that was written at one size, so the setting travels with the page
+       rather than with the window. */
+    int zoom;
 } DAppPage;
 
 typedef struct {
@@ -23,10 +27,11 @@ void d_app_history_init(DAppHistory *history);
 void d_app_history_clear(DAppHistory *history, DAppPageDisposer disposer);
 bool d_app_history_push(DAppHistory *history, const char *url,
                         const char *template_path,
-                        const char *theme, DAppPageDisposer disposer);
+                        const char *theme, int zoom, DAppPageDisposer disposer);
 bool d_app_history_replace_current(DAppHistory *history, const char *url,
                                    const char *template_path,
-                                   const char *theme, DAppPageDisposer disposer);
+                                   const char *theme, int zoom,
+                                   DAppPageDisposer disposer);
 bool d_app_history_back(DAppHistory *history);
 bool d_app_history_forward(DAppHistory *history);
 bool d_app_history_can_back(const DAppHistory *history);

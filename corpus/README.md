@@ -68,7 +68,13 @@ open a page in the GTK reader, or run `./check.py --app` for the display-free
 history/form-geometry/address-bar shell gate. The window provides an address bar, cached
 back/forward history, a Cairo reader surface, native GTK form controls placed
 from litehtml geometry, simple GET/POST submission, URI-validated external
-hand-off, three reader themes, and a reading-list toggle.
+hand-off, three reader themes, eight zoom levels, and a reading-list toggle.
+
+Zoom is a layout setting, not a scale applied to the finished surface: the
+shell passes `--zoom` to the engine and the page is laid out again at the new
+size. Ctrl+plus and Ctrl+minus step through the levels the menu offers and
+Ctrl+0 returns to 100%; `--self-test` covers the stepping and the fallback for
+a saved level the menu no longer has.
 
 The address bar takes either a URL or a search. The rule is the one browsers
 converged on, because users have already learned it: a scheme, a path, or a

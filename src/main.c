@@ -17,6 +17,11 @@
 #define DISTILL_SOURCE_DIR "."
 #endif
 
+/* Reader zoom, as a percentage of the design size. The bounds are part of the
+   command line, so they are defined outside the renderer's build. */
+#define READER_ZOOM_MIN 50
+#define READER_ZOOM_MAX 300
+
 typedef struct Engine Engine;
 
 typedef enum {
@@ -2474,9 +2479,59 @@ static void append_json_links(Engine *engine, JSValueConst links, DBuffer *outpu
     dbuf_puts(output, "</section>");
 }
 
-static char *reader_template(Engine *engine, const char *json, const char *theme,
-                             bool native_forms)
+/* The reader surface is a fixed width, so the type and the column grow
+   together only until the column reaches the surface's edge; past that point
+   the type keeps growing and the column stays put. Every other length in the
+   template is already relative to the body size, so these are the only
+   measurements zoom has to touch. */
+typedef struct {
+    int font_size;
+    int column;
+    int side_padding;
+    int top_padding;
+    int bottom_padding;
+    int field_height;
+    int textarea_height;
+    int choice_size;
+} ReaderMetrics;
+
+static int scale_px(int base, int zoom)
 {
+    long value = ((long)base * zoom + 50) / 100;
+    if (value < 1) value = 1;
+    return (int)value;
+}
+
+static ReaderMetrics reader_metrics(int zoom, int width)
+{
+    enum { MIN_SIDE_PADDING = 28, MIN_COLUMN = 220 };
+    if (zoom < READER_ZOOM_MIN) zoom = READER_ZOOM_MIN;
+    if (zoom > READER_ZOOM_MAX) zoom = READER_ZOOM_MAX;
+    if (width < MIN_COLUMN) width = MIN_COLUMN;
+    ReaderMetrics metrics = {
+        .font_size = scale_px(18, zoom),
+        .column = scale_px(612, zoom),
+        .side_padding = scale_px(74, zoom),
+        .top_padding = scale_px(68, zoom),
+        .bottom_padding = scale_px(96, zoom),
+        .field_height = scale_px(28, zoom),
+        .textarea_height = scale_px(104, zoom),
+        .choice_size = scale_px(18, zoom)
+    };
+    int room = width - 2 * MIN_SIDE_PADDING;
+    if (room < MIN_COLUMN) room = MIN_COLUMN;
+    if (metrics.column > room) metrics.column = room;
+    int fit = (width - metrics.column) / 2;
+    if (metrics.side_padding > fit) metrics.side_padding = fit;
+    if (metrics.side_padding < 0) metrics.side_padding = 0;
+    return metrics;
+}
+
+static char *reader_template(Engine *engine, const char *json, const char *theme,
+                             bool native_forms, int zoom, int width)
+{
+    ReaderMetrics metrics = reader_metrics(zoom, width);
+
     JSValue parsed = JS_ParseJSON(engine->context, json, strlen(json), "distill-extraction.json");
     if (JS_IsException(parsed)) {
         note_exception(engine, "reader template JSON");
@@ -2598,9 +2653,14 @@ static char *reader_template(Engine *engine, const char *json, const char *theme
     dbuf_puts(&output, ";--muted:");
     dbuf_puts(&output, muted);
     dbuf_puts(&output,
-        "}html,body{margin:0;padding:0;background:var(--page-background);color:var(--page-text);}"
-        "body{font-family:\"Source Serif 4\",serif;font-size:18px;line-height:1.58;padding-top:68px;padding-right:74px;padding-bottom:96px;padding-left:74px;}"
-        "main{max-width:612px;margin:0 auto;background:var(--main-background);}"
+        "}html,body{margin:0;padding:0;background:var(--page-background);color:var(--page-text);}");
+    dbuf_printf(&output,
+        "body{font-family:\"Source Serif 4\",serif;font-size:%dpx;line-height:1.58;"
+        "padding-top:%dpx;padding-right:%dpx;padding-bottom:%dpx;padding-left:%dpx;}"
+        "main{max-width:%dpx;margin:0 auto;background:var(--main-background);}",
+        metrics.font_size, metrics.top_padding, metrics.side_padding,
+        metrics.bottom_padding, metrics.side_padding, metrics.column);
+    dbuf_puts(&output,
         "h1,h2,h3,.eyebrow,.distill-meta,button,input,.button,th{font-family:\"Source Sans 3\",sans-serif;}"
         "h1{font-size:2.35em;line-height:1.08;letter-spacing:-.025em;margin:0 0 1.1em;color:var(--heading-text);}"
         "h2{font-size:1.45em;line-height:1.2;margin:1.7em 0 .55em;color:var(--heading-text);}"
@@ -2616,12 +2676,19 @@ static char *reader_template(Engine *engine, const char *json, const char *theme
         ".table-card,.form-card,.video-card,.media-gallery,.result-list{margin:2em 0;padding:1.2em;background:var(--card-background);border:1px solid var(--border);border-radius:5px;}"
         ".result-card{padding:.7em 0;border-bottom:1px solid var(--border);}.result-card h3{margin:0 0 .3em;}"
         ".form-card form{margin:0;background:transparent;text-align:left;}"
-        ".form-field-label{display:block;margin:.7em 0 0;color:var(--page-text);text-align:left;}"
-        ".form-field-input{display:block;width:100%;height:28px;box-sizing:border-box;margin:3px 0 0;padding:.55em;border:1px solid var(--border);border-radius:3px;background:var(--main-background);color:var(--page-text);text-align:left;}"
-        ".form-field-textarea{display:block;width:100%;height:104px;box-sizing:border-box;margin:3px 0 0;padding:.55em;border:1px solid var(--border);border-radius:3px;background:var(--main-background);color:var(--page-text);font:inherit;text-align:left;resize:none;}"
-        ".form-field-select{display:block;width:100%;height:28px;box-sizing:border-box;margin:3px 0 0;padding:0 .35em;border:1px solid var(--border);border-radius:3px;background:var(--main-background);color:var(--page-text);font:inherit;text-align:left;}"
+        ".form-field-label{display:block;margin:.7em 0 0;color:var(--page-text);text-align:left;}");
+    /* A native control is placed on the geometry litehtml reports for the
+       field it replaces, so a field that does not grow with the type leaves
+       the reader with page-sized text in thumbnail-sized boxes. */
+    dbuf_printf(&output,
+        ".form-field-input{display:block;width:100%%;height:%dpx;box-sizing:border-box;margin:3px 0 0;padding:.55em;border:1px solid var(--border);border-radius:3px;background:var(--main-background);color:var(--page-text);text-align:left;}"
+        ".form-field-textarea{display:block;width:100%%;height:%dpx;box-sizing:border-box;margin:3px 0 0;padding:.55em;border:1px solid var(--border);border-radius:3px;background:var(--main-background);color:var(--page-text);font:inherit;text-align:left;resize:none;}"
+        ".form-field-select{display:block;width:100%%;height:%dpx;box-sizing:border-box;margin:3px 0 0;padding:0 .35em;border:1px solid var(--border);border-radius:3px;background:var(--main-background);color:var(--page-text);font:inherit;text-align:left;}"
         ".form-choice{display:block;margin:.55em 0 0;color:var(--page-text);text-align:left;}"
-        ".form-choice-input{display:inline-block;width:18px;height:18px;box-sizing:border-box;margin:0 .45em 0 0;padding:0;vertical-align:middle;}"
+        ".form-choice-input{display:inline-block;width:%dpx;height:%dpx;box-sizing:border-box;margin:0 .45em 0 0;padding:0;vertical-align:middle;}",
+        metrics.field_height, metrics.textarea_height, metrics.field_height,
+        metrics.choice_size, metrics.choice_size);
+    dbuf_puts(&output,
         ".form-choice span{vertical-align:middle;}"
         ".form-card form>button{margin:.7em .45em 0 0;text-align:left;}"
         "button,.button{display:inline-block;padding:.55em .85em;border:0;border-radius:3px;background:var(--link);color:white;text-decoration:none;font:inherit;}"
@@ -2998,7 +3065,8 @@ static int run_page(const char *input, uint64_t cap_ms, uint64_t memory_mb,
                     const char *save_media_path, const char *fetch_media_path,
                     int render_width, int render_height,
                     const char *font_dir, const char *template_path,
-                    const char *theme, bool native_forms, const char *request_method,
+                    const char *theme, bool native_forms, int zoom,
+                    const char *request_method,
                     const char *request_data, const char *session_file)
 {
     Engine engine = {0};
@@ -3156,7 +3224,8 @@ static int run_page(const char *input, uint64_t cap_ms, uint64_t memory_mb,
     } else if (render_path) {
 #ifdef DISTILL_RENDER
         char *json = run_extraction(&engine, serialized);
-        char *template = reader_template(&engine, json, theme, native_forms);
+        char *template = reader_template(&engine, json, theme, native_forms, zoom,
+                                        render_width);
         bool template_ok = !template_path || write_file_bytes(template_path, template, strlen(template));
         /* Height 0 means "as tall as the content". Measure here rather than
            inside the renderer so the caller is told what it actually got: the
@@ -3184,7 +3253,8 @@ static int run_page(const char *input, uint64_t cap_ms, uint64_t memory_mb,
     } else if (template_path) {
 #ifdef DISTILL_RENDER
         char *json = run_extraction(&engine, serialized);
-        char *template = reader_template(&engine, json, theme, native_forms);
+        char *template = reader_template(&engine, json, theme, native_forms, zoom,
+                                        render_width);
         if (!*template || !write_file_bytes(template_path, template, strlen(template))) {
             fprintf(stderr, "unable to write reader template %s\n", template_path);
             result = 3;
@@ -3192,7 +3262,7 @@ static int run_page(const char *input, uint64_t cap_ms, uint64_t memory_mb,
         free(template);
         free(json);
 #else
-        (void)theme;
+        (void)theme; (void)zoom;
         fprintf(stderr, "this build has no litehtml renderer\n");
         result = 2;
 #endif
@@ -3221,11 +3291,13 @@ static int run_page(const char *input, uint64_t cap_ms, uint64_t memory_mb,
 
 static void usage(const char *program)
 {
-    fprintf(stderr, "usage: %s --url URL [--dump-dom|--extract|--render FILE|--template FILE|--viewer FILE|--fetch-media FILE] [--media-index N] [--save-media FILE] [--width N] [--height N|0] [--font-dir DIR] [--theme warm|night|paper] [--native-forms] [--request-method GET|POST] [--request-data DATA|--request-data-file FILE|-] [--session-file FILE] [--script-cap-ms N] [--memory-limit-mb N] [--max-scripts N]\n", program);
+    fprintf(stderr, "usage: %s --url URL [--dump-dom|--extract|--render FILE|--template FILE|--viewer FILE|--fetch-media FILE] [--media-index N] [--save-media FILE] [--width N] [--height N|0] [--font-dir DIR] [--theme warm|night|paper] [--zoom PERCENT] [--native-forms] [--request-method GET|POST] [--request-data DATA|--request-data-file FILE|-] [--session-file FILE] [--script-cap-ms N] [--memory-limit-mb N] [--max-scripts N]\n", program);
     fprintf(stderr, "  --height 0            size the render to the content instead of cropping it.\n"
         "  --fetch-media FILE    fetch one image and write its bytes, with no scripts and no\n"
         "                        extraction. The format is taken from the bytes, not the\n"
         "                        served content type, and a non-image is refused.\n");
+    fprintf(stderr, "  --zoom PERCENT        reader type size, 50 to 300, default 100. The column grows with\n"
+        "                        the type until it reaches the surface width.\n");
     fprintf(stderr, "  --session-file FILE   keep cookies across runs, so a login survives the next navigation.\n");
     fprintf(stderr, "                        Created mode 600 and refused if others can read it.\n");
     fprintf(stderr, "  --request-data-file F read the POST body from a file, or from stdin when F is \"-\".\n");
@@ -3274,6 +3346,7 @@ int main(int argc, char **argv)
     char *owned_request_data = NULL;
     uint64_t cap_ms = 5000, memory_mb = 128, max_scripts = 1000;
     int render_width = 760, render_height = 1100;
+    int zoom = 100;
     int media_index = 0;
     bool dump_dom = false, extract = false, native_forms = false;
     for (int i = 1; i < argc; ++i) {
@@ -3290,6 +3363,7 @@ int main(int argc, char **argv)
         else if (d_eq(argv[i], "--height") && i + 1 < argc) render_height = (int)strtol(argv[++i], NULL, 10);
         else if (d_eq(argv[i], "--font-dir") && i + 1 < argc) font_dir = argv[++i];
         else if (d_eq(argv[i], "--theme") && i + 1 < argc) theme = argv[++i];
+        else if (d_eq(argv[i], "--zoom") && i + 1 < argc) zoom = (int)strtol(argv[++i], NULL, 10);
         else if (d_eq(argv[i], "--native-forms")) native_forms = true;
         else if (d_eq(argv[i], "--request-method") && i + 1 < argc) request_method = argv[++i];
         else if (d_eq(argv[i], "--request-data") && i + 1 < argc) request_data = argv[++i];
@@ -3310,6 +3384,7 @@ int main(int argc, char **argv)
         (save_media_path && !viewer_path) || media_index < 0 ||
         (fetch_media_path && (dump_dom || extract || render_path || template_path || viewer_path)) ||
         render_width <= 0 || render_height < 0 ||
+        zoom < READER_ZOOM_MIN || zoom > READER_ZOOM_MAX ||
         ((request_data || request_data_file) && (!request_method || !d_ieq(request_method, "post"))) ||
         (request_method && !d_ieq(request_method, "get") && !d_ieq(request_method, "post"))) {
         usage(argv[0]); return 2;
@@ -3324,7 +3399,7 @@ int main(int argc, char **argv)
                           render_path, viewer_path, media_index, save_media_path,
                           fetch_media_path,
                           render_width, render_height, font_dir, template_path, theme,
-                          native_forms,
+                          native_forms, zoom,
                           request_method, request_data, session_file);
     curl_global_cleanup();
     /* The body may hold a password; do not leave it in freed-but-readable

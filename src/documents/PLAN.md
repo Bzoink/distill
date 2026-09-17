@@ -403,8 +403,10 @@ back/forward history, and a URI-validated `xdg-open` hand-off. The shell asks
 the litehtml C++ boundary for form and link box geometry, overlays native GTK
 entries/buttons on the rendered reader, and dispatches simple GET forms and
 URL-encoded POST forms back through the engine. Warm, night, and paper themes
-are selectable through the reader template; a reading-list toggle keeps URLs
-for the session. `distill-app-state` and `distill-litehtml-geometry` CTest
+are selectable through the reader template, as are eight zoom levels from 75%
+to 200% (`--zoom`, Ctrl+plus/minus/0), laid out by the engine rather than
+scaled after the fact so the type stays sharp and the native controls keep
+their geometry; a reading-list toggle keeps URLs for the session. `distill-app-state` and `distill-litehtml-geometry` CTest
 contracts cover history truncation/replacement and native-control geometry,
 while `corpus/check.py --app` covers the display-free shell model. Phase 4 can
 now widen the interaction and binding surface from evidence.

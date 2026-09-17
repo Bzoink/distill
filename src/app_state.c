@@ -15,12 +15,13 @@ static void page_free(DAppPage *page, DAppPageDisposer disposer)
 }
 
 static DAppPage page_copy(const char *url, const char *template_path,
-                          const char *theme)
+                          const char *theme, int zoom)
 {
     return (DAppPage){
         .url = d_strdup(url),
         .template_path = d_strdup(template_path),
-        .theme = d_strdup(theme ? theme : "warm")
+        .theme = d_strdup(theme ? theme : "warm"),
+        .zoom = zoom > 0 ? zoom : 100
     };
 }
 
@@ -48,25 +49,26 @@ static void discard_forward(DAppHistory *history, DAppPageDisposer disposer)
 
 bool d_app_history_push(DAppHistory *history, const char *url,
                         const char *template_path,
-                        const char *theme, DAppPageDisposer disposer)
+                        const char *theme, int zoom, DAppPageDisposer disposer)
 {
     if (!history || !url || !*url) return false;
     if (history->current != SIZE_MAX) discard_forward(history, disposer);
     d_vec_reserve((void **)&history->entries, &history->capacity,
                   history->length, sizeof(*history->entries), history->length + 1);
-    history->entries[history->length] = page_copy(url, template_path, theme);
+    history->entries[history->length] = page_copy(url, template_path, theme, zoom);
     history->current = history->length++;
     return true;
 }
 
 bool d_app_history_replace_current(DAppHistory *history, const char *url,
                                    const char *template_path,
-                                   const char *theme, DAppPageDisposer disposer)
+                                   const char *theme, int zoom,
+                                   DAppPageDisposer disposer)
 {
     if (!history || history->current == SIZE_MAX || history->current >= history->length)
         return false;
     page_free(&history->entries[history->current], disposer);
-    history->entries[history->current] = page_copy(url, template_path, theme);
+    history->entries[history->current] = page_copy(url, template_path, theme, zoom);
     return true;
 }
 

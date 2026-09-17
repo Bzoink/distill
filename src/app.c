@@ -42,6 +42,36 @@ enum {
     DISPLAY_URL_BUDGET = 58
 };
 
+/* The zoom levels the menu offers. Steps a reader would choose, not a
+   continuous scale: each one is a visible change from its neighbour, and the
+   ends are where the fixed-width column stops being worth reading. */
+static const int zoom_levels[] = {75, 90, 100, 110, 125, 150, 175, 200};
+enum { ZOOM_LEVEL_COUNT = (int)(sizeof(zoom_levels) / sizeof(zoom_levels[0])) };
+#define ZOOM_DEFAULT 100
+
+static int zoom_level_index(int zoom)
+{
+    for (int i = 0; i < ZOOM_LEVEL_COUNT; ++i) {
+        if (zoom_levels[i] == zoom) return i;
+    }
+    return -1;
+}
+
+static bool valid_zoom(int zoom)
+{
+    return zoom_level_index(zoom) >= 0;
+}
+
+static int zoom_step_level(int zoom, int direction)
+{
+    int index = zoom_level_index(zoom);
+    if (index < 0) index = zoom_level_index(ZOOM_DEFAULT);
+    int next = index + direction;
+    if (next < 0) next = 0;
+    if (next >= ZOOM_LEVEL_COUNT) next = ZOOM_LEVEL_COUNT - 1;
+    return zoom_levels[next];
+}
+
 enum {
     PAGE_SECTION_TOP,
     PAGE_SECTION_IMAGES,
@@ -88,6 +118,7 @@ typedef struct {
     char *method;
     char *data;
     char *theme;
+    int zoom;
     guint serial;
     bool replace_current;
 } LoadRequest;
@@ -96,6 +127,7 @@ typedef struct {
     char *url;
     char *template_path;
     char *theme;
+    int zoom;
     char *error;
     bool ok;
     guint serial;
@@ -112,6 +144,7 @@ struct App {
     GtkWidget *section_items[PAGE_SECTION_COUNT];
     GtkWidget *settings_button;
     GtkWidget *theme_items[3];
+    GtkWidget *zoom_items[ZOOM_LEVEL_COUNT];
     GtkCssProvider *form_css_provider;
     GtkWidget *status;
     GtkWidget *drawing_area;
@@ -143,6 +176,7 @@ struct App {
     bool closing;
     bool loading;
     bool updating_theme;
+    bool updating_zoom;
 };
 
 static void app_ref(App *app)
@@ -197,6 +231,28 @@ static void select_theme_id(App *app, const char *theme)
     app->updating_theme = false;
 }
 
+static int active_zoom(const App *app)
+{
+    if (!app) return ZOOM_DEFAULT;
+    for (int i = 0; i < ZOOM_LEVEL_COUNT; ++i) {
+        if (app->zoom_items[i] &&
+            gtk_check_menu_item_get_active(GTK_CHECK_MENU_ITEM(app->zoom_items[i])))
+            return zoom_levels[i];
+    }
+    return ZOOM_DEFAULT;
+}
+
+static void select_zoom(App *app, int zoom)
+{
+    if (!app) return;
+    int index = zoom_level_index(zoom);
+    if (index < 0) index = zoom_level_index(ZOOM_DEFAULT);
+    if (index < 0 || !app->zoom_items[index]) return;
+    app->updating_zoom = true;
+    gtk_check_menu_item_set_active(GTK_CHECK_MENU_ITEM(app->zoom_items[index]), TRUE);
+    app->updating_zoom = false;
+}
+
 static bool valid_theme_id(const char *theme)
 {
     return theme && (strcmp(theme, "warm") == 0 ||
@@ -204,7 +260,10 @@ static bool valid_theme_id(const char *theme)
                      strcmp(theme, "paper") == 0);
 }
 
-static void update_form_theme(App *app, const char *theme)
+/* Native controls are the one part of the reader GTK draws, so the zoom the
+   template was laid out at has to be told to them separately or a zoomed page
+   shows large type inside default-sized fields. */
+static void update_form_style(App *app, const char *theme, int zoom)
 {
     if (!app || !app->window) return;
     if (!app->form_css_provider) {
@@ -243,7 +302,14 @@ static void update_form_theme(App *app, const char *theme)
         button_hover = "#936b4f";
     }
 
+    if (!valid_zoom(zoom)) zoom = ZOOM_DEFAULT;
+
+    /* A percentage rather than a pixel size: the control's text is scaled
+       from whatever the desktop's font is, so zoom moves it without
+       overriding a font size the user chose outside this window. */
     char *css = g_strdup_printf(
+        ".distill-form-entry,.distill-form-textarea,.distill-form-select,"
+        ".distill-form-choice,.distill-form-button{font-size:%d%%;}"
         ".distill-form-entry{color:%s;background-color:%s;background-image:none;"
         "min-height:0;border:1px solid %s;border-radius:3px;padding:2px 6px;}"
         ".distill-form-entry:focus{border-color:%s;}"
@@ -258,6 +324,7 @@ static void update_form_theme(App *app, const char *theme)
         ".distill-form-button{color:%s;background-color:%s;background-image:none;"
         "border:1px solid %s;border-radius:3px;padding:6px 12px;}"
         ".distill-form-button:hover{background-color:%s;}",
+        zoom,
         entry_text, entry_background, border, focus_border,
         entry_text, entry_background, border, entry_text, entry_background, entry_text,
         button_text, button_background, button_border, button_hover);
@@ -275,29 +342,22 @@ static char *browser_settings_path(void)
     return g_build_filename(g_get_user_config_dir(), "distill", "settings.ini", NULL);
 }
 
-static char *load_saved_theme(void)
+/* One file holds every browser preference, so writing one of them loads what
+   is there, changes the one key and writes the file back whole. Building a
+   fresh key file per setting would silently drop the others. */
+static GKeyFile *load_browser_settings(void)
 {
     char *path = browser_settings_path();
     GKeyFile *settings = g_key_file_new();
     GError *error = NULL;
-    char *theme = NULL;
-    if (g_key_file_load_from_file(settings, path, G_KEY_FILE_NONE, &error)) {
-        theme = g_key_file_get_string(settings, "browser", "theme", &error);
-        if (!valid_theme_id(theme)) {
-            g_free(theme);
-            theme = NULL;
-        }
-    }
-    if (error) g_error_free(error);
-    if (!theme) theme = g_strdup("warm");
-    g_key_file_free(settings);
+    if (!g_key_file_load_from_file(settings, path, G_KEY_FILE_NONE, &error) && error)
+        g_error_free(error);
     g_free(path);
-    return theme;
+    return settings;
 }
 
-static void save_theme(const char *theme)
+static void save_browser_settings(GKeyFile *settings)
 {
-    if (!valid_theme_id(theme)) return;
     char *directory = g_build_filename(g_get_user_config_dir(), "distill", NULL);
     if (g_mkdir_with_parents(directory, 0700) != 0) {
         g_warning("settings: unable to create %s: %s", directory, g_strerror(errno));
@@ -305,8 +365,6 @@ static void save_theme(const char *theme)
         return;
     }
     char *path = g_build_filename(directory, "settings.ini", NULL);
-    GKeyFile *settings = g_key_file_new();
-    g_key_file_set_string(settings, "browser", "theme", theme);
     GError *error = NULL;
     gsize length = 0;
     gchar *data = g_key_file_to_data(settings, &length, &error);
@@ -315,9 +373,52 @@ static void save_theme(const char *theme)
                   error ? error->message : "unknown error");
     if (error) g_error_free(error);
     g_free(data);
-    g_key_file_free(settings);
     g_free(path);
     g_free(directory);
+}
+
+static char *load_saved_theme(void)
+{
+    GKeyFile *settings = load_browser_settings();
+    char *theme = g_key_file_get_string(settings, "browser", "theme", NULL);
+    if (!valid_theme_id(theme)) {
+        g_free(theme);
+        theme = g_strdup("warm");
+    }
+    g_key_file_free(settings);
+    return theme;
+}
+
+static int load_saved_zoom(void)
+{
+    GKeyFile *settings = load_browser_settings();
+    GError *error = NULL;
+    int zoom = (int)g_key_file_get_integer(settings, "browser", "zoom", &error);
+    if (error) {
+        g_error_free(error);
+        zoom = ZOOM_DEFAULT;
+    }
+    if (!valid_zoom(zoom)) zoom = ZOOM_DEFAULT;
+    g_key_file_free(settings);
+    return zoom;
+}
+
+static void save_theme(const char *theme)
+{
+    if (!valid_theme_id(theme)) return;
+    GKeyFile *settings = load_browser_settings();
+    g_key_file_set_string(settings, "browser", "theme", theme);
+    save_browser_settings(settings);
+    g_key_file_free(settings);
+}
+
+static void save_zoom(int zoom)
+{
+    if (!valid_zoom(zoom)) return;
+    GKeyFile *settings = load_browser_settings();
+    g_key_file_set_integer(settings, "browser", "zoom", zoom);
+    save_browser_settings(settings);
+    g_key_file_free(settings);
 }
 
 /* Rebuilding the litehtml document resets the adjustment while GTK lays out
@@ -559,6 +660,10 @@ static bool run_engine(const LoadRequest *request, const char *template_path,
     add_arg(arguments, "0");
     add_arg(arguments, "--theme");
     add_arg(arguments, request->theme);
+    add_arg(arguments, "--zoom");
+    char *zoom = g_strdup_printf("%d", request->zoom);
+    add_arg(arguments, zoom);
+    g_free(zoom);
     add_arg(arguments, "--native-forms");
     if (request->method && *request->method) {
         add_arg(arguments, "--request-method");
@@ -618,6 +723,7 @@ static void load_worker(GTask *task, gpointer source_object, gpointer task_data,
     LoadResult *result = g_new0(LoadResult, 1);
     result->url = g_strdup(request->url);
     result->theme = g_strdup(request->theme);
+    result->zoom = request->zoom;
     result->serial = request->serial;
     result->replace_current = request->replace_current;
     result->template_path = temporary_path("distill-template-XXXXXX");
@@ -1066,10 +1172,36 @@ static void step_viewer(App *app, int delta)
     g_free(target);
 }
 
+static void apply_zoom(App *app, int zoom);
+static void step_zoom(App *app, int direction);
+
 static gboolean window_key_press(GtkWidget *widget, GdkEventKey *event, gpointer opaque)
 {
     (void)widget;
     App *app = opaque;
+    GdkModifierType control = event->state & gtk_accelerator_get_default_mod_mask();
+    /* Zoom works in viewer mode too: it is a reader setting, and leaving the
+       image to change it and coming back is not a way to read. */
+    if (control == GDK_CONTROL_MASK) {
+        switch (event->keyval) {
+            case GDK_KEY_plus:
+            case GDK_KEY_equal:
+            case GDK_KEY_KP_Add:
+                step_zoom(app, 1);
+                return TRUE;
+            case GDK_KEY_minus:
+            case GDK_KEY_underscore:
+            case GDK_KEY_KP_Subtract:
+                step_zoom(app, -1);
+                return TRUE;
+            case GDK_KEY_0:
+            case GDK_KEY_KP_0:
+                apply_zoom(app, ZOOM_DEFAULT);
+                return TRUE;
+            default:
+                break;
+        }
+    }
     if (!app->viewer_active) {
         GdkModifierType modifiers = event->state & gtk_accelerator_get_default_mod_mask();
         if (modifiers == GDK_MOD1_MASK) {
@@ -1640,6 +1772,7 @@ static void load_surface(App *app, const DAppPage *page)
     collect_page_media(app);
     gtk_entry_set_text(GTK_ENTRY(app->url_entry), page->url);
     select_theme_id(app, page->theme);
+    select_zoom(app, page->zoom);
     gtk_widget_set_sensitive(app->back_button, d_app_history_can_back(&app->history));
     gtk_widget_set_sensitive(app->forward_button, d_app_history_can_forward(&app->history));
 }
@@ -1681,11 +1814,12 @@ static void load_done(GObject *source_object, GAsyncResult *result, gpointer opa
     if (loaded->replace_current && d_app_history_current(&app->history)) {
         history_ok = d_app_history_replace_current(&app->history, loaded->url,
                                                     loaded->template_path,
-                                                    loaded->theme, page_dispose);
+                                                    loaded->theme, loaded->zoom,
+                                                    page_dispose);
     } else {
         history_ok = d_app_history_push(&app->history, loaded->url,
                                         loaded->template_path,
-                                        loaded->theme, page_dispose);
+                                        loaded->theme, loaded->zoom, page_dispose);
     }
     if (!history_ok) {
         free_load_result(loaded);
@@ -1722,6 +1856,7 @@ static void app_begin_load(App *app, const char *uri, const char *method,
     request->method = g_strdup(method ? method : "");
     request->data = g_strdup(data ? data : "");
     request->theme = g_strdup(active_theme_id(app));
+    request->zoom = active_zoom(app);
     request->serial = ++app->load_serial;
     request->replace_current = replace_current;
     app->loading = true;
@@ -1887,10 +2022,47 @@ static void theme_changed(GtkCheckMenuItem *item, gpointer opaque)
     const char *theme = g_object_get_data(G_OBJECT(item), "distill-theme-id");
     if (!valid_theme_id(theme)) return;
     save_theme(theme);
-    update_form_theme(app, theme);
+    update_form_style(app, theme, active_zoom(app));
     const DAppPage *page = d_app_history_current(&app->history);
     if (!page || strcmp(theme, page->theme) == 0) return;
     app_begin_load(app, page->url, NULL, NULL, true);
+}
+
+/* Zoom is laid out by the engine, not scaled after the fact, so changing it
+   means rendering the page again. The current entry is replaced rather than
+   pushed: the same page at another size is not somewhere else to go back to. */
+static void apply_zoom(App *app, int zoom)
+{
+    if (!valid_zoom(zoom) || app->loading) return;
+    if (zoom != active_zoom(app)) select_zoom(app, zoom);
+    save_zoom(zoom);
+    update_form_style(app, active_theme_id(app), zoom);
+    char *message = g_strdup_printf("Zoom %d%%", zoom);
+    set_status(app, message);
+    g_free(message);
+    const DAppPage *page = d_app_history_current(&app->history);
+    if (!page || page->zoom == zoom) return;
+    app_begin_load(app, page->url, NULL, NULL, true);
+}
+
+static void zoom_changed(GtkCheckMenuItem *item, gpointer opaque)
+{
+    if (!gtk_check_menu_item_get_active(item)) return;
+    App *app = opaque;
+    if (app->updating_zoom || app->loading) return;
+    int zoom = GPOINTER_TO_INT(g_object_get_data(G_OBJECT(item), "distill-zoom"));
+    apply_zoom(app, zoom);
+}
+
+/* Ctrl+= and Ctrl+- move through the offered levels rather than by a fixed
+   percentage, so the keys and the menu can never disagree about where the
+   reader is. The ends hold rather than wrap: zooming in past the largest step
+   should do nothing, not drop the page back to the smallest. */
+static void step_zoom(App *app, int direction)
+{
+    int next = zoom_step_level(active_zoom(app), direction);
+    if (next == active_zoom(app)) return;
+    apply_zoom(app, next);
 }
 
 static GtkWidget *make_sections_button(App *app)
@@ -1945,6 +2117,24 @@ static GtkWidget *make_settings_button(App *app)
     gtk_menu_item_set_submenu(GTK_MENU_ITEM(theme_item), theme_menu);
     gtk_menu_shell_append(GTK_MENU_SHELL(menu), theme_item);
 
+    GtkWidget *zoom_item = gtk_menu_item_new_with_label("Zoom");
+    GtkWidget *zoom_menu = gtk_menu_new();
+    GSList *zoom_group = NULL;
+    for (int i = 0; i < ZOOM_LEVEL_COUNT; ++i) {
+        char *label = zoom_levels[i] == ZOOM_DEFAULT
+                          ? g_strdup_printf("%d%%    Ctrl+0", zoom_levels[i])
+                          : g_strdup_printf("%d%%", zoom_levels[i]);
+        GtkWidget *item = gtk_radio_menu_item_new_with_label(zoom_group, label);
+        g_free(label);
+        zoom_group = gtk_radio_menu_item_get_group(GTK_RADIO_MENU_ITEM(item));
+        g_object_set_data(G_OBJECT(item), "distill-zoom", GINT_TO_POINTER(zoom_levels[i]));
+        app->zoom_items[i] = item;
+        g_signal_connect(item, "toggled", G_CALLBACK(zoom_changed), app);
+        gtk_menu_shell_append(GTK_MENU_SHELL(zoom_menu), item);
+    }
+    gtk_menu_item_set_submenu(GTK_MENU_ITEM(zoom_item), zoom_menu);
+    gtk_menu_shell_append(GTK_MENU_SHELL(menu), zoom_item);
+
     GtkWidget *button = gtk_menu_button_new();
     GtkWidget *icon = gtk_image_new_from_icon_name("preferences-system-symbolic",
                                                    GTK_ICON_SIZE_BUTTON);
@@ -1998,6 +2188,7 @@ static void app_activate(GtkApplication *application, gpointer opaque)
 {
     const char *initial_url = opaque;
     char *saved_theme = load_saved_theme();
+    int saved_zoom = load_saved_zoom();
     App *app = g_new0(App, 1);
     app->application = G_APPLICATION(application);
     app->references = 1;
@@ -2035,7 +2226,8 @@ static void app_activate(GtkApplication *application, gpointer opaque)
     gtk_box_pack_start(GTK_BOX(toolbar), app->section_button, FALSE, FALSE, 0);
     app->settings_button = make_settings_button(app);
     gtk_box_pack_start(GTK_BOX(toolbar), app->settings_button, FALSE, FALSE, 0);
-    update_form_theme(app, saved_theme);
+    select_zoom(app, saved_zoom);
+    update_form_style(app, saved_theme, saved_zoom);
     select_theme_id(app, saved_theme);
     g_free(saved_theme);
 
@@ -2419,17 +2611,51 @@ static bool run_media_self_test(void)
     return ok;
 }
 
+/* The keys and the menu read the same table, so what this checks is the part
+   that can still be wrong: the ends hold, and an unknown saved value lands on
+   the default rather than off the end of the table. */
+static bool run_zoom_self_test(void)
+{
+    bool ok = true;
+    if (zoom_levels[0] >= ZOOM_DEFAULT || zoom_levels[ZOOM_LEVEL_COUNT - 1] <= ZOOM_DEFAULT) {
+        fprintf(stderr, "zoom: the default is not inside the offered levels\n");
+        ok = false;
+    }
+    if (!valid_zoom(ZOOM_DEFAULT) || valid_zoom(137) || valid_zoom(0)) {
+        fprintf(stderr, "zoom: level validation accepts a level the menu cannot show\n");
+        ok = false;
+    }
+    if (zoom_step_level(zoom_levels[0], -1) != zoom_levels[0] ||
+        zoom_step_level(zoom_levels[ZOOM_LEVEL_COUNT - 1], 1) !=
+            zoom_levels[ZOOM_LEVEL_COUNT - 1]) {
+        fprintf(stderr, "zoom: stepping past an end does not hold there\n");
+        ok = false;
+    }
+    if (zoom_step_level(ZOOM_DEFAULT, 1) <= ZOOM_DEFAULT ||
+        zoom_step_level(ZOOM_DEFAULT, -1) >= ZOOM_DEFAULT ||
+        zoom_step_level(zoom_step_level(ZOOM_DEFAULT, 1), -1) != ZOOM_DEFAULT) {
+        fprintf(stderr, "zoom: stepping does not move one level at a time\n");
+        ok = false;
+    }
+    if (zoom_step_level(137, 0) != ZOOM_DEFAULT) {
+        fprintf(stderr, "zoom: an unknown level does not fall back to the default\n");
+        ok = false;
+    }
+    return ok;
+}
+
 static int run_state_self_test(void)
 {
     DAppHistory history;
     d_app_history_init(&history);
-    bool ok = d_app_history_push(&history, "one", "one", "warm", NULL) &&
-              d_app_history_push(&history, "two", "two", "night", NULL) &&
+    bool ok = d_app_history_push(&history, "one", "one", "warm", 100, NULL) &&
+              d_app_history_push(&history, "two", "two", "night", 125, NULL) &&
               d_app_history_back(&history) &&
               d_app_history_current(&history) &&
               strcmp(d_app_history_current(&history)->url, "one") == 0 &&
               d_app_history_forward(&history);
     d_app_history_clear(&history, NULL);
+    ok = run_zoom_self_test() && ok;
     ok = run_coordinate_self_test() && ok;
     ok = run_address_bar_self_test() && ok;
     ok = run_redirect_self_test() && ok;
