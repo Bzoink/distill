@@ -76,6 +76,16 @@ size. Ctrl+plus and Ctrl+minus step through the levels the menu offers and
 Ctrl+0 returns to 100%; `--self-test` covers the stepping and the fallback for
 a saved level the menu no longer has.
 
+The shell opens on `share/welcome.html`, which presents the browser and its
+keys to a first-time reader. It is an ordinary local page: the shell navigates
+to it, so it is fetched, extracted and laid out by the reader template like any
+other, and reading it is a demonstration of the thing it describes. Settings ->
+Start page saves the current page, the welcome page or blank under
+`browser/start-page`; `--url` overrides it. The page is found through
+`DISTILL_WELCOME_PAGE`, then the source tree, then the installed copy --
+the same order the engine uses for its profiles -- and `--self-test` gates
+both that search and what each setting resolves to.
+
 Text selection is drag, double-click for a word, triple-click for a block,
 Ctrl+A for the page, Ctrl+C to copy, and Escape to clear; a finished drag also
 goes to the X11 primary selection. The runs come from the renderer -- litehtml

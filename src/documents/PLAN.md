@@ -423,7 +423,11 @@ boundary hands the shell the runs litehtml drew, with the box each filled and
 the block it came from, and the shaper answers where a character sits inside a
 run in cluster steps, so a selection never lands inside a letter. Selection is
 logical-order by design -- visual-order highlighting for bidirectional text is
-out of scope, and RTL pages still copy correct text. A reading-list toggle
+out of scope, and RTL pages still copy correct text. The browser opens on a
+welcome page that ships with it (`share/welcome.html`), read through the same
+pipeline as anything else rather than drawn specially; Settings chooses what it
+opens with instead -- the current page, the welcome page, or nothing -- and a
+URL on the command line still wins over the setting. A reading-list toggle
 keeps URLs for the session. `distill-app-state` and `distill-litehtml-geometry` CTest
 contracts cover history truncation/replacement and native-control geometry,
 while `corpus/check.py --app` covers the display-free shell model. Phase 4 can

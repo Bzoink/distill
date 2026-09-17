@@ -99,12 +99,15 @@ set_target_properties(distill PROPERTIES
 install(TARGETS distill RUNTIME DESTINATION bin)
 install(DIRECTORY profiles/ DESTINATION ${CMAKE_INSTALL_DATADIR}/distill/profiles
         FILES_MATCHING PATTERN "*.json")
+install(FILES share/welcome.html DESTINATION ${CMAKE_INSTALL_DATADIR}/distill)
 
 if(DISTILL_GTK_FOUND)
     add_executable(distill-gtk src/app.c src/app_state.c src/litehtml_probe.cpp)
     target_compile_definitions(distill-gtk PRIVATE
         DISTILL_ENGINE_PATH="${CMAKE_BINARY_DIR}/distill"
         DISTILL_FONT_DIR="${CMAKE_SOURCE_DIR}/external/fonts"
+        DISTILL_SOURCE_DIR="${CMAKE_SOURCE_DIR}"
+        DISTILL_INSTALL_WELCOME_PAGE="${CMAKE_INSTALL_FULL_DATADIR}/distill/welcome.html"
     )
     target_include_directories(distill-gtk PRIVATE
         src

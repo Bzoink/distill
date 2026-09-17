@@ -32,6 +32,16 @@
 #define DISTILL_FONT_DIR ""
 #endif
 
+#ifndef DISTILL_SOURCE_DIR
+#define DISTILL_SOURCE_DIR ""
+#endif
+
+/* What the shell opens when it is given nothing else. "welcome" is the page
+   that ships with the browser, "blank" is an empty reader, and anything else
+   is a URL the reader chose. */
+#define START_PAGE_WELCOME "welcome"
+#define START_PAGE_BLANK "blank"
+
 enum {
     /* The page follows the window between these two, in design pixels that
        zoom then scales. The upper end is the width the reader was drawn at:
@@ -536,6 +546,24 @@ static void update_form_style(App *app, const char *theme, int zoom)
     g_free(css);
 }
 
+/* Where the welcome page is, looked for the way the engine looks for its
+   profiles: an override for a reader who wants their own, the source tree for
+   a build that has not been installed, the installed copy otherwise. */
+static char *welcome_page_path(void)
+{
+    const char *configured = getenv("DISTILL_WELCOME_PAGE");
+    if (configured && *configured && access(configured, R_OK) == 0)
+        return g_strdup(configured);
+    char *source = g_build_filename(DISTILL_SOURCE_DIR, "share", "welcome.html", NULL);
+    if (*DISTILL_SOURCE_DIR && access(source, R_OK) == 0) return source;
+    g_free(source);
+#ifdef DISTILL_INSTALL_WELCOME_PAGE
+    if (access(DISTILL_INSTALL_WELCOME_PAGE, R_OK) == 0)
+        return g_strdup(DISTILL_INSTALL_WELCOME_PAGE);
+#endif
+    return NULL;
+}
+
 static char *browser_settings_path(void)
 {
     return g_build_filename(g_get_user_config_dir(), "distill", "settings.ini", NULL);
@@ -609,6 +637,52 @@ static void save_theme(const char *theme)
     g_key_file_set_string(settings, "browser", "theme", theme);
     save_browser_settings(settings);
     g_key_file_free(settings);
+}
+
+static char *load_saved_start_page(void)
+{
+    GKeyFile *settings = load_browser_settings();
+    char *value = g_key_file_get_string(settings, "browser", "start-page", NULL);
+    g_key_file_free(settings);
+    if (!value || !*value) {
+        g_free(value);
+        return g_strdup(START_PAGE_WELCOME);
+    }
+    return value;
+}
+
+static void save_start_page(const char *value)
+{
+    if (!value || !*value) return;
+    GKeyFile *settings = load_browser_settings();
+    g_key_file_set_string(settings, "browser", "start-page", value);
+    save_browser_settings(settings);
+    g_key_file_free(settings);
+}
+
+/* The address a setting stands for, or NULL for an empty reader. The welcome
+   page is a file like any other: it goes through the same fetch, extraction
+   and reader template as anything else, which is both less code and a fair
+   demonstration of what the browser does. Anything that is neither of the two
+   names is an address the reader chose, and a welcome page that is not on disk
+   leaves an empty reader rather than a failed load. */
+static char *start_page_for_setting(const char *value, const char *welcome_path)
+{
+    if (!value || !*value || strcmp(value, START_PAGE_BLANK) == 0) return NULL;
+    if (strcmp(value, START_PAGE_WELCOME) == 0)
+        return welcome_path && *welcome_path ? g_strconcat("file://", welcome_path, NULL)
+                                             : NULL;
+    return g_strdup(value);
+}
+
+static char *start_page_url(void)
+{
+    char *value = load_saved_start_page();
+    char *path = welcome_page_path();
+    char *url = start_page_for_setting(value, path);
+    g_free(path);
+    g_free(value);
+    return url;
 }
 
 static void save_zoom(int zoom)
@@ -2753,6 +2827,43 @@ static void step_zoom(App *app, int direction)
     apply_zoom(app, next);
 }
 
+/* Three ways to say what the browser opens with, and no dialog: the page you
+   want is nearly always the page you are looking at, and the two fixed answers
+   are the way back from it. */
+static void start_page_chosen(App *app, const char *value, const char *description)
+{
+    save_start_page(value);
+    char *message = g_strdup_printf("Start page: %s", description);
+    set_status(app, message);
+    g_free(message);
+}
+
+static void start_welcome_clicked(GtkWidget *widget, gpointer opaque)
+{
+    (void)widget;
+    start_page_chosen(opaque, START_PAGE_WELCOME, "the welcome page");
+}
+
+static void start_blank_clicked(GtkWidget *widget, gpointer opaque)
+{
+    (void)widget;
+    start_page_chosen(opaque, START_PAGE_BLANK, "blank");
+}
+
+static void start_current_clicked(GtkWidget *widget, gpointer opaque)
+{
+    (void)widget;
+    App *app = opaque;
+    const DAppPage *page = d_app_history_current(&app->history);
+    if (!page || !page->url || !*page->url) {
+        set_status(app, "No page to start with yet");
+        return;
+    }
+    char *shown = display_url(page->url);
+    start_page_chosen(app, page->url, shown);
+    g_free(shown);
+}
+
 static GtkWidget *make_sections_button(App *app)
 {
     GtkWidget *menu = gtk_menu_new();
@@ -2822,6 +2933,21 @@ static GtkWidget *make_settings_button(App *app)
     }
     gtk_menu_item_set_submenu(GTK_MENU_ITEM(zoom_item), zoom_menu);
     gtk_menu_shell_append(GTK_MENU_SHELL(menu), zoom_item);
+
+    GtkWidget *start_item = gtk_menu_item_new_with_label("Start page");
+    GtkWidget *start_menu = gtk_menu_new();
+    struct { const char *label; GCallback callback; } start_items[] = {
+        {"Use the current page", G_CALLBACK(start_current_clicked)},
+        {"Use the welcome page", G_CALLBACK(start_welcome_clicked)},
+        {"Start blank", G_CALLBACK(start_blank_clicked)}
+    };
+    for (size_t i = 0; i < sizeof start_items / sizeof start_items[0]; ++i) {
+        GtkWidget *item = gtk_menu_item_new_with_label(start_items[i].label);
+        g_signal_connect(item, "activate", start_items[i].callback, app);
+        gtk_menu_shell_append(GTK_MENU_SHELL(start_menu), item);
+    }
+    gtk_menu_item_set_submenu(GTK_MENU_ITEM(start_item), start_menu);
+    gtk_menu_shell_append(GTK_MENU_SHELL(menu), start_item);
 
     GtkWidget *button = gtk_menu_button_new();
     GtkWidget *icon = gtk_image_new_from_icon_name("preferences-system-symbolic",
@@ -2982,7 +3108,16 @@ static void app_activate(GtkApplication *application, gpointer opaque)
     gtk_box_pack_start(GTK_BOX(status_row), app->status, FALSE, FALSE, 0);
     gtk_box_pack_start(GTK_BOX(root), status_row, FALSE, FALSE, 0);
     gtk_widget_show_all(app->window);
-    if (initial_url && *initial_url) app_begin_load(app, initial_url, NULL, NULL, false);
+    /* A URL on the command line is what the reader asked for now; the setting
+       is what they asked for in general, and only stands in when there is no
+       other instruction. */
+    if (initial_url && *initial_url) {
+        app_begin_load(app, initial_url, NULL, NULL, false);
+    } else {
+        char *start = start_page_url();
+        if (start) app_begin_load(app, start, NULL, NULL, false);
+        g_free(start);
+    }
 }
 
 static bool expect_resolved(const char *input, const char *expected)
@@ -3502,6 +3637,57 @@ static bool run_selection_self_test(void)
     return ok;
 }
 
+/* The page the browser opens with is a setting, an address and a file that has
+   to be where the build says it is. All three can drift apart, and the reader
+   meets the result as an empty window on the first launch. */
+static bool run_start_page_self_test(void)
+{
+    bool ok = true;
+    char *path = welcome_page_path();
+    if (!path) {
+        fprintf(stderr, "start page: the welcome page is not where the build says\n");
+        ok = false;
+    } else {
+        char *contents = d_read_file(path, NULL);
+        if (!contents || !strstr(contents, "<title>Distill</title>")) {
+            fprintf(stderr, "start page: %s is not the welcome page\n", path);
+            ok = false;
+        }
+        free(contents);
+    }
+
+    char *welcome = start_page_for_setting(START_PAGE_WELCOME, "/tmp/welcome.html");
+    if (!welcome || strcmp(welcome, "file:///tmp/welcome.html") != 0) {
+        fprintf(stderr, "start page: the welcome setting gave %s\n",
+                welcome ? welcome : "nothing");
+        ok = false;
+    }
+    g_free(welcome);
+
+    /* A welcome page that is not installed leaves an empty reader; a blank
+       setting says the same thing deliberately. */
+    char *missing = start_page_for_setting(START_PAGE_WELCOME, NULL);
+    char *blank = start_page_for_setting(START_PAGE_BLANK, "/tmp/welcome.html");
+    char *nothing = start_page_for_setting("", "/tmp/welcome.html");
+    if (missing || blank || nothing) {
+        fprintf(stderr, "start page: an empty reader was asked for and not given\n");
+        ok = false;
+    }
+    g_free(missing);
+    g_free(blank);
+    g_free(nothing);
+
+    char *saved = start_page_for_setting("https://example.test/news", "/tmp/welcome.html");
+    if (!saved || strcmp(saved, "https://example.test/news") != 0) {
+        fprintf(stderr, "start page: a saved address came back as %s\n",
+                saved ? saved : "nothing");
+        ok = false;
+    }
+    g_free(saved);
+    g_free(path);
+    return ok;
+}
+
 static int run_state_self_test(void)
 {
     DAppHistory history;
@@ -3517,6 +3703,7 @@ static int run_state_self_test(void)
     ok = run_width_self_test() && ok;
     ok = run_progress_self_test() && ok;
     ok = run_selection_self_test() && ok;
+    ok = run_start_page_self_test() && ok;
     ok = run_coordinate_self_test() && ok;
     ok = run_address_bar_self_test() && ok;
     ok = run_redirect_self_test() && ok;
