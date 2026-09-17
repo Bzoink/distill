@@ -447,6 +447,547 @@ static char *json_quote(const char *value)
     dbuf_puts(&out, "\""); return dbuf_take(&out);
 }
 
+/* Embedded application state is useful only when its shape is known. This is
+   the first versioned adapter: the pageContent tree used by Folksam's
+   server-rendered Next.js pages. It intentionally maps a small allow-list of
+   component types; unknown components remain visible through the HTML
+   candidate and are reported in the extraction diagnostics. */
+#define DISTILL_EMBEDDED_JSON_BYTES (2u * 1024u * 1024u)
+#define DISTILL_EMBEDDED_NODES 2048u
+#define DISTILL_EMBEDDED_NAVIGATION_NODES 4096u
+
+typedef struct {
+    bool detected;
+    bool matched;
+    char *adapter;
+    char *version;
+    char *title;
+    DBuffer blocks;
+    DBuffer links;
+    DBuffer media;
+    DBuffer navigation;
+    StringVec block_keys;
+    StringVec link_keys;
+    StringVec media_keys;
+    StringVec navigation_keys;
+    StringVec unknown;
+    bool first_block;
+    bool first_link;
+    bool first_media;
+    bool first_navigation;
+    size_t nodes;
+    size_t navigation_nodes;
+} EmbeddedCandidate;
+
+static void embedded_init(EmbeddedCandidate *candidate)
+{
+    *candidate = (EmbeddedCandidate){0};
+    candidate->adapter = d_strdup("");
+    candidate->version = d_strdup("");
+    candidate->title = d_strdup("");
+    dbuf_init(&candidate->blocks);
+    dbuf_init(&candidate->links);
+    dbuf_init(&candidate->media);
+    dbuf_init(&candidate->navigation);
+    dbuf_puts(&candidate->blocks, "[");
+    dbuf_puts(&candidate->links, "[");
+    dbuf_puts(&candidate->media, "[");
+    dbuf_puts(&candidate->navigation, "[");
+    candidate->first_block = candidate->first_link = candidate->first_media = true;
+    candidate->first_navigation = true;
+}
+
+static void embedded_free(EmbeddedCandidate *candidate)
+{
+    free(candidate->adapter); free(candidate->version); free(candidate->title);
+    dbuf_free(&candidate->blocks); dbuf_free(&candidate->links); dbuf_free(&candidate->media); dbuf_free(&candidate->navigation);
+    string_vec_free(&candidate->block_keys); string_vec_free(&candidate->link_keys);
+    string_vec_free(&candidate->media_keys); string_vec_free(&candidate->navigation_keys); string_vec_free(&candidate->unknown);
+    *candidate = (EmbeddedCandidate){0};
+}
+
+static char *embedded_property_string(Engine *engine, JSValueConst object,
+                                      const char *const *names, size_t count)
+{
+    if (!JS_IsObject(object)) return d_strdup("");
+    for (size_t i = 0; i < count; ++i) {
+        JSValue value = JS_GetPropertyStr(engine->context, object, names[i]);
+        if (JS_IsString(value) || JS_IsNumber(value)) {
+            char *text = js_string(engine->context, value);
+            JS_FreeValue(engine->context, value);
+            char *clean = d_trim(text);
+            free(text);
+            if (*clean) return clean;
+            free(clean);
+        } else JS_FreeValue(engine->context, value);
+    }
+    return d_strdup("");
+}
+
+static JSValue embedded_property(Engine *engine, JSValueConst object, const char *name);
+
+static char *embedded_property_text(Engine *engine, JSValueConst object,
+                                    const char *const *names, size_t count)
+{
+    const char *nested_names[] = {"text", "value", "label", "name", "title"};
+    if (JS_IsObject(object)) {
+        for (size_t i = 0; i < count; ++i) {
+            JSValue value = embedded_property(engine, object, names[i]);
+            if (JS_IsObject(value)) {
+                char *nested = embedded_property_string(engine, value, nested_names,
+                                                         sizeof(nested_names) / sizeof(*nested_names));
+                JS_FreeValue(engine->context, value);
+                if (*nested) return nested;
+                free(nested);
+            } else JS_FreeValue(engine->context, value);
+        }
+    }
+    return embedded_property_string(engine, object, names, count);
+}
+
+static JSValue embedded_property(Engine *engine, JSValueConst object, const char *name)
+{
+    return JS_GetPropertyStr(engine->context, object, name);
+}
+
+static char *embedded_plain_text(const char *value)
+{
+    DBuffer out; dbuf_init(&out);
+    bool in_tag = false, space = false;
+    for (const unsigned char *p = (const unsigned char *)(value ? value : ""); *p; ++p) {
+        if (*p == '<') { in_tag = true; continue; }
+        if (in_tag) { if (*p == '>') in_tag = false; continue; }
+        if (*p == 0xc2 && p[1] == 0xa0) { ++p; space = out.length > 0; continue; }
+        if (*p <= ' ') {
+            space = out.length > 0;
+            continue;
+        }
+        if (space && out.length) dbuf_puts(&out, " ");
+        space = false;
+        dbuf_append(&out, p, 1);
+    }
+    char *text = dbuf_take(&out);
+    char *trimmed = d_trim(text);
+    free(text);
+    return trimmed;
+}
+
+static bool embedded_has_key(const StringVec *keys, const char *key)
+{
+    for (size_t i = 0; i < keys->length; ++i)
+        if (d_eq(keys->items[i], key)) return true;
+    return false;
+}
+
+static void embedded_add_unknown(EmbeddedCandidate *candidate, const char *name)
+{
+    if (!*name || embedded_has_key(&candidate->unknown, name)) return;
+    string_vec_push(&candidate->unknown, d_strdup(name));
+}
+
+static void embedded_add_block(Engine *engine, EmbeddedCandidate *candidate,
+                               const char *type, const char *text, const char *raw_url,
+                               size_t *rejected)
+{
+    char *clean = embedded_plain_text(text);
+    if (!*clean) { free(clean); return; }
+    char *url = safe_uri(engine, raw_url, rejected);
+    char *key = d_cat4(type, "\x1f", clean, url);
+    if (embedded_has_key(&candidate->block_keys, key)) {
+        free(key); free(url); free(clean); return;
+    }
+    string_vec_push(&candidate->block_keys, key);
+    char *qt = json_quote(type), *qx = json_quote(clean), *qh = json_quote(url);
+    if (!candidate->first_block) dbuf_puts(&candidate->blocks, ",");
+    candidate->first_block = false;
+    dbuf_printf(&candidate->blocks, "{\"type\":%s,\"text\":%s,\"href\":%s,\"main\":false}", qt, qx, qh);
+    free(qt); free(qx); free(qh); free(url); free(clean);
+}
+
+static void embedded_add_link(Engine *engine, EmbeddedCandidate *candidate,
+                              const char *text, const char *raw_url, size_t *rejected)
+{
+    char *label = embedded_plain_text(text);
+    char *url = safe_uri(engine, raw_url, rejected);
+    if (!*label || !*url) { free(label); free(url); return; }
+    char *key = d_cat4(label, "\x1f", url, "");
+    if (embedded_has_key(&candidate->link_keys, key)) {
+        free(key); free(label); free(url); return;
+    }
+    string_vec_push(&candidate->link_keys, key);
+    char *qt = json_quote(label), *qu = json_quote(url);
+    if (!candidate->first_link) dbuf_puts(&candidate->links, ",");
+    candidate->first_link = false;
+    dbuf_printf(&candidate->links, "{\"text\":%s,\"url\":%s}", qt, qu);
+    free(qt); free(qu); free(label); free(url);
+}
+
+static void embedded_add_navigation(Engine *engine, EmbeddedCandidate *candidate,
+                                    const char *text, const char *raw_url,
+                                    size_t *rejected)
+{
+    char *label = embedded_plain_text(text);
+    char *url = safe_uri(engine, raw_url, rejected);
+    if (!*label || !*url) { free(label); free(url); return; }
+    char *key = d_cat4(label, "\x1f", url, "");
+    if (embedded_has_key(&candidate->navigation_keys, key)) {
+        free(key); free(label); free(url); return;
+    }
+    string_vec_push(&candidate->navigation_keys, key);
+    char *qt = json_quote(label), *qu = json_quote(url);
+    if (!candidate->first_navigation) dbuf_puts(&candidate->navigation, ",");
+    candidate->first_navigation = false;
+    dbuf_printf(&candidate->navigation, "{\"text\":%s,\"url\":%s}", qt, qu);
+    free(qt); free(qu); free(label); free(url);
+}
+
+static void embedded_add_media(Engine *engine, EmbeddedCandidate *candidate,
+                               const char *raw_url, const char *alt, size_t *rejected)
+{
+    char *url = safe_uri(engine, raw_url, rejected);
+    char *description = embedded_plain_text(alt);
+    if (!*url) { free(url); free(description); return; }
+    char *key = d_cat4(url, "\x1f", description, "");
+    if (embedded_has_key(&candidate->media_keys, key)) {
+        free(key); free(url); free(description); return;
+    }
+    string_vec_push(&candidate->media_keys, key);
+    char *qk = json_quote("content"), *qu = json_quote(url), *qa = json_quote(description);
+    if (!candidate->first_media) dbuf_puts(&candidate->media, ",");
+    candidate->first_media = false;
+    dbuf_printf(&candidate->media, "{\"kind\":%s,\"url\":%s,\"alt\":%s}", qk, qu, qa);
+    free(qk); free(qu); free(qa); free(url); free(description);
+}
+
+static char *embedded_nested_url(Engine *engine, JSValueConst value)
+{
+    const char *names[] = {"url", "href", "src", "imageUrl", "targetUrl", "selectOptionValue", "path"};
+    char *direct = embedded_property_string(engine, value, names, sizeof(names) / sizeof(*names));
+    if (*direct || !JS_IsObject(value)) return direct;
+    const char *objects[] = {"url", "link", "target", "image", "asset", "file", "fields"};
+    for (size_t i = 0; i < sizeof(objects) / sizeof(*objects); ++i) {
+        JSValue child = embedded_property(engine, value, objects[i]);
+        if (JS_IsObject(child)) {
+            char *nested = embedded_nested_url(engine, child);
+            JS_FreeValue(engine->context, child);
+            if (*nested) { free(direct); return nested; }
+            free(nested);
+        } else JS_FreeValue(engine->context, child);
+    }
+    return direct;
+}
+
+static char *embedded_nested_label(Engine *engine, JSValueConst value)
+{
+    const char *names[] = {"label", "text", "paragraphBold", "linkText", "buttonText",
+                          "ctaText", "selectOptionText", "title", "name"};
+    char *direct = embedded_property_text(engine, value, names, sizeof(names) / sizeof(*names));
+    if (*direct || !JS_IsObject(value)) return direct;
+    const char *objects[] = {"link", "heading", "label"};
+    for (size_t i = 0; i < sizeof(objects) / sizeof(*objects); ++i) {
+        JSValue child = embedded_property(engine, value, objects[i]);
+        if (JS_IsObject(child)) {
+            char *nested = embedded_nested_label(engine, child);
+            JS_FreeValue(engine->context, child);
+            if (*nested) { free(direct); return nested; }
+            free(nested);
+        } else JS_FreeValue(engine->context, child);
+    }
+    return direct;
+}
+
+static char *embedded_navigation_label(Engine *engine, JSValueConst value)
+{
+    const char *names[] = {"name", "label", "text", "linkText", "buttonText"};
+    return embedded_property_text(engine, value, names, sizeof(names) / sizeof(*names));
+}
+
+static void embedded_map_navigation(Engine *engine, EmbeddedCandidate *candidate,
+                                    JSValueConst value, size_t *rejected,
+                                    unsigned depth)
+{
+    if ((!JS_IsObject(value) && !JS_IsArray(value)) || depth > 10 ||
+        candidate->navigation_nodes++ >= DISTILL_EMBEDDED_NAVIGATION_NODES) return;
+    if (JS_IsObject(value) && !JS_IsArray(value)) {
+        char *url = embedded_nested_url(engine, value);
+        /* Menu entries use name/label/text. Do not treat an illustration's
+           title as a navigation label merely because its asset has a URL. */
+        char *label = embedded_navigation_label(engine, value);
+        if (*url && *label) embedded_add_navigation(engine, candidate, label, url, rejected);
+        free(url); free(label);
+    }
+    JSPropertyEnum *properties = NULL;
+    uint32_t count = 0;
+    if (JS_GetOwnPropertyNames(engine->context, &properties, &count, value,
+                               JS_GPN_STRING_MASK | JS_GPN_ENUM_ONLY) < 0) return;
+    for (uint32_t i = 0; i < count && candidate->navigation_nodes < DISTILL_EMBEDDED_NAVIGATION_NODES; ++i) {
+        const char *name = JS_AtomToCString(engine->context, properties[i].atom);
+        JSValue child = JS_GetProperty(engine->context, value, properties[i].atom);
+        if (JS_IsObject(child) || JS_IsArray(child))
+            embedded_map_navigation(engine, candidate, child, rejected, depth + 1);
+        JS_FreeValue(engine->context, child);
+        if (name) JS_FreeCString(engine->context, name);
+    }
+    JS_FreePropertyEnum(engine->context, properties, count);
+}
+
+static void embedded_map_object(Engine *engine, EmbeddedCandidate *candidate,
+                                JSValueConst object, const char *component,
+                                size_t *rejected, unsigned depth)
+{
+    (void)component;
+    if (!JS_IsObject(object) || JS_IsArray(object) || depth > 8 ||
+        candidate->nodes++ >= DISTILL_EMBEDDED_NODES) return;
+
+    const char *heading_names[] = {"heading", "headline", "title", "name"};
+    const char *text_names[] = {"paragraph", "paragraphBold", "body", "description", "copy", "intro", "lead", "text", "content"};
+    const char *label_names[] = {"label", "linkText", "buttonText", "ctaText", "paragraphBold", "text", "title", "name"};
+    char *heading = embedded_property_text(engine, object, heading_names, sizeof(heading_names) / sizeof(*heading_names));
+    char *heading_type = embedded_property_string(engine, object, (const char *[]) {"as"}, 1);
+    if (!d_eq(heading_type, "h1") && !d_eq(heading_type, "h2") && !d_eq(heading_type, "h3")) {
+        free(heading_type); heading_type = d_strdup("h2");
+    }
+    if (*heading) embedded_add_block(engine, candidate, heading_type, heading, "", rejected);
+    free(heading_type);
+    free(heading);
+    char *text = embedded_property_text(engine, object, text_names, sizeof(text_names) / sizeof(*text_names));
+    if (*text) embedded_add_block(engine, candidate, "p", text, "", rejected);
+    free(text);
+
+    char *url = embedded_nested_url(engine, object);
+    char *label = embedded_property_text(engine, object, label_names, sizeof(label_names) / sizeof(*label_names));
+    if (!*label) { free(label); label = embedded_nested_label(engine, object); }
+    if (*url && *label) {
+        embedded_add_block(engine, candidate, "p", label, url, rejected);
+        embedded_add_link(engine, candidate, label, url, rejected);
+    }
+    free(url); free(label);
+
+    const char *image_names[] = {"image", "media", "asset", "photo"};
+    for (size_t i = 0; i < sizeof(image_names) / sizeof(*image_names); ++i) {
+        JSValue image = embedded_property(engine, object, image_names[i]);
+        if (!JS_IsObject(image)) { JS_FreeValue(engine->context, image); continue; }
+        char *image_url = embedded_nested_url(engine, image);
+        const char *alt_names[] = {"alt", "altText", "description", "title"};
+        char *alt = embedded_property_string(engine, image, alt_names, sizeof(alt_names) / sizeof(*alt_names));
+        if (*image_url) embedded_add_media(engine, candidate, image_url, alt, rejected);
+        free(image_url); free(alt); JS_FreeValue(engine->context, image);
+    }
+
+    /* These names cover the observed collection components while keeping the
+       traversal bounded. No arbitrary string flattening is performed. */
+    const char *children[] = {"items", "cards", "shortcuts", "buttons", "links",
+                              "cardItems", "sections", "content", "data",
+                              "headings", "shortcutButtonCollection", "shortcutButtons",
+                              "dropdownOptions", "textSnippets"};
+    for (size_t i = 0; i < sizeof(children) / sizeof(*children); ++i) {
+        JSValue child = embedded_property(engine, object, children[i]);
+        if (JS_IsArray(child)) {
+            int64_t length = json_array_length_for_context(engine->context, child);
+            for (int64_t j = 0; j < length && candidate->nodes < DISTILL_EMBEDDED_NODES; ++j) {
+                JSValue item = JS_GetPropertyUint32(engine->context, child, (uint32_t)j);
+                embedded_map_object(engine, candidate, item, component, rejected, depth + 1);
+                JS_FreeValue(engine->context, item);
+            }
+        } else if (JS_IsObject(child)) {
+            embedded_map_object(engine, candidate, child, component, rejected, depth + 1);
+        }
+        JS_FreeValue(engine->context, child);
+    }
+}
+
+static bool embedded_region_disabled(Engine *engine, JSValueConst region)
+{
+    JSValue meta = embedded_property(engine, region, "regionMeta");
+    JSValue disabled = embedded_property(engine, meta, "turnOffRegion");
+    bool result = false;
+    if (JS_IsString(disabled)) {
+        char *raw = js_string(engine->context, disabled);
+        char *value = d_lower(raw);
+        free(raw);
+        result = d_eq(value, "true") || d_eq(value, "1") || d_eq(value, "yes");
+        free(value);
+    } else result = JS_ToBool(engine->context, disabled);
+    JS_FreeValue(engine->context, disabled); JS_FreeValue(engine->context, meta);
+    return result;
+}
+
+static void embedded_map_region(Engine *engine, EmbeddedCandidate *candidate,
+                                JSValueConst region, size_t *rejected)
+{
+    if (!JS_IsObject(region) || embedded_region_disabled(engine, region)) return;
+    JSValue data = embedded_property(engine, region, "regionData");
+    if (!JS_IsArray(data)) { JS_FreeValue(engine->context, data); return; }
+    int64_t count = json_array_length_for_context(engine->context, data);
+    for (int64_t i = 0; i < count && candidate->nodes < DISTILL_EMBEDDED_NODES; ++i) {
+        JSValue entry = JS_GetPropertyUint32(engine->context, data, (uint32_t)i);
+        JSValue name_value = embedded_property(engine, entry, "templateName");
+        char *name = js_string(engine->context, name_value);
+        JS_FreeValue(engine->context, name_value);
+        const char *supported[] = {"marketingBanner", "headingParagraph",
+                                   "expandableShortcutButtonCollection", "imageCardCollection",
+                                   "tempSimpleCardCollection", "languageSelector"};
+        bool known = false;
+        for (size_t s = 0; s < sizeof(supported) / sizeof(*supported); ++s)
+            if (d_eq(name, supported[s])) { known = true; break; }
+        if (!known) embedded_add_unknown(candidate, name);
+        else {
+            JSValue template_data = embedded_property(engine, entry, "templateData");
+            JSValue payload = embedded_property(engine, template_data, "data");
+            if (JS_IsArray(payload)) {
+                int64_t payload_count = json_array_length_for_context(engine->context, payload);
+                for (int64_t p = 0; p < payload_count && candidate->nodes < DISTILL_EMBEDDED_NODES; ++p) {
+                    JSValue item = JS_GetPropertyUint32(engine->context, payload, (uint32_t)p);
+                    embedded_map_object(engine, candidate, item, name, rejected, 0);
+                    JS_FreeValue(engine->context, item);
+                }
+            } else embedded_map_object(engine, candidate, payload, name, rejected, 0);
+            JS_FreeValue(engine->context, payload);
+            JS_FreeValue(engine->context, template_data);
+        }
+        free(name); JS_FreeValue(engine->context, entry);
+    }
+    JS_FreeValue(engine->context, data);
+}
+
+static bool embedded_route_matches(Engine *engine, JSValueConst page_props)
+{
+    JSValue path_value = embedded_property(engine, page_props, "path");
+    if (!JS_IsString(path_value)) {
+        JS_FreeValue(engine->context, path_value);
+        return true;
+    }
+    char *raw = js_string(engine->context, path_value);
+    char *wanted = d_trim(raw);
+    free(raw);
+    JS_FreeValue(engine->context, path_value);
+    if (!*wanted) { free(wanted); return true; }
+    /* A saved response opened as file:// has no HTTP path to compare with
+       the route recorded by Next.js. Its canonical URL/base identifies the
+       captured page, so the root route is still an exact match. */
+    if (d_starts(engine->source_url, "file://") && d_eq(wanted, "/")) {
+        free(wanted);
+        return true;
+    }
+    char *actual = url_path(engine->source_url);
+    size_t wanted_length = strlen(wanted), actual_length = strlen(actual);
+    while (wanted_length > 1 && wanted[wanted_length - 1] == '/') wanted[--wanted_length] = 0;
+    while (actual_length > 1 && actual[actual_length - 1] == '/') actual[--actual_length] = 0;
+    bool matches = d_eq(wanted, actual);
+    free(wanted); free(actual);
+    return matches;
+}
+
+static EmbeddedCandidate embedded_candidate(Engine *engine, lxb_dom_node_t *root,
+                                             size_t *rejected)
+{
+    EmbeddedCandidate candidate;
+    embedded_init(&candidate);
+    NodeVec scripts = find_selector(root, "script");
+    for (size_t i = 0; i < scripts.length && !candidate.matched; ++i) {
+        lxb_dom_element_t *element = lxb_dom_interface_element(scripts.items[i]);
+        char *id = attr_value(element, "id");
+        char *type_raw = attr_value(element, "type");
+        char *type = d_lower(type_raw);
+        free(type_raw);
+        bool candidate_script = d_eq(id, "__NEXT_DATA__") || d_contains(type, "application/json");
+        free(id); free(type);
+        if (!candidate_script) continue;
+        char *text = node_text(scripts.items[i]);
+        if (strlen(text) > DISTILL_EMBEDDED_JSON_BYTES) { free(text); continue; }
+        char *body = d_trim(text); free(text);
+        if (!*body) { free(body); continue; }
+        candidate.detected = true;
+        JSValue parsed = JS_ParseJSON(engine->context, body, strlen(body), "distill-embedded.json");
+        free(body);
+        if (JS_IsException(parsed)) {
+            JS_FreeValue(engine->context, JS_GetException(engine->context));
+            continue;
+        }
+        JSValue props = embedded_property(engine, parsed, "props");
+        JSValue page_props = embedded_property(engine, props, "pageProps");
+        JSValue page_data = embedded_property(engine, page_props, "pageData");
+        JSValue data = embedded_property(engine, page_data, "data");
+        JSValue content = embedded_property(engine, data, "pageContent");
+        if (JS_IsArray(content) && embedded_route_matches(engine, page_props)) {
+            candidate.matched = true;
+            free(candidate.adapter); candidate.adapter = d_strdup("folksam-page-content");
+            free(candidate.version); candidate.version = d_strdup("1");
+            JSValue meta = embedded_property(engine, page_data, "meta");
+            const char *title_names[] = {"title", "headline", "pageTitle"};
+            free(candidate.title); candidate.title = embedded_property_string(engine, meta, title_names, sizeof(title_names) / sizeof(*title_names));
+            JS_FreeValue(engine->context, meta);
+            int64_t count = json_array_length_for_context(engine->context, content);
+            for (int64_t r = 0; r < count && candidate.nodes < DISTILL_EMBEDDED_NODES; ++r) {
+                JSValue region = JS_GetPropertyUint32(engine->context, content, (uint32_t)r);
+                embedded_map_region(engine, &candidate, region, rejected);
+                JS_FreeValue(engine->context, region);
+            }
+        }
+        JSValue menu = embedded_property(engine, page_props, "menuData");
+        if (JS_IsObject(menu)) embedded_map_navigation(engine, &candidate, menu, rejected, 0);
+        JS_FreeValue(engine->context, menu);
+        JS_FreeValue(engine->context, content); JS_FreeValue(engine->context, data);
+        JS_FreeValue(engine->context, page_data); JS_FreeValue(engine->context, page_props);
+        JS_FreeValue(engine->context, props); JS_FreeValue(engine->context, parsed);
+    }
+    free(scripts.items);
+    dbuf_puts(&candidate.blocks, "]");
+    dbuf_puts(&candidate.links, "]");
+    dbuf_puts(&candidate.media, "]");
+    dbuf_puts(&candidate.navigation, "]");
+    return candidate;
+}
+
+static char *embedded_array_take(DBuffer *buffer)
+{
+    return dbuf_take(buffer);
+}
+
+static char *merge_json_arrays(Engine *engine, const char *primary, const char *extra,
+                               const char *kind)
+{
+    JSValue left = JS_ParseJSON(engine->context, primary ? primary : "[]",
+                                primary ? strlen(primary) : 2, "distill-array-left.json");
+    JSValue right = JS_ParseJSON(engine->context, extra ? extra : "[]",
+                                 extra ? strlen(extra) : 2, "distill-array-right.json");
+    if (JS_IsException(left) || JS_IsException(right)) {
+        if (JS_IsException(left)) JS_FreeValue(engine->context, JS_GetException(engine->context));
+        if (JS_IsException(right)) JS_FreeValue(engine->context, JS_GetException(engine->context));
+        JS_FreeValue(engine->context, left); JS_FreeValue(engine->context, right);
+        return d_strdup(primary ? primary : "[]");
+    }
+    JSValue result = JS_NewArray(engine->context);
+    StringVec keys = {0};
+    int64_t out_index = 0;
+    JSValue arrays[] = {left, right};
+    for (size_t a = 0; a < 2; ++a) {
+        int64_t length = json_array_length_for_context(engine->context, arrays[a]);
+        for (int64_t i = 0; i < length; ++i) {
+            JSValue item = JS_GetPropertyUint32(engine->context, arrays[a], (uint32_t)i);
+            const char *fields = d_eq(kind, "blocks") ? "text" : d_eq(kind, "media") ? "url" : "url";
+            char *first = embedded_property_string(engine, item, &fields, 1);
+            const char *second_name = d_eq(kind, "blocks") ? "href" : d_eq(kind, "media") ? "alt" : "text";
+            JSValue second_value = embedded_property(engine, item, second_name);
+            char *second = js_string(engine->context, second_value);
+            JS_FreeValue(engine->context, second_value);
+            char *key = d_cat4(first, "\x1f", second, "");
+            if (!embedded_has_key(&keys, key)) {
+                string_vec_push(&keys, key);
+                JS_SetPropertyUint32(engine->context, result, (uint32_t)out_index++, JS_DupValue(engine->context, item));
+            } else free(key);
+            free(first); free(second); JS_FreeValue(engine->context, item);
+        }
+    }
+    JSValue serialized = JS_JSONStringify(engine->context, result, JS_UNDEFINED, JS_UNDEFINED);
+    char *out = JS_IsException(serialized) ? d_strdup(primary ? primary : "[]") : js_string(engine->context, serialized);
+    if (JS_IsException(serialized)) JS_FreeValue(engine->context, JS_GetException(engine->context));
+    JS_FreeValue(engine->context, serialized); JS_FreeValue(engine->context, result);
+    JS_FreeValue(engine->context, left); JS_FreeValue(engine->context, right);
+    string_vec_free(&keys);
+    return out;
+}
+
 static void free_readability(ReadabilityFields *fields)
 {
     free(fields->title); free(fields->byline); free(fields->dir); free(fields->lang); free(fields->content); free(fields->text_content);
@@ -1452,8 +1993,24 @@ static char *run_extraction(Engine *engine, const char *serialized)
                        main_chars >= DISTILL_MAIN_CONTENT_FLOOR &&
                        main_content_is_a_minority(root, &item));
     char *content = sanitize_content(readability.content); char *tables = table_json(root); char *search = search_json(engine, root, &rejected); char *forms = forms_json(engine, root, &rejected); char *videos = videos_json(engine, root, &rejected); char *media = media_json(engine, root, &rejected); char *links = links_json(engine, root, &rejected); char *structured = structured_data_json(engine, root);
+    EmbeddedCandidate embedded = embedded_candidate(engine, root, &rejected);
+    char *embedded_blocks = embedded_array_take(&embedded.blocks);
+    char *embedded_links = embedded_array_take(&embedded.links);
+    char *embedded_media = embedded_array_take(&embedded.media);
+    char *embedded_navigation = embedded_array_take(&embedded.navigation);
+    DBuffer dom_blocks_buffer; dbuf_init(&dom_blocks_buffer);
+    append_blocks(engine, &dom_blocks_buffer, root, main_found ? &item : NULL, &rejected);
+    char *dom_blocks = dbuf_take(&dom_blocks_buffer);
+    char *blocks = embedded.matched ? merge_json_arrays(engine, dom_blocks, embedded_blocks, "blocks") : d_strdup(dom_blocks);
+    if (embedded.matched) {
+        char *merged_links = merge_json_arrays(engine, links, embedded_links, "links");
+        char *merged_media = merge_json_arrays(engine, media, embedded_media, "media");
+        free(links); links = merged_links;
+        free(media); media = merged_media;
+    }
     const char *selected = "structured-text"; if (d_eq(shape.kind, "article")) selected = readability.ok ? "readability" : "structured-text"; else if (d_eq(shape.kind, "table")) selected = "table"; else if (d_eq(shape.kind, "search-results")) selected = "search-results"; else if (d_eq(shape.kind, "form")) selected = "form"; else if (d_eq(shape.kind, "video")) selected = "video-metadata"; else if (d_eq(shape.kind, "image-heavy")) selected = "media-reference";
     DBuffer out; dbuf_init(&out); char *page_title = document_title(root);
+    if (!*page_title && *embedded.title) { free(page_title); page_title = d_strdup(embedded.title); }
     char *qurl = json_quote(engine->source_url), *qbase = json_quote(engine->base_url), *qkind = json_quote(shape.kind), *qevidence = json_quote(shape.evidence), *qselected = json_quote(selected), *qtitle = json_quote(page_title);
     dbuf_printf(&out, "{\"schema\":1,\"url\":%s,\"base_url\":%s,\"title\":%s,\"shape\":{\"kind\":%s,\"confidence\":%.2f,\"evidence\":%s},\"extractor\":%s,\"extractor_registry\":[\"readability\",\"structured-text\",\"table\",\"search-results\",\"form\",\"video-metadata\",\"media-reference\"],\"readability\":", qurl, qbase, qtitle, qkind, shape.confidence, qevidence, qselected);
     if (!readability.ok) dbuf_puts(&out, "null"); else { char *qt = json_quote(readability.title), *qb = json_quote(readability.byline), *qd = json_quote(readability.dir), *ql = json_quote(readability.lang), *qc = json_quote(content), *qtc = json_quote(readability.text_content), *qe = json_quote(readability.excerpt), *qs = json_quote(readability.site_name), *qp = json_quote(readability.published_time); dbuf_printf(&out, "{\"title\":%s,\"byline\":%s,\"dir\":%s,\"lang\":%s,\"content\":%s,\"textContent\":%s,\"excerpt\":%s,\"siteName\":%s,\"publishedTime\":%s}", qt, readability.byline_null ? "null" : qb, readability.dir_null ? "null" : qd, readability.lang_null ? "null" : ql, qc, qtc, readability.excerpt_null ? "null" : qe, readability.site_name_null ? "null" : qs, readability.published_time_null ? "null" : qp); free(qt); free(qb); free(qd); free(ql); free(qc); free(qtc); free(qe); free(qs); free(qp); }
@@ -1465,6 +2022,14 @@ static char *run_extraction(Engine *engine, const char *serialized)
                 main_found ? "true" : "false", qsource, qprofile, qselector, qmain_title,
                 main_found ? item.nodes.length : (size_t)0, main_found ? main_blocks_json : "[]");
     free(qsource); free(qprofile); free(qselector); free(qmain_title);
-    dbuf_puts(&out, ",\"blocks\":"); append_blocks(engine, &out, root, main_found ? &item : NULL, &rejected); dbuf_printf(&out, ",\"tables\":%s,\"search_results\":%s,\"forms\":%s,\"videos\":%s,\"media\":%s,\"links\":%s,\"structured_data\":%s,\"sanitization\":{\"allowed_schemes\":[\"http\",\"https\",\"mailto\",\"tel\"],\"rejected_uris\":%zu}}", tables, search, forms, videos, media, links, structured, rejected);
-    free(qurl); free(qbase); free(qtitle); free(page_title); free(qkind); free(qevidence); free(qselected); free(content); free(tables); free(search); free(forms); free(videos); free(media); free(links); free(structured); free(shape.kind); free(shape.evidence); free(main_blocks_json); free_main_content(&item); free_main_content_profile(&profile); free_readability(&readability); lxb_html_document_destroy(document); return dbuf_take(&out);
+    char *qembedded_adapter = json_quote(embedded.adapter);
+    char *qembedded_version = json_quote(embedded.version);
+    char *qembedded_title = json_quote(embedded.title);
+    dbuf_printf(&out, ",\"blocks\":%s,\"tables\":%s,\"search_results\":%s,\"forms\":%s,\"videos\":%s,\"media\":%s,\"links\":%s,\"structured_data\":%s,\"embedded_data\":{\"detected\":%s,\"matched\":%s,\"adapter\":%s,\"version\":%s,\"title\":%s,\"unknown_components\":[", blocks, tables, search, forms, videos, media, links, structured, embedded.detected ? "true" : "false", embedded.matched ? "true" : "false", qembedded_adapter, qembedded_version, qembedded_title);
+    for (size_t i = 0; i < embedded.unknown.length; ++i) {
+        if (i) dbuf_puts(&out, ",");
+        char *quoted = json_quote(embedded.unknown.items[i]); dbuf_puts(&out, quoted); free(quoted);
+    }
+    dbuf_printf(&out, "],\"blocks\":%s,\"links\":%s,\"media\":%s,\"navigation\":%s},\"sanitization\":{\"allowed_schemes\":[\"http\",\"https\",\"mailto\",\"tel\"],\"rejected_uris\":%zu}}", embedded_blocks, embedded_links, embedded_media, embedded_navigation, rejected);
+    free(qembedded_adapter); free(qembedded_version); free(qembedded_title); free(qurl); free(qbase); free(qtitle); free(page_title); free(qkind); free(qevidence); free(qselected); free(content); free(tables); free(search); free(forms); free(videos); free(media); free(links); free(structured); free(blocks); free(dom_blocks); free(embedded_blocks); free(embedded_links); free(embedded_media); free(embedded_navigation); free(shape.kind); free(shape.evidence); free(main_blocks_json); embedded_free(&embedded); free_main_content(&item); free_main_content_profile(&profile); free_readability(&readability); lxb_html_document_destroy(document); return dbuf_take(&out);
 }

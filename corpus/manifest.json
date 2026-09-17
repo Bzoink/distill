@@ -185,6 +185,11 @@
           "stage": "dom",
           "selector": "#xhr",
           "expect": "XHR-OK"
+        },
+        {
+          "stage": "extract",
+          "path": "diagnostics.selected_source",
+          "expect": "settled-dom"
         }
       ]
     },
@@ -898,6 +903,38 @@
       "assertions": [
         {"stage": "dom", "selector": "#content", "expect": "SIGNED-OUT"},
         {"stage": "dom", "selector": "#content", "expect_absent": ["SIGNED-IN-AS-corpus", "LOGIN-REJECTED"]}
+      ]
+    },
+    {
+      "id": "34-initial-fallback",
+      "path": "34-initial-fallback.html",
+      "gate": true,
+      "plan_section": "Phase 1 extraction breadth, initial candidate fallback",
+      "exercises": ["initial-html", "failed-hydration", "candidate-selection"],
+      "why": "A client-side failure must not erase useful server-rendered content from the reader.",
+      "assertions": [
+        {"stage": "extract", "path": "diagnostics.selected_source", "expect": "initial-html"},
+        {"stage": "extract", "path": "blocks", "expect": "Server-rendered content remains readable"},
+        {"stage": "extract", "path": "links", "expect": "/preserved-destination"},
+        {"stage": "extract", "path": "blocks", "expect_absent": ["Application Error: hydration failed"]}
+      ]
+    },
+    {
+      "id": "35-folksam-embedded",
+      "path": "35-folksam-embedded.html",
+      "gate": true,
+      "plan_section": "Phase 1 extraction breadth, embedded page data",
+      "exercises": ["next-data", "folksam-adapter", "relative-urls", "embedded-diagnostics"],
+      "why": "Known page data can recover ordered content and actions without executing a framework component tree.",
+      "assertions": [
+        {"stage": "extract", "path": "embedded_data.adapter", "expect": "folksam-page-content"},
+        {"stage": "extract", "path": "embedded_data.blocks", "expect": "A mapped heading"},
+        {"stage": "extract", "path": "blocks", "expect": "/shortcut"},
+        {"stage": "extract", "path": "links", "expect": "/card"},
+        {"stage": "extract", "path": "media", "expect": "/card.jpg"},
+        {"stage": "extract", "path": "embedded_data.navigation", "expect": "/insurance"},
+        {"stage": "template", "expect": "/insurance"},
+        {"stage": "template", "expect": "/card"}
       ]
     }
   ],

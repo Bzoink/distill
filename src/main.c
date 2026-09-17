@@ -142,6 +142,7 @@ struct Engine {
     uint64_t memory_limit;
     uint64_t max_scripts;
     uint64_t scripts_run;
+    uint64_t script_errors;
     size_t async_sequence;
     size_t async_next_order;
     uint64_t next_timer;
@@ -840,6 +841,7 @@ static void value_vec_push(ValueVec *vec, JSValue value)
 static void note_exception(Engine *engine, const char *where)
 {
     if (!JS_HasException(engine->context)) return;
+    ++engine->script_errors;
     JSValue exception = JS_GetException(engine->context);
     char *message = js_string(engine->context, exception);
     fprintf(stderr, "script error [%s]: %s\n", where, message);
@@ -2011,6 +2013,163 @@ static char *run_extraction(Engine *engine, const char *serialized)
 extern int distill_litehtml_probe(const char *html);
 #endif
 
+/* A page can be useful before its scripts run and empty after a framework
+   crashes. Keep the two extraction results separate until there is enough
+   evidence to choose one. These scores are deliberately content-oriented:
+   navigation links and a document title help, but do not outweigh readable
+   blocks. */
+typedef struct {
+    long score;
+    size_t blocks;
+    size_t characters;
+    size_t links;
+    size_t media;
+    bool useful;
+    bool error_like;
+} ExtractionCandidate;
+
+static int64_t candidate_array_length(Engine *engine, JSValueConst value)
+{
+    return json_array_length_for_context(engine->context, value);
+}
+
+static char *candidate_string(Engine *engine, JSValueConst object, const char *name)
+{
+    JSValue value = JS_GetPropertyStr(engine->context, object, name);
+    char *result = JS_IsUndefined(value) || JS_IsNull(value)
+                       ? d_strdup("") : js_string(engine->context, value);
+    JS_FreeValue(engine->context, value);
+    return result;
+}
+
+static bool candidate_error_text(const char *text)
+{
+    char *lower = d_lower(text);
+    bool result = d_contains(lower, "application error") ||
+                  d_contains(lower, "something went wrong") ||
+                  d_contains(lower, "internal server error") ||
+                  d_contains(lower, "checking your browser") ||
+                  d_contains(lower, "enable javascript") ||
+                  d_contains(lower, "javascript is required") ||
+                  d_contains(lower, "page could not be loaded");
+    free(lower);
+    return result;
+}
+
+static ExtractionCandidate score_extraction(Engine *engine, const char *json)
+{
+    ExtractionCandidate score = {0};
+    JSValue parsed = JS_ParseJSON(engine->context, json ? json : "", json ? strlen(json) : 0,
+                                  "distill-candidate.json");
+    if (JS_IsException(parsed)) {
+        JS_FreeValue(engine->context, JS_GetException(engine->context));
+        return score;
+    }
+    JSValue blocks = JS_GetPropertyStr(engine->context, parsed, "blocks");
+    int64_t block_count = candidate_array_length(engine, blocks);
+    bool any_error = false;
+    for (int64_t i = 0; i < block_count; ++i) {
+        JSValue block = JS_GetPropertyUint32(engine->context, blocks, (uint32_t)i);
+        char *text = candidate_string(engine, block, "text");
+        if (*text) {
+            ++score.blocks;
+            size_t length = strlen(text);
+            if (candidate_error_text(text)) any_error = true;
+            else {
+                score.characters += length;
+                score.score += (long)length + 32;
+            }
+        }
+        free(text);
+        JS_FreeValue(engine->context, block);
+    }
+    JSValue links = JS_GetPropertyStr(engine->context, parsed, "links");
+    JSValue media = JS_GetPropertyStr(engine->context, parsed, "media");
+    score.links = (size_t)candidate_array_length(engine, links);
+    score.media = (size_t)candidate_array_length(engine, media);
+    score.score += (long)score.links * 8L + (long)score.media * 16L;
+
+    JSValue main_content = JS_GetPropertyStr(engine->context, parsed, "main_content");
+    JSValue main_blocks = JS_GetPropertyStr(engine->context, main_content, "blocks");
+    int64_t main_count = candidate_array_length(engine, main_blocks);
+    for (int64_t i = 0; i < main_count; ++i) {
+        JSValue block = JS_GetPropertyUint32(engine->context, main_blocks, (uint32_t)i);
+        char *text = candidate_string(engine, block, "text");
+        if (*text && !candidate_error_text(text)) score.score += 24;
+        free(text);
+        JS_FreeValue(engine->context, block);
+    }
+
+    JSValue readability = JS_GetPropertyStr(engine->context, parsed, "readability");
+    if (!JS_IsNull(readability) && !JS_IsUndefined(readability)) {
+        char *text = candidate_string(engine, readability, "textContent");
+        if (*text && !candidate_error_text(text)) {
+            score.characters += strlen(text);
+            score.score += (long)strlen(text) / 2L;
+        } else if (*text) {
+            any_error = true;
+        }
+        free(text);
+    }
+    score.error_like = any_error && score.characters < 240;
+    score.useful = score.characters >= 24 || score.blocks >= 2 ||
+                   score.links >= 2 || score.media >= 1;
+    JS_FreeValue(engine->context, readability);
+    JS_FreeValue(engine->context, main_blocks);
+    JS_FreeValue(engine->context, main_content);
+    JS_FreeValue(engine->context, media);
+    JS_FreeValue(engine->context, links);
+    JS_FreeValue(engine->context, blocks);
+    JS_FreeValue(engine->context, parsed);
+    return score;
+}
+
+static char *annotate_extraction(Engine *engine, const char *json, const char *source,
+                                 const char *reason, const ExtractionCandidate *initial,
+                                 const ExtractionCandidate *settled)
+{
+    JSValue parsed = JS_ParseJSON(engine->context, json ? json : "", json ? strlen(json) : 0,
+                                  "distill-selected-extraction.json");
+    if (JS_IsException(parsed)) {
+        JS_FreeValue(engine->context, JS_GetException(engine->context));
+        return d_strdup(json ? json : "");
+    }
+    JSValue diagnostics = JS_NewObject(engine->context);
+    JS_SetPropertyStr(engine->context, diagnostics, "selected_source", js_str(engine->context, source));
+    JS_SetPropertyStr(engine->context, diagnostics, "fallback", JS_NewBool(engine->context, d_eq(source, "initial-html")));
+    JS_SetPropertyStr(engine->context, diagnostics, "reason", js_str(engine->context, reason));
+    JS_SetPropertyStr(engine->context, diagnostics, "initial_score", JS_NewInt64(engine->context, initial->score));
+    JS_SetPropertyStr(engine->context, diagnostics, "settled_score", JS_NewInt64(engine->context, settled->score));
+    JS_SetPropertyStr(engine->context, diagnostics, "script_errors", JS_NewInt64(engine->context, (int64_t)engine->script_errors));
+    JS_SetPropertyStr(engine->context, diagnostics, "cap_hit", JS_NewBool(engine->context, engine->cap_hit));
+    JS_SetPropertyStr(engine->context, parsed, "diagnostics", diagnostics);
+    JSValue serialized = JS_JSONStringify(engine->context, parsed, JS_UNDEFINED, JS_UNDEFINED);
+    char *result = JS_IsException(serialized) ? d_strdup(json ? json : "") : js_string(engine->context, serialized);
+    if (JS_IsException(serialized)) JS_FreeValue(engine->context, JS_GetException(engine->context));
+    JS_FreeValue(engine->context, serialized);
+    JS_FreeValue(engine->context, parsed);
+    return result;
+}
+
+static char *select_extraction(Engine *engine, const char *initial_json,
+                               const char *settled_json)
+{
+    ExtractionCandidate initial = score_extraction(engine, initial_json);
+    ExtractionCandidate settled = score_extraction(engine, settled_json);
+    bool choose_initial = initial.useful &&
+                          (!settled.useful || settled.error_like ||
+                           initial.score > settled.score + settled.score / 4L);
+    const char *source = choose_initial ? "initial-html" : "settled-dom";
+    const char *reason = choose_initial
+        ? (!settled.useful ? "settled DOM has no useful content"
+                           : settled.error_like ? "settled DOM is an error or placeholder"
+                                                 : "initial HTML has substantially more content")
+        : (initial.useful ? "settled DOM is coherent or improves the page"
+                          : "initial HTML has no useful content");
+    const char *selected = choose_initial ? initial_json : settled_json;
+    return annotate_extraction(engine, selected, source, reason, &initial, &settled);
+}
+
 #ifdef DISTILL_RENDER
 extern int distill_litehtml_render(const char *html, const char *output_path,
                                    int width, int height, const char *font_dir);
@@ -2575,6 +2734,30 @@ static void append_json_links(Engine *engine, JSValueConst links, DBuffer *outpu
     dbuf_puts(output, "</section>");
 }
 
+static void append_json_navigation(Engine *engine, JSValueConst navigation,
+                                   DBuffer *output)
+{
+    int64_t count = json_array_length(engine, navigation);
+    if (!count) return;
+    append_section_marker(output, "navigation");
+    dbuf_puts(output, "<section id=\"navigation\" class=\"link-list\"><h2>Navigation</h2>");
+    for (int64_t i = 0; i < count; ++i) {
+        JSValue item = JS_GetPropertyUint32(engine->context, navigation, (uint32_t)i);
+        char *text = json_property_string(engine, item, "text");
+        char *url = json_property_string(engine, item, "url");
+        if (*text && *url) {
+            dbuf_puts(output, "<p><a");
+            append_json_attr(output, "href", url);
+            dbuf_puts(output, ">");
+            append_html_escaped(output, text);
+            dbuf_puts(output, "</a></p>");
+        }
+        free(text); free(url);
+        JS_FreeValue(engine->context, item);
+    }
+    dbuf_puts(output, "</section>");
+}
+
 /* The template is laid out at whatever width the surface happens to be -- the
    desktop shell re-lays it out as its window changes -- so nothing here is
    computed for one width. The column is a maximum and the side padding the
@@ -2635,6 +2818,9 @@ static char *reader_template(Engine *engine, const char *json, const char *theme
     JSValue videos = JS_GetPropertyStr(engine->context, parsed, "videos");
     JSValue media = JS_GetPropertyStr(engine->context, parsed, "media");
     JSValue links = JS_GetPropertyStr(engine->context, parsed, "links");
+    JSValue embedded_data = JS_GetPropertyStr(engine->context, parsed, "embedded_data");
+    JSValue embedded_blocks = JS_GetPropertyStr(engine->context, embedded_data, "blocks");
+    JSValue embedded_navigation = JS_GetPropertyStr(engine->context, embedded_data, "navigation");
     JSValue main_content = JS_GetPropertyStr(engine->context, parsed, "main_content");
     JSValue main_blocks = JS_GetPropertyStr(engine->context, main_content, "blocks");
     char *shape_kind = json_property_string(engine, shape, "kind");
@@ -2659,6 +2845,12 @@ static char *reader_template(Engine *engine, const char *json, const char *theme
        densest container and on a liveblog permalink returns the whole stream
        with the requested post somewhere inside it. */
     bool main_found = false;
+    bool embedded_mapped = false;
+    if (JS_IsObject(embedded_data)) {
+        JSValue matched = JS_GetPropertyStr(engine->context, embedded_data, "matched");
+        embedded_mapped = JS_ToBool(engine->context, matched);
+        JS_FreeValue(engine->context, matched);
+    }
     if (JS_IsObject(main_content)) {
         JSValue found = JS_GetPropertyStr(engine->context, main_content, "found");
         main_found = JS_ToBool(engine->context, found);
@@ -2851,6 +3043,11 @@ static char *reader_template(Engine *engine, const char *json, const char *theme
         append_json_forms(engine, forms, &output);
     } else if (d_eq(shape_kind, "article") && *content) {
         dbuf_puts(&output, content);
+        if (embedded_mapped && json_array_length(engine, embedded_blocks) > 0) {
+            dbuf_puts(&output, "<section class=\"embedded-content\">");
+            append_json_blocks(engine, embedded_blocks, &output, false);
+            dbuf_puts(&output, "</section>");
+        }
     } else if (d_eq(shape_kind, "docs")) {
         append_json_blocks(engine, blocks, &output, main_found);
     } else if (d_eq(shape_kind, "table")) {
@@ -2874,6 +3071,7 @@ static char *reader_template(Engine *engine, const char *json, const char *theme
         append_json_videos(engine, videos, &output);
         append_json_media(engine, media, &output);
     }
+    if (embedded_mapped) append_json_navigation(engine, embedded_navigation, &output);
     dbuf_puts(&output, "</main></body></html>");
     free(shape_kind);
     free(title);
@@ -2889,6 +3087,9 @@ static char *reader_template(Engine *engine, const char *json, const char *theme
     JS_FreeValue(engine->context, videos);
     JS_FreeValue(engine->context, media);
     JS_FreeValue(engine->context, links);
+    JS_FreeValue(engine->context, embedded_blocks);
+    JS_FreeValue(engine->context, embedded_navigation);
+    JS_FreeValue(engine->context, embedded_data);
     JS_FreeValue(engine->context, main_blocks);
     JS_FreeValue(engine->context, main_content);
     JS_FreeValue(engine->context, readability);
@@ -3143,7 +3344,9 @@ static bool init_network(Engine *engine, const char *session_file)
 static bool set_document_base(Engine *engine)
 {
     const char *source =
-        "(function(){var b=document.querySelector('base');return b ? (b.getAttribute('href') || '') : '';})()";
+        "(function(){var b=document.querySelector('base');if(b)return b.getAttribute('href') || '';"
+        "if(location.protocol === 'file:'){var c=document.querySelector('link[rel=canonical]');"
+        "return c ? (c.getAttribute('href') || '') : '';}return '';})()";
     JSValue value = JS_Eval(engine->context, source, strlen(source), "distill-base.js", JS_EVAL_TYPE_GLOBAL);
     if (JS_IsException(value)) { note_exception(engine, "base href"); return false; }
     char *href = js_string(engine->context, value);
@@ -3231,6 +3434,10 @@ static int run_page(const char *input, uint64_t cap_ms, uint64_t memory_mb,
         free(effective_url);
         return 2;
     }
+    /* Keep the served representation alive for the whole run. Page scripts
+       are allowed to replace the body or leave an error shell behind, and a
+       settled DOM is not a reversible snapshot of what the server sent. */
+    char *initial_html = d_strndup(html.data, html.length);
     if (effective_url && *effective_url) { free(engine.source_url); engine.source_url = effective_url; }
     else free(effective_url);
     free(engine.base_url); engine.base_url = d_strdup(engine.source_url);
@@ -3255,6 +3462,7 @@ static int run_page(const char *input, uint64_t cap_ms, uint64_t memory_mb,
         else
             fprintf(stderr, "fetched %s image, %zu bytes\n", format, html.length);
         dbuf_free(&html);
+        free(initial_html);
         engine_cleanup(&engine);
         free(owned_font_dir);
         return ok ? 0 : 2;
@@ -3269,7 +3477,7 @@ static int run_page(const char *input, uint64_t cap_ms, uint64_t memory_mb,
 
     engine.runtime = JS_NewRuntime();
     if (!engine.runtime) {
-        dbuf_free(&html); engine_cleanup(&engine);
+        dbuf_free(&html); free(initial_html); engine_cleanup(&engine);
 #ifdef DISTILL_RENDER
         free(owned_font_dir);
 #endif
@@ -3281,7 +3489,7 @@ static int run_page(const char *input, uint64_t cap_ms, uint64_t memory_mb,
     JS_SetInterruptHandler(engine.runtime, interrupt_handler, &engine);
     engine.context = JS_NewContext(engine.runtime);
     if (!engine.context) {
-        dbuf_free(&html); engine_cleanup(&engine);
+        dbuf_free(&html); free(initial_html); engine_cleanup(&engine);
 #ifdef DISTILL_RENDER
         free(owned_font_dir);
 #endif
@@ -3291,7 +3499,7 @@ static int run_page(const char *input, uint64_t cap_ms, uint64_t memory_mb,
     JS_SetModuleLoaderFunc(engine.runtime, module_normalize, module_loader, &engine);
     engine.global = JS_GetGlobalObject(engine.context);
     if (!engine.multi || !load_linkedom(&engine, &html) || !install_host(&engine)) {
-        dbuf_free(&html); engine_cleanup(&engine);
+        dbuf_free(&html); free(initial_html); engine_cleanup(&engine);
 #ifdef DISTILL_RENDER
         free(owned_font_dir);
 #endif
@@ -3299,9 +3507,13 @@ static int run_page(const char *input, uint64_t cap_ms, uint64_t memory_mb,
     }
     dbuf_free(&html);
     set_document_base(&engine);
+    bool needs_extraction = viewer_path || render_path || template_path || extract;
+    char *initial_json = needs_extraction ? run_extraction(&engine, initial_html) : NULL;
     report_progress(&engine, PROGRESS_FETCH_END, "scripts");
     if (!engine.challenge) {
         if (!discover_scripts(&engine)) {
+            free(initial_json);
+            free(initial_html);
             engine_cleanup(&engine);
 #ifdef DISTILL_RENDER
             free(owned_font_dir);
@@ -3328,10 +3540,19 @@ static int run_page(const char *input, uint64_t cap_ms, uint64_t memory_mb,
         }
     }
     int result = 0;
+    char *selected_json = NULL;
+    if (needs_extraction) {
+        char *settled_json = run_extraction(&engine, serialized);
+        selected_json = select_extraction(&engine, initial_json, settled_json);
+        free(settled_json);
+        free(initial_json);
+        initial_json = NULL;
+    }
     report_progress(&engine, PROGRESS_EXTRACT_END, "render");
     if (viewer_path) {
 #ifdef DISTILL_RENDER
-        char *json = run_extraction(&engine, serialized);
+        char *json = selected_json;
+        selected_json = NULL;
         bool saved = !save_media_path || save_media_file(&engine, json, media_index, save_media_path);
         char *template = viewer_template(&engine, json, media_index,
                                          saved ? save_media_path : NULL);
@@ -3352,7 +3573,8 @@ static int run_page(const char *input, uint64_t cap_ms, uint64_t memory_mb,
 #endif
     } else if (render_path) {
 #ifdef DISTILL_RENDER
-        char *json = run_extraction(&engine, serialized);
+        char *json = selected_json;
+        selected_json = NULL;
         char *template = reader_template(&engine, json, theme, native_forms, zoom);
         bool template_ok = !template_path || write_file_bytes(template_path, template, strlen(template));
         /* Height 0 means "as tall as the content". Measure here rather than
@@ -3380,7 +3602,8 @@ static int run_page(const char *input, uint64_t cap_ms, uint64_t memory_mb,
 #endif
     } else if (template_path) {
 #ifdef DISTILL_RENDER
-        char *json = run_extraction(&engine, serialized);
+        char *json = selected_json;
+        selected_json = NULL;
         char *template = reader_template(&engine, json, theme, native_forms, zoom);
         if (!*template || !write_file_bytes(template_path, template, strlen(template))) {
             fprintf(stderr, "unable to write reader template %s\n", template_path);
@@ -3394,7 +3617,8 @@ static int run_page(const char *input, uint64_t cap_ms, uint64_t memory_mb,
         result = 2;
 #endif
     } else if (extract) {
-        char *json = run_extraction(&engine, serialized);
+        char *json = selected_json;
+        selected_json = NULL;
         puts(json);
         free(json);
     } else if (dump_dom) {
@@ -3409,6 +3633,9 @@ static int run_page(const char *input, uint64_t cap_ms, uint64_t memory_mb,
     report_progress(&engine, 100, "done");
     fprintf(stderr, "%s scripts=%llu cap_hit=%s\n", viewer_path ? "phase2-viewer" : (render_path ? "phase2" : (extract ? "phase1" : "phase0")),
             (unsigned long long)engine.scripts_run, engine.cap_hit ? "true" : "false");
+    free(selected_json);
+    free(initial_json);
+    free(initial_html);
     free(serialized);
     engine_cleanup(&engine);
 #ifdef DISTILL_RENDER

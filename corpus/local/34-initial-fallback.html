@@ -1,0 +1,14 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>Initial HTML survives hydration failure</title>
+<main id="content">
+  <h1>Server-rendered content remains readable</h1>
+  <p>The server response contains the useful page before the application starts.</p>
+  <p>This paragraph and the destination link must survive a client-side failure.</p>
+  <p><a href="/preserved-destination">Read the preserved destination</a></p>
+</main>
+<script>
+  document.getElementById('content').innerHTML =
+    '<p>Application Error: hydration failed</p>';
+  throw new Error('synthetic hydration failure');
+</script>
