@@ -65,6 +65,24 @@ typedef struct {
     bool required;
 } DFormBox;
 
+/* One run of text as the renderer drew it: the string, the box it filled, and
+   the block it belongs to. Selection is built from these -- litehtml hands the
+   container each run already broken to a line, which is the granularity a
+   reader selects at. */
+typedef struct {
+    int x;
+    int y;
+    int width;
+    int height;
+    /* Runs sharing a block are one paragraph when copied; a change of block is
+       a line break. The id is only meaningful within one document. */
+    unsigned int block;
+    /* The block's tag, so the caller can tell a list item from a paragraph
+       without a second lookup. */
+    char block_tag[12];
+    char text[256];
+} DTextBox;
+
 /* Hit-test data for links in the rendered reader template. */
 typedef struct {
     int x;
@@ -85,6 +103,14 @@ DRenderFont *d_render_font_create(DRenderContext *context, const char *face_name
                                   unsigned int decoration, DRenderFontMetrics *metrics);
 void d_render_font_destroy(DRenderFont *font);
 int d_render_text_width(DRenderFont *font, const char *text);
+/* Where a point falls in a run, and where a character sits in it. Both answer
+   in cluster steps rather than bytes: a ligature is one place to stand and a
+   combining mark belongs to the letter it is on, so a selection can never cut
+   a character in half. Shaping is what knows the clusters, which is why these
+   live beside the shaper rather than in the shell. Both read a run in logical
+   order, which is the selection model the reader offers. */
+size_t d_render_text_offset_at(DRenderFont *font, const char *text, int x);
+int d_render_text_x_at(DRenderFont *font, const char *text, size_t offset);
 size_t d_render_wrap_text(DRenderFont *font, const char *text, int max_width,
                           DRenderTextLine *lines, size_t line_capacity);
 void d_render_draw_text(DRenderContext *context, const char *text, DRenderFont *font,
@@ -133,6 +159,19 @@ int distill_litehtml_document_choice_id_at(DLiteHtmlDocument *document, int x, i
 
 size_t distill_litehtml_document_link_boxes(const DLiteHtmlDocument *document,
                                             DLinkBox *boxes, size_t box_capacity);
+
+/* The text runs of the whole document, in the order they were drawn, which
+   for a reader page in normal flow is reading order. Collected once when the
+   document is laid out: the shell paints in bands, and a selection that could
+   only reach painted text would stop at the edge of the screen. */
+size_t distill_litehtml_document_text_boxes(DLiteHtmlDocument *document,
+                                            DTextBox *boxes, size_t box_capacity);
+/* Byte offset in run `index` for a point `x` pixels into its box. */
+size_t distill_litehtml_document_text_offset_at(DLiteHtmlDocument *document,
+                                                size_t index, int x);
+/* The x offset, within run `index`'s box, of the boundary at byte `offset`. */
+int distill_litehtml_document_text_x_at(DLiteHtmlDocument *document,
+                                        size_t index, size_t offset);
 
 /* One-shot region rendering for callers that do not need to retain a
    document between paints. */

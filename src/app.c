@@ -50,6 +50,10 @@ enum {
     RENDER_OVERSCAN = 200,
     MAX_FORM_BOXES = 512,
     MAX_LINK_BOXES = 2048,
+    MAX_TEXT_BOXES = 16384,
+    /* A press that moves less than this is a click, not a drag. Without it a
+       link could not be activated without selecting a character of it. */
+    DRAG_THRESHOLD_PX = 3,
     /* Long enough to keep a host and a file name, short enough to fit the
        column: litehtml breaks neither on overflow-wrap nor on word-break, so
        a URL that does not fit simply runs off the edge of the page. */
@@ -139,6 +143,14 @@ typedef struct {
     GtkWidget *widget;
 } FormControl;
 
+/* A place in the page's text: which run, and how far into it. Runs arrive in
+   the order they were drawn, which for a reader page in normal flow is reading
+   order, so comparing two places is comparing this pair. */
+typedef struct {
+    size_t run;
+    size_t offset;
+} TextPoint;
+
 /* What the engine has said so far about the run in flight. The load happens
    on a worker thread and the status line belongs to the main one, so the two
    meet here instead of reaching into each other: the worker writes what the
@@ -207,6 +219,16 @@ struct App {
     size_t control_count;
     DLinkBox *link_boxes;
     size_t link_count;
+    DTextBox *text_boxes;
+    size_t text_count;
+    bool text_collected;
+    TextPoint selection_anchor;
+    TextPoint selection_focus;
+    bool has_selection;
+    bool selecting;
+    bool dragged;
+    double press_x;
+    double press_y;
     DAppHistory history;
     /* The images this page offers, in document order, captured while the page
        document exists -- viewer mode replaces that document, so the list has
@@ -1066,6 +1088,217 @@ static int section_index_for_id(const char *id)
     return -1;
 }
 
+/* Collected when the reader first reaches for text, not when the page is
+   built: scrolling through a page nobody selects should not pay for a pass
+   over every line of it. */
+static void ensure_text_boxes(App *app)
+{
+    if (app->text_collected || !app->document) return;
+    app->text_collected = true;
+    size_t count = distill_litehtml_document_text_boxes(app->document, NULL, 0);
+    if (count > MAX_TEXT_BOXES) count = MAX_TEXT_BOXES;
+    if (!count) return;
+    app->text_boxes = g_new0(DTextBox, count);
+    app->text_count = count;
+    distill_litehtml_document_text_boxes(app->document, app->text_boxes, count);
+}
+
+static void clear_selection(App *app)
+{
+    if (!app->has_selection) return;
+    app->has_selection = false;
+    if (app->drawing_area) gtk_widget_queue_draw(app->drawing_area);
+}
+
+static int text_point_compare(TextPoint a, TextPoint b)
+{
+    if (a.run != b.run) return a.run < b.run ? -1 : 1;
+    if (a.offset != b.offset) return a.offset < b.offset ? -1 : 1;
+    return 0;
+}
+
+static void selection_range(const App *app, TextPoint *start, TextPoint *end)
+{
+    if (text_point_compare(app->selection_anchor, app->selection_focus) <= 0) {
+        *start = app->selection_anchor;
+        *end = app->selection_focus;
+    } else {
+        *start = app->selection_focus;
+        *end = app->selection_anchor;
+    }
+}
+
+/* The nearest run to a point, not the one under it: a drag that wanders into
+   the margin or past the last line should keep selecting rather than stop
+   dead. Vertical distance dominates, because which line the pointer is on
+   matters more than how far along it the pointer has got. */
+static size_t nearest_text_run(const App *app, double x, double y)
+{
+    size_t best = 0;
+    long best_distance = LONG_MAX;
+    for (size_t i = 0; i < app->text_count; ++i) {
+        const DTextBox *box = &app->text_boxes[i];
+        long dy = 0;
+        if (y < box->y) dy = (long)(box->y - y);
+        else if (y > box->y + box->height) dy = (long)(y - (box->y + box->height));
+        long dx = 0;
+        if (x < box->x) dx = (long)(box->x - x);
+        else if (x > box->x + box->width) dx = (long)(x - (box->x + box->width));
+        long distance = dy * 4096 + dx;
+        if (distance < best_distance) {
+            best_distance = distance;
+            best = i;
+        }
+    }
+    return best;
+}
+
+static bool text_point_at(App *app, double x, double y, TextPoint *point)
+{
+    ensure_text_boxes(app);
+    if (!app->text_count) return false;
+    size_t best = nearest_text_run(app, x, y);
+    point->run = best;
+    point->offset = distill_litehtml_document_text_offset_at(
+        app->document, best, (int)(x - app->text_boxes[best].x));
+    return true;
+}
+
+static size_t run_text_length(const App *app, size_t run)
+{
+    return run < app->text_count ? strlen(app->text_boxes[run].text) : 0;
+}
+
+/* Word boundaries the Latin way: runs of letters and digits, everything else
+   a separator. The reader's own scripts are covered, and a script that does
+   not put spaces between words is not served by any rule this simple -- there
+   a double click selects the run it landed in. */
+static bool word_character(unsigned char c)
+{
+    return g_ascii_isalnum(c) || c >= 0x80 || c == '\'' || c == '_';
+}
+
+static void select_word_at(App *app, TextPoint point)
+{
+    const char *text = app->text_boxes[point.run].text;
+    size_t length = strlen(text);
+    size_t start = point.offset > length ? length : point.offset;
+    size_t end = start;
+    while (start > 0 && word_character((unsigned char)text[start - 1])) --start;
+    while (end < length && word_character((unsigned char)text[end])) ++end;
+    if (start == end) {
+        start = 0;
+        end = length;
+    }
+    app->selection_anchor = (TextPoint){point.run, start};
+    app->selection_focus = (TextPoint){point.run, end};
+    app->has_selection = true;
+}
+
+/* A triple click takes the block, which is the paragraph or list item the
+   layout put the run in -- the same identity that decides where a copied
+   selection breaks its lines. */
+static void select_block_at(App *app, TextPoint point)
+{
+    unsigned int block = app->text_boxes[point.run].block;
+    size_t first = point.run, last = point.run;
+    while (first > 0 && app->text_boxes[first - 1].block == block) --first;
+    while (last + 1 < app->text_count && app->text_boxes[last + 1].block == block) ++last;
+    app->selection_anchor = (TextPoint){first, 0};
+    app->selection_focus = (TextPoint){last, run_text_length(app, last)};
+    app->has_selection = true;
+}
+
+static void select_all_text(App *app)
+{
+    ensure_text_boxes(app);
+    if (!app->text_count) return;
+    app->selection_anchor = (TextPoint){0, 0};
+    app->selection_focus = (TextPoint){app->text_count - 1,
+                                       run_text_length(app, app->text_count - 1)};
+    app->has_selection = true;
+    gtk_widget_queue_draw(app->drawing_area);
+}
+
+/* The selected text, assembled from the runs it covers. Runs of one block are
+   one paragraph: a line that wrapped is joined with a space, because that
+   break was the layout's decision rather than the writer's. A change of block
+   is a real break -- one newline for a list item, a blank line between
+   paragraphs, which is what pasting somewhere else should look like. */
+static char *selection_text(const App *app)
+{
+    if (!app->has_selection || !app->text_count) return g_strdup("");
+    TextPoint start, end;
+    selection_range(app, &start, &end);
+    GString *out = g_string_new(NULL);
+    for (size_t i = start.run; i <= end.run && i < app->text_count; ++i) {
+        const DTextBox *box = &app->text_boxes[i];
+        size_t length = strlen(box->text);
+        size_t from = i == start.run ? start.offset : 0;
+        size_t to = i == end.run ? end.offset : length;
+        if (from > length) from = length;
+        if (to > length) to = length;
+        if (i > start.run) {
+            const DTextBox *previous = &app->text_boxes[i - 1];
+            bool spaced = out->len && out->str[out->len - 1] == ' ';
+            if (box->block != previous->block)
+                g_string_append(out, strcmp(box->block_tag, "li") == 0 ? "\n" : "\n\n");
+            else if (!spaced && (box->y != previous->y ||
+                                 box->x > previous->x + previous->width))
+                g_string_append_c(out, ' ');
+        }
+        if (to > from) g_string_append_len(out, box->text + from, (gssize)(to - from));
+    }
+    return g_string_free(out, FALSE);
+}
+
+static void copy_selection(App *app, bool primary)
+{
+    char *text = selection_text(app);
+    if (!text || !*text) {
+        g_free(text);
+        return;
+    }
+    GdkAtom target = primary ? GDK_SELECTION_PRIMARY : GDK_SELECTION_CLIPBOARD;
+    gtk_clipboard_set_text(gtk_clipboard_get(target), text, -1);
+    if (!primary) {
+        long characters = g_utf8_strlen(text, -1);
+        char *message = g_strdup_printf("Copied %ld characters", characters);
+        set_status(app, message);
+        g_free(message);
+    }
+    g_free(text);
+}
+
+/* The highlight is painted over the finished surface rather than into it: the
+   text is already drawn, so a wash is what there is room for, and a drag costs
+   a repaint of the band instead of a re-render of the page. The tint follows
+   the theme, because the same wash cannot stay readable on a cream page and on
+   a dark one. */
+static void draw_selection(App *app, cairo_t *cairo)
+{
+    if (!app->has_selection || !app->text_count || !app->document) return;
+    TextPoint start, end;
+    selection_range(app, &start, &end);
+    if (text_point_compare(start, end) == 0) return;
+    const char *theme = active_theme_id(app);
+    if (strcmp(theme, "night") == 0) cairo_set_source_rgba(cairo, 0.47, 0.73, 0.81, 0.32);
+    else if (strcmp(theme, "paper") == 0) cairo_set_source_rgba(cairo, 0.47, 0.33, 0.23, 0.26);
+    else cairo_set_source_rgba(cairo, 0.09, 0.36, 0.48, 0.24);
+    for (size_t i = start.run; i <= end.run && i < app->text_count; ++i) {
+        const DTextBox *box = &app->text_boxes[i];
+        int from = 0;
+        int to = box->width;
+        if (i == start.run)
+            from = distill_litehtml_document_text_x_at(app->document, i, start.offset);
+        if (i == end.run)
+            to = distill_litehtml_document_text_x_at(app->document, i, end.offset);
+        if (to <= from) continue;
+        cairo_rectangle(cairo, box->x + from, box->y, to - from, box->height);
+    }
+    cairo_fill(cairo);
+}
+
 static gboolean draw_page(GtkWidget *widget, cairo_t *cairo, gpointer opaque)
 {
     App *app = opaque;
@@ -1076,6 +1309,7 @@ static gboolean draw_page(GtkWidget *widget, cairo_t *cairo, gpointer opaque)
     if (app->surface && cairo_surface_status(app->surface) == CAIRO_STATUS_SUCCESS) {
         cairo_set_source_surface(cairo, app->surface, 0, app->surface_top);
         cairo_paint(cairo);
+        draw_selection(app, cairo);
     } else {
         cairo_set_source_rgb(cairo, 0.82, 0.79, 0.73);
         cairo_select_font_face(cairo, "sans", CAIRO_FONT_SLANT_NORMAL, CAIRO_FONT_WEIGHT_NORMAL);
@@ -1173,15 +1407,34 @@ static gboolean activate_link_at(App *app, double x, double y)
     return TRUE;
 }
 
-static void set_link_cursor(GtkWidget *widget, bool link)
+static void set_cursor_shape(GtkWidget *widget, GdkCursorType shape)
 {
     GdkWindow *window = gtk_widget_get_window(widget);
     if (!window) return;
-    GdkCursor *cursor = gdk_cursor_new_for_display(
-        gdk_window_get_display(window), link ? GDK_HAND2 : GDK_LEFT_PTR);
+    GdkCursor *cursor = gdk_cursor_new_for_display(gdk_window_get_display(window), shape);
     if (!cursor) return;
     gdk_window_set_cursor(window, cursor);
     g_object_unref(cursor);
+}
+
+static bool text_present_at(App *app, double x, double y)
+{
+    ensure_text_boxes(app);
+    for (size_t i = 0; i < app->text_count; ++i) {
+        const DTextBox *box = &app->text_boxes[i];
+        if (x >= box->x && x <= box->x + box->width &&
+            y >= box->y && y <= box->y + box->height) return true;
+    }
+    return false;
+}
+
+/* The pointer says what the surface will do with it: a hand over a link, a
+   beam over text that can be selected, an arrow over the rest. */
+static void set_reader_cursor(App *app, GtkWidget *widget, double x, double y)
+{
+    if (link_present_at(app, x, y)) set_cursor_shape(widget, GDK_HAND2);
+    else if (text_present_at(app, x, y)) set_cursor_shape(widget, GDK_XTERM);
+    else set_cursor_shape(widget, GDK_LEFT_PTR);
 }
 
 /* Activating a media link is the only thing that fetches an image, so the
@@ -1502,6 +1755,25 @@ static gboolean window_key_press(GtkWidget *widget, GdkEventKey *event, gpointer
     GdkModifierType control = event->state & gtk_accelerator_get_default_mod_mask();
     /* Zoom works in viewer mode too: it is a reader setting, and leaving the
        image to change it and coming back is not a way to read. */
+    /* A focused entry keeps its own copy and select-all: the reader's are for
+       the page, not for whatever the caret happens to be in. */
+    GtkWidget *focus = gtk_window_get_focus(GTK_WINDOW(app->window));
+    bool editing = focus && (GTK_IS_ENTRY(focus) || GTK_IS_TEXT_VIEW(focus));
+    if (control == GDK_CONTROL_MASK && !editing && !app->viewer_active) {
+        switch (event->keyval) {
+            case GDK_KEY_c:
+            case GDK_KEY_C:
+                if (!app->has_selection) return FALSE;
+                copy_selection(app, false);
+                return TRUE;
+            case GDK_KEY_a:
+            case GDK_KEY_A:
+                select_all_text(app);
+                return TRUE;
+            default:
+                break;
+        }
+    }
     if (control == GDK_CONTROL_MASK) {
         switch (event->keyval) {
             case GDK_KEY_plus:
@@ -1523,6 +1795,10 @@ static gboolean window_key_press(GtkWidget *widget, GdkEventKey *event, gpointer
         }
     }
     if (!app->viewer_active) {
+        if (event->keyval == GDK_KEY_Escape && app->has_selection && !editing) {
+            clear_selection(app);
+            return TRUE;
+        }
         GdkModifierType modifiers = event->state & gtk_accelerator_get_default_mod_mask();
         if (modifiers == GDK_MOD1_MASK) {
             int index = section_index_for_key(event->keyval);
@@ -1601,37 +1877,113 @@ static void open_link(App *app, const char *uri)
 
 static bool activate_choice_at(App *app, int x, int y);
 
-static gboolean page_button_press(GtkWidget *widget, GdkEventButton *event, gpointer opaque)
+/* A press no longer activates anything: it may be the start of a drag across
+   the text. What it was is known on release, which is also where a browser
+   decides -- press, move, release without moving is a click. */
+static gboolean reader_button_press(App *app, GtkWidget *widget, GdkEventButton *event)
 {
-    App *app = opaque;
-    if (event->type != GDK_BUTTON_PRESS || event->button != 1) return FALSE;
+    if (event->button != 1) return FALSE;
+    int y = document_y(app, widget, event->y);
+    if (event->type == GDK_2BUTTON_PRESS || event->type == GDK_3BUTTON_PRESS) {
+        TextPoint point;
+        if (!text_point_at(app, event->x, y, &point)) return FALSE;
+        if (event->type == GDK_2BUTTON_PRESS) select_word_at(app, point);
+        else select_block_at(app, point);
+        app->selecting = false;
+        copy_selection(app, true);
+        gtk_widget_queue_draw(app->drawing_area);
+        return TRUE;
+    }
+    if (event->type != GDK_BUTTON_PRESS) return FALSE;
+    /* Clicking the page gives the page the keys. Without this the
+       address bar keeps them after a click on the text, and Ctrl+C
+       copies whatever is in the entry rather than what is selected. A
+       form control is its own widget and takes focus for itself. */
+    if (app->event_box && !gtk_widget_has_focus(app->event_box))
+        gtk_widget_grab_focus(app->event_box);
+    clear_selection(app);
+    app->press_x = event->x;
+    app->press_y = y;
+    app->dragged = false;
+    app->selecting = true;
+    TextPoint point;
+    if (text_point_at(app, event->x, y, &point)) {
+        app->selection_anchor = point;
+        app->selection_focus = point;
+    }
+    return FALSE;
+}
+
+static gboolean reader_button_release(App *app, GtkWidget *widget, GdkEventButton *event)
+{
+    if (event->button != 1) return FALSE;
+    bool dragged = app->dragged;
+    app->selecting = false;
+    app->dragged = false;
+    if (dragged) {
+        /* The X11 convention: a finished selection is available to a middle
+           click without anyone having asked for a copy. */
+        copy_selection(app, true);
+        return TRUE;
+    }
     int y = document_y(app, widget, event->y);
     return activate_choice_at(app, event->x, y) || activate_link_at(app, event->x, y);
+}
+
+static gboolean reader_motion(App *app, GtkWidget *widget, GdkEventMotion *event)
+{
+    int y = document_y(app, widget, event->y);
+    if (app->selecting && (event->state & GDK_BUTTON1_MASK)) {
+        if (!app->dragged &&
+            (ABS(event->x - app->press_x) > DRAG_THRESHOLD_PX ||
+             ABS(y - app->press_y) > DRAG_THRESHOLD_PX))
+            app->dragged = true;
+        if (app->dragged) {
+            TextPoint point;
+            if (text_point_at(app, event->x, y, &point)) {
+                app->selection_focus = point;
+                app->has_selection = true;
+                gtk_widget_queue_draw(app->drawing_area);
+            }
+            return TRUE;
+        }
+    }
+    set_reader_cursor(app, widget, event->x, y);
+    return TRUE;
+}
+
+static gboolean page_button_press(GtkWidget *widget, GdkEventButton *event, gpointer opaque)
+{
+    return reader_button_press(opaque, widget, event);
+}
+
+static gboolean page_button_release(GtkWidget *widget, GdkEventButton *event, gpointer opaque)
+{
+    return reader_button_release(opaque, widget, event);
 }
 
 static gboolean page_motion_notify(GtkWidget *widget, GdkEventMotion *event,
                                    gpointer opaque)
 {
-    App *app = opaque;
-    set_link_cursor(widget, link_present_at(app, event->x, document_y(app, widget, event->y)));
-    return TRUE;
+    return reader_motion(opaque, widget, event);
 }
 
 static gboolean overlay_button_press(GtkWidget *widget, GdkEventButton *event,
                                      gpointer opaque)
 {
-    App *app = opaque;
-    if (event->type != GDK_BUTTON_PRESS || event->button != 1) return FALSE;
-    int y = document_y(app, widget, event->y);
-    return activate_choice_at(app, event->x, y) || activate_link_at(app, event->x, y);
+    return reader_button_press(opaque, widget, event);
+}
+
+static gboolean overlay_button_release(GtkWidget *widget, GdkEventButton *event,
+                                       gpointer opaque)
+{
+    return reader_button_release(opaque, widget, event);
 }
 
 static gboolean overlay_motion_notify(GtkWidget *widget, GdkEventMotion *event,
                                       gpointer opaque)
 {
-    App *app = opaque;
-    set_link_cursor(widget, link_present_at(app, event->x, document_y(app, widget, event->y)));
-    return FALSE;
+    return reader_motion(opaque, widget, event);
 }
 
 static bool is_hidden(const DFormBox *box)
@@ -2018,6 +2370,14 @@ static void build_document(App *app, const char *template)
     app->surface = NULL;
     app->surface_top = 0;
     clear_controls(app);
+    /* The runs belong to the document that is being replaced, and so does
+       anything selected in them. */
+    g_free(app->text_boxes);
+    app->text_boxes = NULL;
+    app->text_count = 0;
+    app->text_collected = false;
+    app->has_selection = false;
+    app->selecting = false;
     int page_height = PAGE_HEIGHT;
     int page_width = reader_page_width(app);
 
@@ -2499,6 +2859,9 @@ static void app_destroy(GtkWidget *widget, gpointer opaque)
     app->document = NULL;
     app->surface = NULL;
     clear_controls(app);
+    g_free(app->text_boxes);
+    app->text_boxes = NULL;
+    app->text_count = 0;
     if (app->form_css_provider) {
         GdkScreen *screen = gtk_widget_get_screen(app->window);
         if (screen)
@@ -2574,8 +2937,9 @@ static void app_activate(GtkApplication *application, gpointer opaque)
     gtk_style_context_add_class(gtk_widget_get_style_context(scrolled), "distill-desk");
     gtk_box_pack_start(GTK_BOX(root), scrolled, TRUE, TRUE, 0);
     GtkWidget *overlay = gtk_overlay_new();
-    gtk_widget_add_events(overlay, GDK_BUTTON_PRESS_MASK | GDK_POINTER_MOTION_MASK |
-                          GDK_LEAVE_NOTIFY_MASK);
+    gtk_widget_add_events(overlay, GDK_BUTTON_PRESS_MASK | GDK_BUTTON_RELEASE_MASK |
+                          GDK_POINTER_MOTION_MASK | GDK_LEAVE_NOTIFY_MASK);
+    g_signal_connect(overlay, "button-release-event", G_CALLBACK(overlay_button_release), app);
     g_signal_connect(overlay, "button-press-event", G_CALLBACK(overlay_button_press), app);
     g_signal_connect(overlay, "motion-notify-event", G_CALLBACK(overlay_motion_notify), app);
     gtk_container_add(GTK_CONTAINER(scrolled), overlay);
@@ -2587,8 +2951,9 @@ static void app_activate(GtkApplication *application, gpointer opaque)
     gtk_event_box_set_visible_window(GTK_EVENT_BOX(app->event_box), FALSE);
     gtk_event_box_set_above_child(GTK_EVENT_BOX(app->event_box), TRUE);
     gtk_widget_set_halign(app->event_box, GTK_ALIGN_CENTER);
-    gtk_widget_add_events(app->event_box, GDK_BUTTON_PRESS_MASK | GDK_POINTER_MOTION_MASK |
-                          GDK_LEAVE_NOTIFY_MASK);
+    gtk_widget_add_events(app->event_box, GDK_BUTTON_PRESS_MASK | GDK_BUTTON_RELEASE_MASK |
+                          GDK_POINTER_MOTION_MASK | GDK_LEAVE_NOTIFY_MASK);
+    g_signal_connect(app->event_box, "button-release-event", G_CALLBACK(page_button_release), app);
     g_signal_connect(app->event_box, "button-press-event", G_CALLBACK(page_button_press), app);
     g_signal_connect(app->event_box, "motion-notify-event", G_CALLBACK(page_motion_notify), app);
     app->drawing_area = gtk_drawing_area_new();
@@ -3077,6 +3442,66 @@ static bool run_progress_self_test(void)
     return ok;
 }
 
+/* What a selection turns into is the whole point of the feature: the runs are
+   what the layout drew, and the reader wanted the text back. The joins are
+   what this checks -- a wrapped line is not a new line, a new paragraph is. */
+static bool run_selection_self_test(void)
+{
+    bool ok = true;
+    DTextBox boxes[5] = {
+        /* One paragraph over two lines, then a second paragraph, then two
+           list items, laid out the way litehtml hands them over. */
+        {.x = 0, .y = 0, .width = 200, .height = 20, .block = 1, .block_tag = "p",
+         .text = "The harbour was quiet"},
+        {.x = 0, .y = 20, .width = 200, .height = 20, .block = 1, .block_tag = "p",
+         .text = "that morning"},
+        {.x = 0, .y = 60, .width = 200, .height = 20, .block = 2, .block_tag = "p",
+         .text = "The tugs were tied up"},
+        {.x = 0, .y = 100, .width = 200, .height = 20, .block = 3, .block_tag = "li",
+         .text = "First item"},
+        {.x = 0, .y = 120, .width = 200, .height = 20, .block = 4, .block_tag = "li",
+         .text = "Second item"}
+    };
+    App app = {0};
+    app.text_boxes = boxes;
+    app.text_count = sizeof boxes / sizeof boxes[0];
+    app.has_selection = true;
+    app.selection_anchor = (TextPoint){0, 0};
+    app.selection_focus = (TextPoint){4, strlen(boxes[4].text)};
+    char *text = selection_text(&app);
+    const char *expected =
+        "The harbour was quiet that morning\n\n"
+        "The tugs were tied up\n"
+        "First item\n"
+        "Second item";
+    if (strcmp(text, expected) != 0) {
+        fprintf(stderr, "selection: joined as \"%s\"\n", text);
+        ok = false;
+    }
+    g_free(text);
+
+    /* Backwards is the same selection: a drag that ends above where it began
+       selects what lies between, not nothing. */
+    app.selection_anchor = (TextPoint){1, 4};
+    app.selection_focus = (TextPoint){0, 4};
+    text = selection_text(&app);
+    if (strcmp(text, "harbour was quiet that") != 0) {
+        fprintf(stderr, "selection: dragged backwards gave \"%s\"\n", text);
+        ok = false;
+    }
+    g_free(text);
+
+    /* A point outside the text belongs to the nearest line rather than to
+       nothing, or a drag into the margin would stop selecting. */
+    if (nearest_text_run(&app, 400, 22) != 1 ||
+        nearest_text_run(&app, -50, 105) != 3 ||
+        nearest_text_run(&app, 10, 9000) != 4) {
+        fprintf(stderr, "selection: a point off the text found the wrong line\n");
+        ok = false;
+    }
+    return ok;
+}
+
 static int run_state_self_test(void)
 {
     DAppHistory history;
@@ -3091,6 +3516,7 @@ static int run_state_self_test(void)
     ok = run_zoom_self_test() && ok;
     ok = run_width_self_test() && ok;
     ok = run_progress_self_test() && ok;
+    ok = run_selection_self_test() && ok;
     ok = run_coordinate_self_test() && ok;
     ok = run_address_bar_self_test() && ok;
     ok = run_redirect_self_test() && ok;

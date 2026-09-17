@@ -418,7 +418,13 @@ and the shell reads the pipe as the run happens rather than waiting for it to
 end. The phases -- fetch, scripts, extract, render -- are what is measured;
 the percentage is their weighting, with the fetch band following the bytes
 when the server declares a length and the script band following the settle
-budget it cannot exceed. A reading-list toggle keeps URLs for the session. `distill-app-state` and `distill-litehtml-geometry` CTest
+budget it cannot exceed. Text can be selected and copied: the rendering
+boundary hands the shell the runs litehtml drew, with the box each filled and
+the block it came from, and the shaper answers where a character sits inside a
+run in cluster steps, so a selection never lands inside a letter. Selection is
+logical-order by design -- visual-order highlighting for bidirectional text is
+out of scope, and RTL pages still copy correct text. A reading-list toggle
+keeps URLs for the session. `distill-app-state` and `distill-litehtml-geometry` CTest
 contracts cover history truncation/replacement and native-control geometry,
 while `corpus/check.py --app` covers the display-free shell model. Phase 4 can
 now widen the interaction and binding surface from evidence.

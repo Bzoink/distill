@@ -76,6 +76,19 @@ size. Ctrl+plus and Ctrl+minus step through the levels the menu offers and
 Ctrl+0 returns to 100%; `--self-test` covers the stepping and the fallback for
 a saved level the menu no longer has.
 
+Text selection is drag, double-click for a word, triple-click for a block,
+Ctrl+A for the page, Ctrl+C to copy, and Escape to clear; a finished drag also
+goes to the X11 primary selection. The runs come from the renderer -- litehtml
+hands its container one per line with the box it filled -- and are collected
+over the whole document rather than the painted band, so a selection reaches
+text that has never been on screen. Where a character sits inside a run is a
+shaping question, answered in cluster steps, which is what keeps a boundary
+from landing inside an "fi" ligature or between the two bytes of an "o".
+Copying rejoins what the layout broke: runs of one block become one paragraph,
+a change of block is a line break. `distill-litehtml-geometry` gates the runs,
+the cluster round-trip and that collecting text leaves link hit-testing alone;
+`--self-test` gates what a selection turns into.
+
 A load reports itself: `distill --progress` writes one `progress PERCENT PHASE`
 line per step to stdout, and the shell spawns the engine with pipes so those
 records arrive while the run is still going, turning into a spinner and a

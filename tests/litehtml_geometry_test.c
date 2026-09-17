@@ -265,6 +265,100 @@ int main(void)
     assert(found_gap);
     distill_litehtml_document_destroy(link_document);
 
+    /* Text runs are what a selection is built from. The container is handed
+       one per line with the box it filled, and nothing else in the boundary
+       can answer where a character sits -- the shell has no layout of its own
+       and no access to the fonts litehtml chose. */
+    const char *text_page =
+        "<!doctype html><style>html,body{margin:0}body{font-size:18px;width:420px}"
+        "p{margin:0 0 20px}li{margin:0}</style>"
+        "<main><p>The harbour was quiet that morning and the tugs were still tied "
+        "up against the wall, waiting for the tide to turn at noon.</p>"
+        "<ul><li>First item</li><li>Second item</li></ul>"
+        "<p>Sm\xc3\xb6rg\xc3\xa5sbord</p></main>";
+    DLiteHtmlDocument *text_document =
+        distill_litehtml_document_create(text_page, 420, 800, DISTILL_TEST_FONT_DIR);
+    assert(text_document);
+    size_t run_count = distill_litehtml_document_text_boxes(text_document, NULL, 0);
+    /* The first paragraph alone wraps, so anything that collected one run per
+       block -- or only what fits the painted band -- fails here. */
+    assert(run_count >= 5);
+    DTextBox *runs = calloc(run_count, sizeof(*runs));
+    assert(runs);
+    assert(distill_litehtml_document_text_boxes(text_document, runs, run_count) == run_count);
+
+    bool saw_paragraph = false, saw_list_item = false, saw_swedish = false;
+    unsigned int first_block = runs[0].block;
+    unsigned int other_block = 0;
+    for (size_t i = 0; i < run_count; ++i) {
+        assert(runs[i].width > 0 && runs[i].height > 0);
+        assert(runs[i].text[0]);
+        if (!strcmp(runs[i].block_tag, "p")) saw_paragraph = true;
+        if (!strcmp(runs[i].block_tag, "li")) saw_list_item = true;
+        if (strstr(runs[i].text, "Sm\xc3\xb6rg\xc3\xa5sbord")) saw_swedish = true;
+        if (runs[i].block != first_block) other_block = runs[i].block;
+    }
+    /* A block per paragraph and per list item: copying a wrapped line is one
+       paragraph, copying two list items is two lines, and only the block
+       identity distinguishes them -- the geometry is the same. */
+    assert(saw_paragraph && saw_list_item && saw_swedish);
+    assert(other_block != 0);
+
+    /* Wrapped lines of one paragraph share a block; the run below them does
+       not. Both directions matter: a selection joins the first pair and breaks
+       at the second. */
+    size_t wrapped = 0;
+    while (wrapped + 1 < run_count && runs[wrapped + 1].block == runs[0].block) ++wrapped;
+    assert(wrapped >= 1);
+    assert(runs[wrapped].y > runs[0].y);
+
+    /* Every character boundary must map to an x and back to itself: this is
+       what stops a selection from landing inside a character. The Swedish run
+       is here for that reason -- \xc3\xb6 is two bytes, and byte arithmetic
+       would put a boundary between them. */
+    for (size_t i = 0; i < run_count; ++i) {
+        size_t length = strlen(runs[i].text);
+        for (size_t offset = 0; offset <= length; ++offset) {
+            if (offset < length && (runs[i].text[offset] & 0xC0) == 0x80) continue;
+            int x = distill_litehtml_document_text_x_at(text_document, i, offset);
+            size_t back = distill_litehtml_document_text_offset_at(text_document, i, x);
+            assert(back == offset);
+        }
+        assert(distill_litehtml_document_text_offset_at(text_document, i, -5) == 0);
+        assert(distill_litehtml_document_text_offset_at(text_document, i, 100000) == length);
+    }
+    free(runs);
+    distill_litehtml_document_destroy(text_document);
+
+    /* Collecting the text must leave the document as it found it. Both passes
+       ask litehtml what is under a point, and the collecting one asks it a
+       thousand times in a row; a link that stops answering afterwards is a
+       page whose links stop working the moment a reader selects a word. */
+    const char *mixed_page =
+        "<!doctype html><style>body{font-size:18px}</style>"
+        "<main><p>Prose before <a href=\"https://example.test/inline\">a link inside "
+        "a sentence</a> and prose after.</p></main>";
+    DLiteHtmlDocument *mixed = distill_litehtml_document_create(mixed_page, 760, 800,
+                                                               DISTILL_TEST_FONT_DIR);
+    assert(mixed);
+    int hits_before = 0, hits_after = 0;
+    for (int y = 0; y < 200; y += 3)
+        for (int x = 4; x < 700; x += 7) {
+            char href[512] = {0};
+            if (distill_litehtml_document_link_at(mixed, x, y, href, sizeof(href)))
+                ++hits_before;
+        }
+    assert(hits_before > 0);
+    assert(distill_litehtml_document_text_boxes(mixed, NULL, 0) > 0);
+    for (int y = 0; y < 200; y += 3)
+        for (int x = 4; x < 700; x += 7) {
+            char href[512] = {0};
+            if (distill_litehtml_document_link_at(mixed, x, y, href, sizeof(href)))
+                ++hits_after;
+        }
+    assert(hits_after == hits_before);
+    distill_litehtml_document_destroy(mixed);
+
     /* Section markers are intentionally empty, but their one-pixel layout box
        is what lets the desktop shell locate the section without a second
        layout implementation. */

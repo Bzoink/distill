@@ -424,6 +424,56 @@ int d_render_text_width(DRenderFont *font, const char *text)
     return (int)((width + 63) / 64);
 }
 
+/* One cluster at a time, because a cluster is what a reader can stand before
+   or after: several glyphs can share one (a letter and the mark on it), and
+   one glyph can cover several characters (an "fi" ligature). Walking glyphs
+   instead would offer positions inside both. */
+size_t d_render_text_offset_at(DRenderFont *font, const char *text, int x)
+{
+    if (!font || !text || !*text) return 0;
+    size_t length = strlen(text);
+    if (x <= 0) return 0;
+    hb_glyph_position_t *positions = NULL;
+    unsigned int count = 0;
+    hb_glyph_info_t *infos = shape_text(font, text, &positions, &count);
+    if (!infos) return 0;
+    size_t offset = length;
+    int64_t pen = 0;
+    for (unsigned int i = 0; i < count;) {
+        uint32_t cluster = infos[i].cluster;
+        int64_t advance = 0;
+        unsigned int next = i;
+        while (next < count && infos[next].cluster == cluster)
+            advance += positions[next++].x_advance;
+        /* Past the middle of a cluster belongs to the far side of it, which is
+           where every other text surface puts the caret. */
+        if ((int64_t)x * 64 < pen + advance / 2) {
+            offset = cluster;
+            break;
+        }
+        pen += advance;
+        i = next;
+    }
+    free(infos);
+    free(positions);
+    return offset > length ? length : offset;
+}
+
+int d_render_text_x_at(DRenderFont *font, const char *text, size_t offset)
+{
+    if (!font || !text || !*text || offset == 0) return 0;
+    hb_glyph_position_t *positions = NULL;
+    unsigned int count = 0;
+    hb_glyph_info_t *infos = shape_text(font, text, &positions, &count);
+    if (!infos) return 0;
+    int64_t pen = 0;
+    for (unsigned int i = 0; i < count; ++i)
+        if (infos[i].cluster < offset) pen += positions[i].x_advance;
+    free(infos);
+    free(positions);
+    return (int)((pen + 32) / 64);
+}
+
 static int measure_shaped_text(void *opaque, const char *text, size_t length)
 {
     DRenderFont *font = opaque;

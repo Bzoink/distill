@@ -12,6 +12,26 @@
 
 namespace {
 
+/* Enough runs for a page at the renderer's height limit with room to spare.
+   Past it a selection simply cannot reach the tail of the page, which is a
+   better failure than an allocation that grows with a hostile document. */
+constexpr size_t DISTILL_MAX_TEXT_RUNS = 16384;
+
+/* Truncation has to land on a character boundary: half a UTF-8 sequence is
+   not text, and this string is copied to a clipboard. */
+static void copy_run_text(char *destination, size_t capacity, const char *value)
+{
+    if (!destination || capacity == 0) return;
+    const char *source = value ? value : "";
+    size_t length = std::strlen(source);
+    if (length > capacity - 1) {
+        length = capacity - 1;
+        while (length > 0 && (static_cast<unsigned char>(source[length]) & 0xC0) == 0x80) --length;
+    }
+    std::memcpy(destination, source, length);
+    destination[length] = '\0';
+}
+
 struct Probe final : litehtml::document_container {
     explicit Probe(DRenderContext *context = nullptr) : renderer(context) {}
 
@@ -43,9 +63,40 @@ struct Probe final : litehtml::document_container {
 
     void draw_text(litehtml::uint_ptr, const char *text, litehtml::uint_ptr font,
                    litehtml::web_color color, const litehtml::position &position) override {
+        if (collecting) {
+            record_text_run(text, reinterpret_cast<DRenderFont *>(font), position);
+            return;
+        }
         if (!renderer) return;
         d_render_draw_text(renderer, text, reinterpret_cast<DRenderFont *>(font),
                            to_color(color), to_rect(position));
+    }
+
+    /* A run as it was drawn: the string litehtml broke to this line and the
+       box it filled. The collecting pass walks the whole document rather than
+       the painted band -- a selection that could only reach painted text would
+       stop at the edge of the screen -- and records instead of painting, so a
+       twenty-thousand-pixel page costs a traversal and no pixels. */
+    struct TextRun {
+        DTextBox box;
+        DRenderFont *font;
+    };
+    std::vector<TextRun> text_runs;
+    bool collecting = false;
+    bool text_collected = false;
+
+    void record_text_run(const char *text, DRenderFont *font,
+                         const litehtml::position &position) {
+        if (!text || !*text || position.width <= 0 || position.height <= 0) return;
+        if (text_runs.size() >= DISTILL_MAX_TEXT_RUNS) return;
+        TextRun run = {};
+        run.box.x = position.x;
+        run.box.y = position.y;
+        run.box.width = position.width;
+        run.box.height = position.height;
+        copy_run_text(run.box.text, sizeof(run.box.text), text);
+        run.font = font;
+        text_runs.push_back(run);
     }
 
     int pt_to_px(int pt) const override { return pt; }
@@ -53,7 +104,7 @@ struct Probe final : litehtml::document_container {
     const char *get_default_font_name() const override { return "sans"; }
 
     void draw_list_marker(litehtml::uint_ptr, const litehtml::list_marker &marker) override {
-        if (!renderer) return;
+        if (collecting || !renderer) return;
         d_render_draw_marker(renderer, to_rect(marker.pos), to_color(marker.color),
                              marker.index > 0, marker.index);
     }
@@ -112,7 +163,7 @@ struct Probe final : litehtml::document_container {
 
     /* litehtml draws <img> through this too, with the source in `image`. */
     void draw_background(litehtml::uint_ptr, const std::vector<litehtml::background_paint> &backgrounds) override {
-        if (!renderer || backgrounds.empty()) return;
+        if (collecting || !renderer || backgrounds.empty()) return;
         const litehtml::background_paint &background = backgrounds.back();
         if (background.color.alpha) {
             d_render_fill(renderer, to_rect(background.clip_box), to_color(background.color));
@@ -136,7 +187,7 @@ struct Probe final : litehtml::document_container {
 
     void draw_borders(litehtml::uint_ptr, const litehtml::borders &borders,
                       const litehtml::position &position, bool) override {
-        if (!renderer) return;
+        if (collecting || !renderer) return;
         if (borders.top.width && borders.top.style > litehtml::border_style_hidden)
             d_render_fill(renderer, {position.x, position.y, position.width, borders.top.width}, to_color(borders.top.color));
         if (borders.bottom.width && borders.bottom.style > litehtml::border_style_hidden)
@@ -578,6 +629,120 @@ extern "C" size_t distill_litehtml_document_form_boxes(const DLiteHtmlDocument *
                                                           size_t box_capacity)
 {
     return copy_form_boxes(document, boxes, box_capacity);
+}
+
+/* Which block each run belongs to. The container is handed no element with a
+   text run, so the identity comes from the layout afterwards -- and it has to
+   come cheaply: asking litehtml what is under each run walks the tree once per
+   run, which on a very long page is half a minute of the reader waiting for a
+   click. Blocks and runs both arrive in document order, so a cursor that only
+   moves forward, plus a short walk back to the innermost box that contains the
+   run, settles every run in a step or two. */
+struct BlockBox {
+    litehtml::position rect;
+    std::string tag;
+};
+
+static void collect_block_boxes(const litehtml::element::ptr &element,
+                                std::vector<BlockBox> &output)
+{
+    if (!element) return;
+    if (element->is_block_box()) {
+        litehtml::position rect = element->get_placement();
+        if (rect.width > 0 && rect.height > 0) {
+            BlockBox block;
+            block.rect = rect;
+            const char *tag = element->get_tagName();
+            block.tag = tag ? tag : "";
+            output.push_back(block);
+        }
+    }
+    for (const auto &child : element->children()) collect_block_boxes(child, output);
+}
+
+static bool block_holds_run(const BlockBox &block, const DTextBox &box)
+{
+    /* The run's centre rather than its box: a line can overflow its block by a
+       pixel or two where an inline is taller than the line height, and that is
+       not a reason to hand the line to the block's parent. */
+    int x = box.x + box.width / 2;
+    int y = box.y + box.height / 2;
+    return x >= block.rect.x && x <= block.rect.x + block.rect.width &&
+           y >= block.rect.y && y <= block.rect.y + block.rect.height;
+}
+
+static void assign_text_blocks(DLiteHtmlDocument *document)
+{
+    std::vector<BlockBox> blocks;
+    collect_block_boxes(document->document->root(), blocks);
+    if (blocks.empty()) return;
+    size_t cursor = 0;
+    for (auto &run : document->probe->text_runs) {
+        while (cursor + 1 < blocks.size() && blocks[cursor + 1].rect.y <= run.box.y) ++cursor;
+        for (size_t index = cursor + 1; index-- > 0;) {
+            if (!block_holds_run(blocks[index], run.box)) continue;
+            /* The index is the identity: a document-order position is stable
+               for as long as the document is, which is as long as a selection
+               in it can live. */
+            run.box.block = static_cast<unsigned int>(index) + 1;
+            copy_run_text(run.box.block_tag, sizeof(run.box.block_tag),
+                          blocks[index].tag.c_str());
+            break;
+        }
+    }
+}
+
+/* Collected on demand rather than at layout: the command-line renderer lays
+   out documents it only ever paints, and it should not pay for a pass it has
+   no use for. */
+static void collect_text_runs(DLiteHtmlDocument *document)
+{
+    if (!document || !document->document || !document->probe) return;
+    if (document->probe->text_collected) return;
+    document->probe->text_collected = true;
+    document->probe->text_runs.clear();
+    int height = document->content_height > 0 ? document->content_height
+                                              : document->surface_height;
+    litehtml::position clip(0, 0, document->width, height);
+    document->probe->collecting = true;
+    document->document->draw(reinterpret_cast<litehtml::uint_ptr>(document->renderer),
+                             0, 0, &clip);
+    document->probe->collecting = false;
+    assign_text_blocks(document);
+}
+
+extern "C" size_t distill_litehtml_document_text_boxes(DLiteHtmlDocument *document,
+                                                       DTextBox *boxes, size_t box_capacity)
+{
+    if (!document || !document->probe) return 0;
+    collect_text_runs(document);
+    const std::vector<Probe::TextRun> &runs = document->probe->text_runs;
+    size_t count = runs.size();
+    if (boxes && box_capacity) {
+        size_t copy_count = count < box_capacity ? count : box_capacity;
+        for (size_t i = 0; i < copy_count; ++i) boxes[i] = runs[i].box;
+    }
+    return count;
+}
+
+extern "C" size_t distill_litehtml_document_text_offset_at(DLiteHtmlDocument *document,
+                                                           size_t index, int x)
+{
+    if (!document || !document->probe) return 0;
+    collect_text_runs(document);
+    const std::vector<Probe::TextRun> &runs = document->probe->text_runs;
+    if (index >= runs.size()) return 0;
+    return d_render_text_offset_at(runs[index].font, runs[index].box.text, x);
+}
+
+extern "C" int distill_litehtml_document_text_x_at(DLiteHtmlDocument *document,
+                                                   size_t index, size_t offset)
+{
+    if (!document || !document->probe) return 0;
+    collect_text_runs(document);
+    const std::vector<Probe::TextRun> &runs = document->probe->text_runs;
+    if (index >= runs.size()) return 0;
+    return d_render_text_x_at(runs[index].font, runs[index].box.text, offset);
 }
 
 extern "C" size_t distill_litehtml_document_link_boxes(const DLiteHtmlDocument *document,
