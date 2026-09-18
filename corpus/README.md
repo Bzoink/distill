@@ -15,6 +15,7 @@ Arm B′ is decided on corpus pass rate. Until this exists, Phase 0 cannot start
 ./check.py --render /tmp/png  # Phase 2 reader PNG smoke renders
 ./check.py --viewer /tmp/png  # Phase 2 media viewer smoke render
 ./check.py --app              # Phase 3 desktop-shell model smoke test
+./check.py --tui              # Phase 6 terminal shell, driven through a pty
 ./check.py --bundles          # recorded saved-bundle smoke checks, never gates
 ./check.py --baseline         # validate the fixtures against a real browser
 ./check.py --id 07-churn      # one page
@@ -428,13 +429,43 @@ sniffed. The harder case — an explicit declaration that *contradicts* the byte
 is `08b-charset-lie.html`, deliberately left undecided and ungated. See
 `open_decisions` in `manifest.json`.
 
+## The terminal
+
+Two gates, for two different things.
+
+**What the terminal lays out** is a `cells` assertion, checked by `--extract`
+beside `markdown`. The engine lays the reader page out in character cells
+(`distill --dump-cells FILE --columns N`) with no terminal involved, and the
+assertion is a substring of that text. `columns` is one width or a list, and a
+list is the point: wrapping bugs hide at one width.
+
+```json
+{"stage": "cells", "columns": [40, 80, 120], "expect": "A careful reader"}
+```
+
+Every cells dump is also checked, at every width a page asks for, to fit its
+terminal — measured with python-wcwidth where it is installed rather than by
+the engine's own width table, so the check is not the renderer grading itself.
+
+**The shell around it** is `--tui`: `corpus/tui_suite.py` runs
+`build/distill-tui` under a pseudo-terminal and reads the screen through
+[pyte](https://github.com/selectel/pyte) (`python-pyte`). It covers keys, the
+address prompt, history, both ways of submitting a form, a POST login whose
+session crosses engine runs, resize, a table's sideways scroll, the mouse,
+audio through the null backend (`DISTILL_AUDIO_BACKEND=null`: real time, no
+device, no sound), and leaving the terminal as it was found — after `q`, and
+after `SIGTERM` and `SIGSEGV`. Whether kitty or sixel images actually appear
+needs a real terminal and is not gated; see `src/documents/TUI_PLAN.md`.
+
 ## The assertion contract
 
 `manifest.json` is the machine-readable contract. Each assertion carries:
 
-- `stage` — `dom` (Phase 0, checked against the post-JS DOM at settle time) or
-  `extract` (Phase 1, checked against extractor output). Only `dom` assertions
-  gate Phase 0; `check.py` reports `extract` ones as pending.
+- `stage` — `dom` (Phase 0, checked against the post-JS DOM at settle time),
+  `extract` (Phase 1, checked against extractor output), or one of the reader
+  page's forms: `template`, `markdown`, `cells` (see [The terminal](#the-terminal)).
+  Only `dom` assertions gate Phase 0; `check.py` reports the others as pending
+  and checks them under `--extract`.
 - `selector` + `expect` / `expect_absent` — the contract PLAN.md specifies.
   Only `#id` selectors are supported, on purpose: every fixture is written to
   make its assertion unambiguous.

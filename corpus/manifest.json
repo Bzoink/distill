@@ -391,6 +391,16 @@
       "golden": "golden/09-article.json",
       "assertions": [
         {
+          "stage": "cells",
+          "columns": [40, 80, 120],
+          "expect": "A careful reader"
+        },
+        {
+          "stage": "cells",
+          "columns": 80,
+          "expect": "This sentence was added after the page loaded"
+        },
+        {
           "stage": "extract",
           "path": "shape.kind",
           "expect": "article"
@@ -442,6 +452,16 @@
       "why": "Tables must be read as data before Readability can mistake them for layout.",
       "golden": "golden/11-table.json",
       "assertions": [
+        {
+          "stage": "cells",
+          "columns": [40, 80, 120],
+          "expect": "Arm A  │ 14.4 MiB │ selected"
+        },
+        {
+          "stage": "cells",
+          "columns": 30,
+          "expect": "›"
+        },
         {
           "stage": "extract",
           "path": "shape.kind",
@@ -504,6 +524,12 @@
       "golden": "golden/13-form.json",
       "assertions": [
         {
+          "stage": "cells",
+          "columns": [40, 80],
+          "expect": "[ Search ]",
+          "expect_absent": ["CSRF-PASSTHROUGH"]
+        },
+        {
           "stage": "extract",
           "path": "shape.kind",
           "expect": "form"
@@ -535,6 +561,7 @@
       "why": "Video is represented as metadata and a hand-off URL; the reader does not become a media engine.",
       "golden": "golden/14-video.json",
       "assertions": [
+        {"stage": "cells", "columns": [40, 80], "expect": "[ Open externally ]"},
         {"stage": "extract", "path": "shape.kind", "expect": "video"},
         {"stage": "extract", "path": "videos[0].url", "expect": "youtube.com/embed/distill-demo"},
         {"stage": "extract", "path": "videos[0].title", "expect": "A short history of the reader"},
@@ -689,6 +716,7 @@
       "exercises": ["rtl", "direction-metadata", "non-latin-text"],
       "why": "The reader renders its own template, so a source document's direction and language must survive extraction or a right-to-left article is laid out flush left. Mixed-direction ordering within the paragraph needs the Unicode Bidirectional Algorithm and is recorded rather than asserted.",
       "assertions": [
+        {"stage": "cells", "columns": [40, 80], "expect": "RTL-ARABIC-OK"},
         {"stage": "dom", "selector": "#content", "expect": "RTL-ARABIC-OK"},
         {"stage": "extract", "path": "readability.dir", "expect": "rtl"},
         {"stage": "extract", "path": "readability.lang", "expect": "ar"},
@@ -703,6 +731,7 @@
       "exercises": ["cjk", "line-breaking", "non-latin-text"],
       "why": "Japanese and Chinese have no inter-word spaces, so a line may break between almost any two characters subject to kinsoku rules. This is what libunibreak is a dependency for, and no other corpus page exercises it: every other fixture breaks on spaces.",
       "assertions": [
+        {"stage": "cells", "columns": [20, 40, 80], "expect": "CJK-LINEBREAK-OK"},
         {"stage": "dom", "selector": "#content", "expect": "CJK-LINEBREAK-OK"},
         {"stage": "extract", "path": "readability.lang", "expect": "ja"},
         {"stage": "extract", "path": "readability.textContent", "expect": "ウェブブラウザは"},
@@ -717,6 +746,7 @@
       "exercises": ["thai", "devanagari", "combining-marks", "non-latin-text"],
       "why": "Thai has no word delimiter at all and stacks vowels and tone marks on the base consonant; Devanagari reorders within a cluster, so a vowel typed after its consonant is drawn before it. Extraction must preserve both intact; correct shaping is a render-path question recorded rather than asserted.",
       "assertions": [
+        {"stage": "cells", "columns": [40, 80], "expect": "COMPLEX-SCRIPT-OK"},
         {"stage": "dom", "selector": "#content", "expect": "COMPLEX-SCRIPT-OK"},
         {"stage": "extract", "path": "readability.lang", "expect": "th"},
         {"stage": "extract", "path": "readability.textContent", "expect": "เว็บเบราว์เซอร์"},
@@ -749,6 +779,7 @@
       "exercises": ["document-title", "block-links", "render-fit"],
       "why": "A front page is headlines that are themselves links, with no article for Readability to find. Without a document title the reader showed 'Untitled page'; without the link on each block it showed headlines nobody could follow; and rendered into a fixed surface the page simply stopped partway down.",
       "assertions": [
+        {"stage": "cells", "columns": [40, 80], "expect": "LINK-INDEX-OK"},
         {"stage": "dom", "selector": "#content", "expect": "LINK-INDEX-OK"},
         {"stage": "extract", "path": "title", "expect": "Kingfisher Gazette"},
         {"stage": "extract", "path": "blocks[0].href", "expect": "/2026/09/kingfisher-dive-rates"},
@@ -1316,6 +1347,11 @@
       ],
       "why": "A download listing offers audio as links and carries no audio element at all, so a reader that only looks for <audio> can play files it will never show. The same file linked twice must collapse to one reference, a PDF link must not become audio, and a format the core cannot decode must be offered as a download rather than a Play that fails.",
       "assertions": [
+        {
+          "stage": "cells",
+          "columns": [40, 80],
+          "expect": "[ Play ]"
+        },
         {
           "stage": "extract",
           "path": "audio[0].source",

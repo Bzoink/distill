@@ -53,7 +53,9 @@ void media_audio_set_volume(float volume);   /* clamped to 0.0 .. 1.0 */
 void media_audio_snapshot(MediaAudioState *out);
 void media_audio_close(void);         /* releases the device and the file */
 
-/* True when the build has a real audio device behind it. */
+/* True while a device is attached -- that is, after an open succeeded and
+   before the next close. Not a probe: before the first open it is false
+   whether or not the machine has a device. */
 bool media_audio_available(void);
 
 /* Test seam. Opens the decoder with no device at all, so position, duration

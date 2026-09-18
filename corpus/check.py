@@ -10,6 +10,7 @@ Starts serve.py, drives the Phase 0 engine over each page, and checks the
     ./check.py --render DIR    Phase 2 PNG smoke renders
     ./check.py --viewer DIR    Phase 2 media-viewer smoke render
     ./check.py --app           Phase 3 desktop-shell model smoke test
+    ./check.py --tui           Phase 6 terminal shell, driven through a pty
     ./check.py --id 03-settle  one page
     ./check.py --live          also record the live rungs (never gates)
     ./check.py --keep-dom DIR  save each dumped DOM for inspection
@@ -30,9 +31,15 @@ import subprocess
 import sys
 import tempfile
 import time
+import unicodedata
 import urllib.error
 import urllib.request
 from html.parser import HTMLParser
+
+try:
+    from wcwidth import wcswidth as _wcswidth
+except ImportError:  # the fallback below is coarser but needs nothing installed
+    _wcswidth = None
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 MANIFEST = os.path.join(HERE, "manifest.json")
@@ -129,6 +136,17 @@ def find_arm_b(pruned=False):
             return candidate
     label = "Arm B'" if pruned else "Arm B"
     sys.exit(f"no {label} engine found; build it first (cmake -S . -B build && cmake --build build)")
+
+
+def find_tui():
+    candidates = [
+        os.environ.get("DISTILL_TUI"),
+        os.path.join(os.path.dirname(HERE), "build", "distill-tui"),
+    ]
+    for candidate in candidates:
+        if candidate and os.path.isfile(candidate) and os.access(candidate, os.X_OK):
+            return candidate
+    sys.exit("no distill-tui found; build it first (cmake -S . -B build && cmake --build build)")
 
 
 def find_app():
@@ -448,6 +466,73 @@ def extraction_text(extraction, path=None):
     return json.dumps(value, ensure_ascii=False, sort_keys=True), True
 
 
+def dump_cells(engine, url, columns, cap_ms, timeout_s):
+    """The reader page laid out in character cells, as the terminal shows it.
+
+    Produced by the same pure renderer the terminal front end draws with, with
+    no terminal involved -- which is what makes terminal rendering something a
+    gate can assert on at all.
+    """
+    with tempfile.NamedTemporaryFile(suffix=".txt", delete=False) as fh:
+        path = fh.name
+    cmd = [engine, "--url", url, "--dump-cells", path, "--columns", str(columns),
+           "--script-cap-ms", str(cap_ms)]
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout_s)
+        if r.returncode != 0:
+            return None, f"cells exit {r.returncode}: {r.stderr.strip()[:200]}"
+        with open(path, encoding="utf-8") as fh:
+            return fh.read(), None
+    except subprocess.TimeoutExpired:
+        return None, f"cells timed out after {timeout_s}s"
+    except OSError as exc:
+        return None, f"cells unavailable: {exc}"
+    finally:
+        try:
+            os.unlink(path)
+        except OSError:
+            pass
+
+
+def cell_columns(a):
+    """The widths a cells assertion runs at: one, or a sweep."""
+    columns = a.get("columns", 80)
+    return columns if isinstance(columns, list) else [columns]
+
+
+def line_cells(line):
+    """Terminal cells a line occupies, measured independently of the engine's
+    own table so the width check is not the renderer grading itself."""
+    if _wcswidth is not None:
+        width = _wcswidth(line)
+        if width >= 0:
+            return width
+    return sum(0 if unicodedata.category(ch) in ("Mn", "Me", "Cf")
+               else 2 if unicodedata.east_asian_width(ch) in ("W", "F") else 1
+               for ch in line)
+
+
+def check_cells_fit(cells):
+    """Every dump must fit its terminal. Wrapping bugs hide at one width, so
+    this runs at every width a page asks for, not only where its content
+    assertions look."""
+    results, failed = [], 0
+    for columns in sorted(cells):
+        text = cells[columns]
+        if text is None:
+            continue
+        widest, where = 0, 0
+        for number, line in enumerate(text.splitlines(), 1):
+            width = line_cells(line)
+            if width > widest:
+                widest, where = width, number
+        ok = widest <= columns
+        results.append(("pass" if ok else "fail", f"cells@{columns} fits the terminal",
+                        "" if ok else f"line {where} is {widest} cells"))
+        failed += 0 if ok else 1
+    return results, failed
+
+
 def check_substrings(a, text, label):
     """Shared expect / expect_absent checking over one blob of text."""
     results, failed = [], 0
@@ -466,11 +551,21 @@ def check_substrings(a, text, label):
 
 
 def check_page(page, html=None, baseline=False, extraction=None, template=None,
-               markdown=None):
+               markdown=None, cells=None):
     """(results, n_failed) for DOM, extraction or reader-template assertions."""
     results, failed = [], 0
     for a in page["assertions"]:
         stage = a.get("stage")
+        if stage == "cells":
+            for columns in cell_columns(a):
+                text = cells.get(columns) if cells else None
+                if text is None:
+                    results.append(("pending", f"cells@{columns}-stage, use --extract", ""))
+                    continue
+                more, bad = check_substrings(a, text, f"cells@{columns}")
+                results.extend(more)
+                failed += bad
+            continue
         if stage == "markdown":
             if markdown is None:
                 results.append(("pending", "markdown-stage, use --extract", ""))
@@ -583,6 +678,8 @@ def main():
                     help="render the gallery fixture through the Phase 2 media viewer")
     ap.add_argument("--app", action="store_true",
                     help="run the Phase 3 desktop-shell model smoke test")
+    ap.add_argument("--tui", action="store_true",
+                    help="Phase 6: drive the terminal shell through a pty")
     ap.add_argument("--bundles", action="store_true",
                     help="also run saved local bundles as recorded, non-gating checks")
     ap.add_argument("--arm", choices=("a", "b", "b-pruned"), default="a",
@@ -593,7 +690,7 @@ def main():
     args = ap.parse_args()
 
     if args.app:
-        incompatible = args.id or args.live or args.baseline or args.extract or args.render or args.viewer or args.bundles or args.keep_dom
+        incompatible = args.id or args.live or args.baseline or args.extract or args.render or args.viewer or args.bundles or args.keep_dom or args.tui
         if incompatible:
             ap.error("--app is a standalone Phase 3 shell smoke test")
         app = find_app()
@@ -657,6 +754,23 @@ def main():
         else:
             sys.exit("corpus server did not come up")
 
+        if args.tui:
+            import tui_suite
+            tui = find_tui()
+            print(f"{DIM}tui:     {tui}\nserver:  http://127.0.0.1:{port}/\nmode:    Phase 6 terminal shell (pty){RESET}\n")
+            results = tui_suite.run(tui, f"http://127.0.0.1:{port}")
+            failed = 0
+            for status, label, detail in results:
+                mark = f"{GREEN}pass{RESET}" if status == "pass" else f"{RED}FAIL{RESET}"
+                print(f"  {mark}  {label}" + (f"  {DIM}{detail[:300]}{RESET}" if detail else ""))
+                failed += status != "pass"
+            print()
+            if failed:
+                print(f"{RED}FAILED{RESET}  {failed} terminal check(s)")
+                return 1
+            print(f"{GREEN}OK{RESET}  all {len(results)} terminal checks pass")
+            return 0
+
         pages = manifest["pages"]
         if args.id:
             pages = [p for p in pages if p["id"] == args.id]
@@ -677,6 +791,7 @@ def main():
             t0 = time.time()
             template = None
             markdown = None
+            cells = None
             session_path = None
             session_error = None
             if page.get("session"):
@@ -718,6 +833,15 @@ def main():
                         engine, url, manifest.get("settle_cap_ms", 5000), args.timeout)
                     if markdown_error and not err:
                         err = markdown_error
+                widths = sorted({c for a in page["assertions"] if a.get("stage") == "cells"
+                                 for c in cell_columns(a)})
+                if widths:
+                    cells = {}
+                    for columns in widths:
+                        cells[columns], cells_error = dump_cells(
+                            engine, url, columns, manifest.get("settle_cap_ms", 5000), args.timeout)
+                        if cells_error and not err:
+                            err = cells_error
             elif args.baseline:
                 html, err = dump_dom(browser, url, args.budget, args.timeout)
                 extraction = None
@@ -770,7 +894,11 @@ def main():
 
             results, failed = check_page(page, html, baseline=args.baseline,
                                          extraction=extraction, template=template,
-                                         markdown=markdown)
+                                         markdown=markdown, cells=cells)
+            if cells:
+                fit_results, fit_failed = check_cells_fit(cells)
+                results.extend(fit_results)
+                failed += fit_failed
             if args.extract:
                 golden_results, golden_failed = check_golden(page, extraction)
                 results.extend(golden_results)

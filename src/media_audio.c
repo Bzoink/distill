@@ -34,6 +34,7 @@
 #include "media_audio.h"
 
 #include <stdatomic.h>
+#include <stdlib.h>
 #include <string.h>
 
 #define MEDIA_AUDIO_CHANNELS 2
@@ -43,6 +44,8 @@
 static struct {
     bool open;            /* a decoder is loaded */
     bool device_ready;    /* a real device is attached */
+    ma_context context;   /* only for DISTILL_AUDIO_BACKEND=null */
+    bool context_ready;
     ma_decoder decoder;
     ma_device device;
     unsigned long long total_frames;
@@ -179,7 +182,20 @@ bool media_audio_open(const char *path, const char *item)
     config.playback.channels = MEDIA_AUDIO_CHANNELS;
     config.sampleRate = core.sample_rate;
     config.dataCallback = data_callback;
-    if (ma_device_init(NULL, &config, &core.device) != MA_SUCCESS) {
+    /* DISTILL_AUDIO_BACKEND=null plays into nothing, in real time: position,
+       seeking and end of track all behave as they do on a device, with no
+       sound and no device needed. It exists for the terminal suite, which
+       must exercise playback on machines with no sound card and must not
+       make a noise on ones that have one. */
+    const char *backend = getenv("DISTILL_AUDIO_BACKEND");
+    ma_context *context = NULL;
+    if (backend && !strcmp(backend, "null")) {
+        ma_backend null_backend = ma_backend_null;
+        if (!core.context_ready && ma_context_init(&null_backend, 1, NULL, &core.context) == MA_SUCCESS)
+            core.context_ready = true;
+        if (core.context_ready) context = &core.context;
+    }
+    if (ma_device_init(context, &config, &core.device) != MA_SUCCESS) {
         /* No device is a reportable condition, not a crash: the file stays
            open so the front end can still offer a download. */
         set_error("no audio device is available");

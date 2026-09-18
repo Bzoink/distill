@@ -2,6 +2,8 @@
 #define _XOPEN_SOURCE 700
 
 #include "cutil.h"
+#include "reader_cells.h"
+#include "reader_walk.h"
 
 #include <quickjs.h>
 #include <curl/curl.h>
@@ -2212,16 +2214,22 @@ extern int distill_litehtml_render(const char *html, const char *output_path,
 /* Laid-out height of the reader page at a given width; see render.h. */
 extern int distill_litehtml_content_height(const char *html, int width,
                                            const char *font_dir);
+#define DISTILL_MAX_RENDER_HEIGHT 20000
+#endif
+
+#ifdef DISTILL_READER
 /* The format these bytes are in, or "" for none we recognise; see image.h. */
 extern const char *d_image_format_name(const unsigned char *bytes, size_t length);
 typedef struct { int width; int height; uint32_t *pixels; } DImage;
 extern bool d_image_load_file(const char *path, DImage *out);
 extern void d_image_free(DImage *image);
 extern const char *d_image_last_error(void);
-#define DISTILL_MAX_RENDER_HEIGHT 20000
 #endif
 
-#ifdef DISTILL_RENDER
+/* The reader page: the template every front end renders, the cards in it and
+   the JSON helpers they read through. None of it lays anything out, so it
+   belongs to every build that extracts, not only to the one that paints. */
+#ifdef DISTILL_READER
 static char *json_property_string(Engine *engine, JSValueConst object, const char *name)
 {
     JSValue value = JS_GetPropertyStr(engine->context, object, name);
@@ -3292,6 +3300,9 @@ static char *reader_template(Engine *engine, const char *json, const char *theme
     return dbuf_take(&output);
 }
 
+#endif /* DISTILL_READER */
+
+#ifdef DISTILL_RENDER
 /* local_path is a file the engine has already downloaded, or empty. When it
    is there the viewer shows the image; when it is not it shows what it knows
    about the image instead, which is the honest state before a fetch has
@@ -3409,6 +3420,23 @@ static bool save_media_file(Engine *engine, const char *json, int media_index,
     JS_FreeValue(engine->context, item);
     JS_FreeValue(engine->context, media);
     JS_FreeValue(engine->context, parsed);
+    return ok;
+}
+#endif
+
+static bool write_file_bytes(const char *path, const char *data, size_t length);
+
+#ifdef DISTILL_READER
+/* The reader page laid out in character cells, as the terminal would show
+   it, written as plain text. Rows 0 means the whole page. */
+static bool write_cells(const char *template, int columns, int rows, const char *path)
+{
+    ReaderLayout *layout = reader_layout(template, &(ReaderLayoutOptions){.columns = columns});
+    if (!layout) return false;
+    char *text = reader_layout_dump(layout, 0, rows);
+    bool ok = write_file_bytes(path, text, strlen(text));
+    free(text);
+    reader_layout_free(layout);
     return ok;
 }
 #endif
@@ -3691,6 +3719,7 @@ static int run_page(const char *input, uint64_t cap_ms, uint64_t memory_mb,
                     int render_width, int render_height,
                     const char *font_dir, const char *template_path,
                     const char *markdown_path,
+                    const char *cells_path, int cell_columns, int cell_rows,
                     const char *theme, bool native_forms, int zoom,
                     const char *request_method,
                     const char *request_data, const char *session_file,
@@ -3768,7 +3797,7 @@ static int run_page(const char *input, uint64_t cap_ms, uint64_t memory_mb,
     else free(effective_url);
     free(engine.base_url); engine.base_url = d_strdup(engine.source_url);
     report_location(&engine);
-#ifdef DISTILL_RENDER
+#ifdef DISTILL_READER
     /* One request and nothing else: no runtime, no scripts, no extraction.
        The shell has no network of its own -- only the engine links libcurl --
        so this is how an image a reader activated reaches the viewer, and
@@ -3790,6 +3819,19 @@ static int run_page(const char *input, uint64_t cap_ms, uint64_t memory_mb,
                              : d_eq(fetch_kind, "any")
                              ? "file"
                              : d_image_format_name((const unsigned char *)html.data, html.length);
+        /* An error page is not the file that was asked for, whatever its
+           bytes happen to be: a download of a 404 must fail, not save the
+           server's apology under the name of a song. */
+        if (status >= 400) {
+            fprintf(stderr, "the server answered %ld for %s\n", status, engine.source_url);
+            dbuf_free(&html);
+            free(initial_html);
+            engine_cleanup(&engine);
+#ifdef DISTILL_RENDER
+            free(owned_font_dir);
+#endif
+            return 2;
+        }
         bool ok = *format && write_file_bytes(fetch_media_path, html.data, html.length);
         if (!ok && !*format)
             fprintf(stderr, "not %s: %s\n",
@@ -3802,7 +3844,9 @@ static int run_page(const char *input, uint64_t cap_ms, uint64_t memory_mb,
         dbuf_free(&html);
         free(initial_html);
         engine_cleanup(&engine);
+#ifdef DISTILL_RENDER
         free(owned_font_dir);
+#endif
         return ok ? 0 : 2;
     }
 #endif
@@ -3861,7 +3905,8 @@ static int run_page(const char *input, uint64_t cap_ms, uint64_t memory_mb,
     }
     dbuf_free(&html);
     set_document_base(&engine);
-    bool needs_extraction = viewer_path || render_path || template_path || markdown_path || extract;
+    bool needs_extraction = viewer_path || render_path || template_path || markdown_path ||
+                            cells_path || extract;
     char *initial_json = NULL;
     report_progress(&engine, PROGRESS_FETCH_END, "scripts");
     bool scripts_failed = false;
@@ -3970,14 +4015,14 @@ static int run_page(const char *input, uint64_t cap_ms, uint64_t memory_mb,
         result = 2;
 #endif
     } else if (markdown_path) {
-#ifdef DISTILL_RENDER
+#ifdef DISTILL_READER
         /* The export is a conversion of the reader page, not a second
            rendering of the extraction: what it writes is what the reader
            shows, and a change to the template carries into it untold. */
         char *json = selected_json;
         selected_json = NULL;
         char *template = reader_template(&engine, json, theme, native_forms, zoom);
-        char *markdown = *template ? markdown_from_template(template, engine.source_url)
+        char *markdown = *template ? reader_markdown(template, engine.source_url)
                                    : d_strdup("");
         if (!*markdown || !write_file_bytes(markdown_path, markdown, strlen(markdown))) {
             fprintf(stderr, "unable to write markdown %s\n", markdown_path);
@@ -3988,11 +4033,27 @@ static int run_page(const char *input, uint64_t cap_ms, uint64_t memory_mb,
         free(json);
 #else
         (void)theme; (void)zoom;
-        fprintf(stderr, "this build has no litehtml renderer\n");
+        fprintf(stderr, "this build has no reader page\n");
+        result = 2;
+#endif
+    } else if (cells_path) {
+#ifdef DISTILL_READER
+        char *json = selected_json;
+        selected_json = NULL;
+        char *template = reader_template(&engine, json, theme, native_forms, zoom);
+        if (!*template || !write_cells(template, cell_columns, cell_rows, cells_path)) {
+            fprintf(stderr, "unable to write cells %s\n", cells_path);
+            result = 3;
+        }
+        free(template);
+        free(json);
+#else
+        (void)cell_columns; (void)cell_rows;
+        fprintf(stderr, "this build has no reader page\n");
         result = 2;
 #endif
     } else if (template_path) {
-#ifdef DISTILL_RENDER
+#ifdef DISTILL_READER
         char *json = selected_json;
         selected_json = NULL;
         char *template = reader_template(&engine, json, theme, native_forms, zoom);
@@ -4004,7 +4065,7 @@ static int run_page(const char *input, uint64_t cap_ms, uint64_t memory_mb,
         free(json);
 #else
         (void)theme; (void)zoom;
-        fprintf(stderr, "this build has no litehtml renderer\n");
+        fprintf(stderr, "this build has no reader page\n");
         result = 2;
 #endif
     } else if (extract) {
@@ -4037,7 +4098,12 @@ static int run_page(const char *input, uint64_t cap_ms, uint64_t memory_mb,
 
 static void usage(const char *program)
 {
-    fprintf(stderr, "usage: %s --url URL [--dump-dom|--extract|--render FILE|--template FILE|--viewer FILE|--fetch-media FILE] [--media-index N] [--save-media FILE] [--width N] [--height N|0] [--font-dir DIR] [--theme warm|night|paper] [--zoom PERCENT] [--native-forms] [--progress] [--https-optional] [--request-method GET|POST] [--request-data DATA|--request-data-file FILE|-] [--session-file FILE] [--script-cap-ms N] [--memory-limit-mb N] [--max-scripts N]\n", program);
+    fprintf(stderr, "usage: %s --url URL [--dump-dom|--extract|--render FILE|--template FILE|--markdown FILE|--dump-cells FILE|--viewer FILE|--fetch-media FILE] [--media-index N] [--save-media FILE] [--width N] [--height N|0] [--font-dir DIR] [--theme warm|night|paper] [--zoom PERCENT] [--native-forms] [--progress] [--https-optional] [--request-method GET|POST] [--request-data DATA|--request-data-file FILE|-] [--session-file FILE] [--script-cap-ms N] [--memory-limit-mb N] [--max-scripts N]\n", program);
+    fprintf(stderr, "  --dump-cells FILE     lay the reader page out in character cells, as the terminal\n"
+        "                        shows it, and write it as plain text. --columns N (default\n"
+        "                        80) is the terminal width; --rows N (default 0, the whole\n"
+        "                        page) how much of it to write. --cells-from PAGE converts a\n"
+        "                        reader page already on disk, like --markdown-from.\n");
     fprintf(stderr, "  --height 0            size the render to the content instead of cropping it.\n"
         "  --fetch-media FILE    fetch one image and write its bytes, with no scripts and no\n"
         "                        extraction. The format is taken from the bytes, not the\n"
@@ -4088,6 +4154,9 @@ int main(int argc, char **argv)
     const char *template_path = NULL;
     const char *markdown_path = NULL;
     const char *markdown_from = NULL;
+    const char *cells_path = NULL;
+    const char *cells_from = NULL;
+    int cell_columns = 80, cell_rows = 0;
     const char *save_media_path = NULL;
     const char *fetch_media_path = NULL;
     const char *fetch_kind = "image";
@@ -4112,6 +4181,10 @@ int main(int argc, char **argv)
         else if (d_eq(argv[i], "--template") && i + 1 < argc) template_path = argv[++i];
         else if (d_eq(argv[i], "--markdown") && i + 1 < argc) markdown_path = argv[++i];
         else if (d_eq(argv[i], "--markdown-from") && i + 1 < argc) markdown_from = argv[++i];
+        else if (d_eq(argv[i], "--dump-cells") && i + 1 < argc) cells_path = argv[++i];
+        else if (d_eq(argv[i], "--cells-from") && i + 1 < argc) cells_from = argv[++i];
+        else if (d_eq(argv[i], "--columns") && i + 1 < argc) cell_columns = (int)strtol(argv[++i], NULL, 10);
+        else if (d_eq(argv[i], "--rows") && i + 1 < argc) cell_rows = (int)strtol(argv[++i], NULL, 10);
         else if (d_eq(argv[i], "--viewer") && i + 1 < argc) viewer_path = argv[++i];
         else if (d_eq(argv[i], "--media-index") && i + 1 < argc) media_index = (int)strtol(argv[++i], NULL, 10);
         else if (d_eq(argv[i], "--save-media") && i + 1 < argc) save_media_path = argv[++i];
@@ -4143,7 +4216,7 @@ int main(int argc, char **argv)
        reading of the same address, which may since have changed or may not be
        reachable again without the session that produced it. */
     if (markdown_from) {
-#ifdef DISTILL_RENDER
+#ifdef DISTILL_READER
         if (!markdown_path) { usage(argv[0]); return 2; }
         size_t length = 0;
         char *template = d_read_file(markdown_from, &length);
@@ -4151,16 +4224,39 @@ int main(int argc, char **argv)
             fprintf(stderr, "unable to read reader page %s\n", markdown_from);
             return 2;
         }
-        char *markdown = markdown_from_template(template, url);
+        char *markdown = reader_markdown(template, url);
         bool ok = *markdown && write_file_bytes(markdown_path, markdown, strlen(markdown));
         if (!ok) fprintf(stderr, "unable to write markdown %s\n", markdown_path);
         free(markdown);
         free(template);
         return ok ? 0 : 3;
 #else
-        fprintf(stderr, "this build has no litehtml renderer\n");
+        fprintf(stderr, "this build has no reader page\n");
         return 2;
 #endif
+    }
+    if (cells_from) {
+#ifdef DISTILL_READER
+        if (!cells_path || cell_columns < 8 || cell_rows < 0) { usage(argv[0]); return 2; }
+        size_t length = 0;
+        char *template = d_read_file(cells_from, &length);
+        if (!template) {
+            fprintf(stderr, "unable to read reader page %s\n", cells_from);
+            return 2;
+        }
+        bool ok = write_cells(template, cell_columns, cell_rows, cells_path);
+        if (!ok) fprintf(stderr, "unable to write cells %s\n", cells_path);
+        free(template);
+        return ok ? 0 : 3;
+#else
+        fprintf(stderr, "this build has no reader page\n");
+        return 2;
+#endif
+    }
+    if ((cells_path && (cell_columns < 8 || cell_rows < 0)) ||
+        (cells_path && (dump_dom || extract || render_path || template_path || viewer_path ||
+                        markdown_path || fetch_media_path))) {
+        usage(argv[0]); return 2;
     }
     if (!url || !*url || (dump_dom && (extract || render_path || template_path || viewer_path)) ||
         (extract && (render_path || template_path || viewer_path)) ||
@@ -4185,7 +4281,7 @@ int main(int argc, char **argv)
                           fetch_media_path,
                           fetch_kind,
                           render_width, render_height, font_dir, template_path,
-                          markdown_path, theme,
+                          markdown_path, cells_path, cell_columns, cell_rows, theme,
                           native_forms, zoom,
                           request_method, request_data, session_file, progress,
                           https_optional);

@@ -16,11 +16,32 @@ set(EXTERNAL_PREFIX "${CMAKE_SOURCE_DIR}/external/install" CACHE PATH "Distill e
 find_package(CURL REQUIRED)
 find_package(Threads REQUIRED)
 find_package(PkgConfig REQUIRED)
-pkg_check_modules(DISTILL_RENDER REQUIRED IMPORTED_TARGET freetype2 harfbuzz cairo libunibreak)
+# The line breaker needs libunibreak and nothing else, so it is its own
+# module: every target breaks lines, and only the desktop one shapes glyphs.
+pkg_check_modules(DISTILL_UNIBREAK REQUIRED IMPORTED_TARGET libunibreak)
 # Still-image decoding is linked directly rather than taken from a toolkit, so
 # the framebuffer and TUI targets can use the same decoder as the desktop one.
 pkg_check_modules(DISTILL_IMAGE REQUIRED IMPORTED_TARGET libpng libjpeg libwebp)
-pkg_check_modules(DISTILL_GTK IMPORTED_TARGET gtk+-3.0)
+
+# The raster renderer -- litehtml laying out, FreeType and HarfBuzz shaping,
+# Cairo painting -- is what the desktop shell draws with, and nothing else
+# needs it. It is found rather than required: a machine without Cairo still
+# builds the engine, the reader page, the Markdown export and the terminal
+# front end. DISTILL_RENDERER=OFF asks for that build deliberately.
+option(DISTILL_RENDERER "Build the litehtml/Cairo renderer when its dependencies are present" ON)
+set(DISTILL_HAVE_RENDERER OFF)
+if(DISTILL_RENDERER)
+    pkg_check_modules(DISTILL_RENDER IMPORTED_TARGET freetype2 harfbuzz cairo)
+    if(DISTILL_RENDER_FOUND AND EXISTS "${EXTERNAL_PREFIX}/lib/liblitehtml.a")
+        set(DISTILL_HAVE_RENDERER ON)
+    else()
+        message(STATUS "FreeType, HarfBuzz, Cairo or litehtml not found; building without the renderer")
+    endif()
+endif()
+message(STATUS "Distill renderer: ${DISTILL_HAVE_RENDERER}")
+if(DISTILL_HAVE_RENDERER)
+    pkg_check_modules(DISTILL_GTK IMPORTED_TARGET gtk+-3.0)
+endif()
 
 enable_testing()
 
@@ -32,39 +53,71 @@ enable_testing()
 function(distill_enable_assertions target)
     target_compile_options(${target} PRIVATE -UNDEBUG)
 endfunction()
-add_executable(distill-shaper-test tests/shaper_test.c src/shaper.c)
-target_include_directories(distill-shaper-test PRIVATE src)
-target_link_libraries(distill-shaper-test PRIVATE PkgConfig::DISTILL_RENDER)
+add_library(distill-shaper STATIC src/shaper.c)
+target_include_directories(distill-shaper PUBLIC src)
+target_link_libraries(distill-shaper PUBLIC PkgConfig::DISTILL_UNIBREAK)
+
+add_library(distill-image STATIC src/image.c)
+target_include_directories(distill-image PUBLIC src)
+target_link_libraries(distill-image PUBLIC PkgConfig::DISTILL_IMAGE)
+
+add_executable(distill-shaper-test tests/shaper_test.c)
+target_link_libraries(distill-shaper-test PRIVATE distill-shaper)
 distill_enable_assertions(distill-shaper-test)
 add_test(NAME distill-shaper COMMAND distill-shaper-test)
 
-add_executable(distill-image-test tests/image_test.c src/image.c)
-target_include_directories(distill-image-test PRIVATE src)
-target_link_libraries(distill-image-test PRIVATE PkgConfig::DISTILL_IMAGE)
+add_executable(distill-image-test tests/image_test.c)
+target_link_libraries(distill-image-test PRIVATE distill-image)
 distill_enable_assertions(distill-image-test)
 add_test(NAME distill-image COMMAND distill-image-test)
+
+# What every front end shares that is not the page: the rules a form is
+# submitted by, what a typed address means, the settings file, and fetching
+# media through the engine. Shared so that the terminal and the desktop send
+# the same request, go to the same place and read the same preferences.
+add_library(distill-shell STATIC src/form_submit.c src/address.c src/settings.c src/media_transfer.c)
+target_include_directories(distill-shell PUBLIC src)
+
+add_executable(distill-form-submit-test tests/form_submit_test.c)
+target_link_libraries(distill-form-submit-test PRIVATE distill-shell)
+distill_enable_assertions(distill-form-submit-test)
+add_test(NAME distill-form-submit COMMAND distill-form-submit-test)
+
+add_executable(distill-settings-test tests/settings_test.c)
+target_link_libraries(distill-settings-test PRIVATE distill-shell)
+# The reader's agreement with GKeyFile is checked against GKeyFile itself
+# wherever GLib is installed; the test runs without it otherwise.
+pkg_check_modules(DISTILL_TEST_GLIB IMPORTED_TARGET glib-2.0)
+if(DISTILL_TEST_GLIB_FOUND)
+    target_compile_definitions(distill-settings-test PRIVATE DISTILL_TEST_GLIB=1)
+    target_link_libraries(distill-settings-test PRIVATE PkgConfig::DISTILL_TEST_GLIB)
+endif()
+distill_enable_assertions(distill-settings-test)
+add_test(NAME distill-settings COMMAND distill-settings-test)
 
 add_executable(distill-app-state-test tests/app_state_test.c src/app_state.c)
 target_include_directories(distill-app-state-test PRIVATE src)
 distill_enable_assertions(distill-app-state-test)
 add_test(NAME distill-app-state COMMAND distill-app-state-test)
 
-add_executable(distill-litehtml-geometry-test tests/litehtml_geometry_test.c src/litehtml_probe.cpp src/image.c)
-target_compile_definitions(distill-litehtml-geometry-test PRIVATE
-    DISTILL_TEST_FONT_DIR="${CMAKE_SOURCE_DIR}/external/fonts"
-)
-target_include_directories(distill-litehtml-geometry-test PRIVATE
-    src
-    "${EXTERNAL_PREFIX}/include"
-)
-target_link_directories(distill-litehtml-geometry-test PRIVATE "${EXTERNAL_PREFIX}/lib")
-target_link_libraries(distill-litehtml-geometry-test PRIVATE
-    litehtml
-    gumbo
-    distill-render-core
-)
-distill_enable_assertions(distill-litehtml-geometry-test)
-add_test(NAME distill-litehtml-geometry COMMAND distill-litehtml-geometry-test)
+if(DISTILL_HAVE_RENDERER)
+    add_executable(distill-litehtml-geometry-test tests/litehtml_geometry_test.c src/litehtml_probe.cpp src/image.c)
+    target_compile_definitions(distill-litehtml-geometry-test PRIVATE
+        DISTILL_TEST_FONT_DIR="${CMAKE_SOURCE_DIR}/external/fonts"
+    )
+    target_include_directories(distill-litehtml-geometry-test PRIVATE
+        src
+        "${EXTERNAL_PREFIX}/include"
+    )
+    target_link_directories(distill-litehtml-geometry-test PRIVATE "${EXTERNAL_PREFIX}/lib")
+    target_link_libraries(distill-litehtml-geometry-test PRIVATE
+        litehtml
+        gumbo
+        distill-render-core
+    )
+    distill_enable_assertions(distill-litehtml-geometry-test)
+    add_test(NAME distill-litehtml-geometry COMMAND distill-litehtml-geometry-test)
+endif()
 
 # The audio core. miniaudio is a single-source third-party header, vendored
 # under external/ like every other dependency, and compiled in exactly one
@@ -75,19 +128,45 @@ target_include_directories(distill-media-audio PUBLIC src PRIVATE "${CMAKE_SOURC
 target_compile_options(distill-media-audio PRIVATE -w)
 target_link_libraries(distill-media-audio PUBLIC Threads::Threads ${CMAKE_DL_LIBS} m)
 
+add_executable(distill-media-transfer-test tests/media_transfer_test.c)
+target_link_libraries(distill-media-transfer-test PRIVATE distill-shell)
+distill_enable_assertions(distill-media-transfer-test)
+add_test(NAME distill-media-transfer COMMAND distill-media-transfer-test)
+
 add_executable(distill-media-audio-test tests/media_audio_test.c)
 target_link_libraries(distill-media-audio-test PRIVATE distill-media-audio m)
 distill_enable_assertions(distill-media-audio-test)
 add_test(NAME distill-media-audio COMMAND distill-media-audio-test)
 
-add_library(distill-render-core STATIC src/render.c src/shaper.c src/image.c)
-target_link_libraries(distill-render-core PUBLIC PkgConfig::DISTILL_RENDER PkgConfig::DISTILL_IMAGE)
+if(DISTILL_HAVE_RENDERER)
+    add_library(distill-render-core STATIC src/render.c)
+    target_link_libraries(distill-render-core PUBLIC PkgConfig::DISTILL_RENDER distill-shaper distill-image)
+endif()
 
-add_executable(distill src/main.c src/litehtml_probe.cpp)
+# The reader-page walker and the front ends that are not litehtml: the
+# Markdown export today, the terminal renderer beside it. It reads the page
+# Distill wrote, so it needs Lexbor and the line breaker and nothing that
+# paints.
+add_library(distill-reader STATIC src/reader_walk.c src/reader_markdown.c src/reader_cells.c)
+target_include_directories(distill-reader PUBLIC src "${EXTERNAL_PREFIX}/include")
+target_link_directories(distill-reader PUBLIC "${EXTERNAL_PREFIX}/lib")
+target_link_libraries(distill-reader PUBLIC lexbor distill-shaper)
+
+add_executable(distill-reader-cells-test tests/reader_cells_test.c)
+target_link_libraries(distill-reader-cells-test PRIVATE distill-reader)
+set_target_properties(distill-reader-cells-test PROPERTIES BUILD_RPATH "${EXTERNAL_PREFIX}/lib")
+distill_enable_assertions(distill-reader-cells-test)
+add_test(NAME distill-reader-cells COMMAND distill-reader-cells-test)
+
+# DISTILL_READER: this build produces the reader page -- the template, the
+# Markdown export, media fetches. DISTILL_RENDER: it can also lay that page
+# out and paint it. The first does not need the second, and a terminal
+# front end is exactly the build that has one without the other.
+add_executable(distill src/main.c)
 target_compile_definitions(distill PRIVATE
     DISTILL_SOURCE_DIR="${CMAKE_SOURCE_DIR}"
     DISTILL_INSTALL_PROFILE_DIR="${CMAKE_INSTALL_FULL_DATADIR}/distill/profiles"
-    DISTILL_RENDER=1
+    DISTILL_READER=1
 )
 target_include_directories(distill PRIVATE
     "${EXTERNAL_PREFIX}/include"
@@ -97,25 +176,65 @@ target_link_directories(distill PRIVATE "${EXTERNAL_PREFIX}/lib")
 target_link_libraries(distill PRIVATE
     qjs
     lexbor
-    litehtml
-    gumbo
     CURL::libcurl
     Threads::Threads
-    distill-render-core
+    distill-image
+    distill-reader
     ${CMAKE_DL_LIBS}
     m
 )
+if(DISTILL_HAVE_RENDERER)
+    target_sources(distill PRIVATE src/litehtml_probe.cpp)
+    target_compile_definitions(distill PRIVATE DISTILL_RENDER=1)
+    target_link_libraries(distill PRIVATE litehtml gumbo distill-render-core)
+endif()
 set_target_properties(distill PROPERTIES
     BUILD_RPATH "${EXTERNAL_PREFIX}/lib"
     INSTALL_RPATH "${EXTERNAL_PREFIX}/lib"
 )
 
 install(TARGETS distill RUNTIME DESTINATION bin)
+
+# The terminal front end. termbox2 is a vendored single header, like
+# miniaudio, pinned to a commit rather than a release: v2.5.0 measures cell
+# widths with libc's locale-dependent wcwidth(), and the built-in tables on
+# master are what a reader whose output is gated needs.
+#   termbox2 master cdf62e9990d8b200768780080fb10a4e2f680051 (2026-09-03)
+#   sha256 edfa22b227c1a82a4a33ffcd1699b2903a7bff46075a210be2e8849127c63f62
+set(DISTILL_TERMBOX_DIR "${CMAKE_SOURCE_DIR}/external/src/termbox2")
+if(EXISTS "${DISTILL_TERMBOX_DIR}/termbox2.h")
+    add_library(distill-termbox STATIC src/termbox_impl.c)
+    target_include_directories(distill-termbox PUBLIC "${DISTILL_TERMBOX_DIR}")
+    target_compile_options(distill-termbox PRIVATE -w)
+
+    add_library(distill-tui-core STATIC src/tui_screen.c src/term_image.c)
+    target_link_libraries(distill-tui-core PUBLIC distill-reader distill-image)
+
+    add_executable(distill-tui src/tui.c src/app_state.c)
+    target_compile_definitions(distill-tui PRIVATE
+        DISTILL_ENGINE_PATH="${CMAKE_BINARY_DIR}/distill"
+        DISTILL_SOURCE_DIR="${CMAKE_SOURCE_DIR}"
+        DISTILL_INSTALL_WELCOME_PAGE="${CMAKE_INSTALL_FULL_DATADIR}/distill/welcome.html"
+    )
+    target_link_libraries(distill-tui PRIVATE
+        distill-tui-core
+        distill-shell
+        distill-media-audio
+        distill-termbox
+    )
+    set_target_properties(distill-tui PROPERTIES
+        BUILD_RPATH "${EXTERNAL_PREFIX}/lib"
+        INSTALL_RPATH "${EXTERNAL_PREFIX}/lib"
+    )
+    install(TARGETS distill-tui RUNTIME DESTINATION bin)
+else()
+    message(STATUS "termbox2 not found under external/src/termbox2; skipping distill-tui")
+endif()
 install(DIRECTORY profiles/ DESTINATION ${CMAKE_INSTALL_DATADIR}/distill/profiles
         FILES_MATCHING PATTERN "*.json")
 install(FILES share/welcome.html DESTINATION ${CMAKE_INSTALL_DATADIR}/distill)
 
-if(DISTILL_GTK_FOUND)
+if(DISTILL_HAVE_RENDERER AND DISTILL_GTK_FOUND)
     add_executable(distill-gtk src/app.c src/app_state.c src/litehtml_probe.cpp)
     target_compile_definitions(distill-gtk PRIVATE
         DISTILL_ENGINE_PATH="${CMAKE_BINARY_DIR}/distill"
@@ -129,7 +248,8 @@ if(DISTILL_GTK_FOUND)
     )
     target_link_directories(distill-gtk PRIVATE "${EXTERNAL_PREFIX}/lib")
     target_link_libraries(distill-gtk PRIVATE
-    distill-media-audio
+        distill-media-audio
+        distill-shell
         litehtml
         gumbo
         distill-render-core
@@ -141,7 +261,7 @@ if(DISTILL_GTK_FOUND)
     )
     install(TARGETS distill-gtk RUNTIME DESTINATION bin)
 else()
-    message(STATUS "GTK3 not found; skipping optional distill-gtk desktop shell")
+    message(STATUS "GTK3 or the renderer not found; skipping optional distill-gtk desktop shell")
 endif()
 
 add_executable(distill-arm-b src/main.c)
@@ -155,13 +275,15 @@ set_target_properties(distill-arm-b PROPERTIES
 )
 install(TARGETS distill-arm-b RUNTIME DESTINATION bin)
 
-add_executable(distill-arm-b-pruned src/main.c src/litehtml_probe.cpp src/render.c src/shaper.c src/image.c)
-target_compile_definitions(distill-arm-b-pruned PRIVATE DISTILL_B_PRUNED=1 DISTILL_NO_EXTRACT=1)
-target_include_directories(distill-arm-b-pruned PRIVATE "${EXTERNAL_PREFIX}/include" ${CURL_INCLUDE_DIRS})
-target_link_directories(distill-arm-b-pruned PRIVATE "${EXTERNAL_PREFIX}/lib")
-target_link_libraries(distill-arm-b-pruned PRIVATE qjs CURL::libcurl litehtml gumbo Threads::Threads PkgConfig::DISTILL_RENDER PkgConfig::DISTILL_IMAGE ${CMAKE_DL_LIBS} m)
-set_target_properties(distill-arm-b-pruned PROPERTIES
-    BUILD_RPATH "${EXTERNAL_PREFIX}/lib"
-    INSTALL_RPATH "${EXTERNAL_PREFIX}/lib"
-)
-install(TARGETS distill-arm-b-pruned RUNTIME DESTINATION bin)
+if(DISTILL_HAVE_RENDERER)
+    add_executable(distill-arm-b-pruned src/main.c src/litehtml_probe.cpp src/render.c src/shaper.c src/image.c)
+    target_compile_definitions(distill-arm-b-pruned PRIVATE DISTILL_B_PRUNED=1 DISTILL_NO_EXTRACT=1)
+    target_include_directories(distill-arm-b-pruned PRIVATE "${EXTERNAL_PREFIX}/include" ${CURL_INCLUDE_DIRS})
+    target_link_directories(distill-arm-b-pruned PRIVATE "${EXTERNAL_PREFIX}/lib")
+    target_link_libraries(distill-arm-b-pruned PRIVATE qjs CURL::libcurl litehtml gumbo Threads::Threads PkgConfig::DISTILL_RENDER PkgConfig::DISTILL_UNIBREAK PkgConfig::DISTILL_IMAGE ${CMAKE_DL_LIBS} m)
+    set_target_properties(distill-arm-b-pruned PROPERTIES
+        BUILD_RPATH "${EXTERNAL_PREFIX}/lib"
+        INSTALL_RPATH "${EXTERNAL_PREFIX}/lib"
+    )
+    install(TARGETS distill-arm-b-pruned RUNTIME DESTINATION bin)
+endif()

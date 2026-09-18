@@ -1,9 +1,13 @@
 #define _POSIX_C_SOURCE 200809L
 
 #include "app_state.h"
+#include "address.h"
+#include "form_submit.h"
+#include "media_transfer.h"
 #include "media_audio.h"
 #include "app_icon.h"
 #include <glib/gstdio.h>
+#include <glib-unix.h>
 #include <signal.h>
 #include "image.h"
 
@@ -278,7 +282,9 @@ struct App {
     guint load_serial;
     /* Media. The transport is an adapter over the audio core; the transfer is
        the one download mechanism both media actions share. */
-    struct MediaTransfer *transfer;
+    DMediaTransfer *transfer;
+    guint transfer_watch;
+    bool transfer_play;
     GtkWidget *transfer_row;
     GtkWidget *transfer_label;
     GtkWidget *transport_row;
@@ -795,25 +801,14 @@ static bool has_scheme(const char *uri, const char *scheme)
 
 static bool page_uri_allowed(const char *uri)
 {
-    if (!uri || !*uri) return false;
-    if (has_scheme(uri, "http") || has_scheme(uri, "https") || has_scheme(uri, "file")) return true;
-    return !strchr(uri, ':');
+    return d_page_uri_allowed(uri);
 }
 
-/* The search engine the reader is pointed at. DuckDuckGo's HTML endpoint is
-   chosen on measured behaviour rather than preference: it is server-rendered,
-   needs no JavaScript, and wraps each result in a "result" class, which is the
-   signal the extractor's search-results shape keys on. Measured against the
-   same query, it produced 27 structured result records where Mojeek, Brave,
-   Ecosia, Startpage and SearX produced none, and Marginalia rate-limited the
-   request outright. Override with DISTILL_SEARCH_URL; the encoded query is
-   appended to whatever it is set to. */
-#define DISTILL_DEFAULT_SEARCH_URL "https://html.duckduckgo.com/html/?q="
+/* The search engine and its reasoning live in address.h. */
 
 static bool external_uri_allowed(const char *uri)
 {
-    return has_scheme(uri, "http") || has_scheme(uri, "https") ||
-           has_scheme(uri, "mailto") || has_scheme(uri, "tel");
+    return d_external_uri_allowed(uri);
 }
 
 /* DuckDuckGo hands out result links as /l/?uddg=<target>, and that redirect
@@ -822,26 +817,7 @@ static bool external_uri_allowed(const char *uri)
    following the wrapper, otherwise every search result is a dead end. */
 static char *unwrap_redirect(const char *uri)
 {
-    if (!uri) return NULL;
-    const char *host = strstr(uri, "duckduckgo.com/l/");
-    if (!host) return NULL;
-    const char *query = strchr(host, '?');
-    if (!query) return NULL;
-    for (const char *p = query + 1; *p; ) {
-        const char *end = strchr(p, '&');
-        size_t span = end ? (size_t)(end - p) : strlen(p);
-        if (span > 5 && strncmp(p, "uddg=", 5) == 0) {
-            char *encoded = g_strndup(p + 5, span - 5);
-            char *target = g_uri_unescape_string(encoded, NULL);
-            g_free(encoded);
-            if (target && (has_scheme(target, "http") || has_scheme(target, "https"))) return target;
-            g_free(target);
-            return NULL;
-        }
-        if (!end) break;
-        p = end + 1;
-    }
-    return NULL;
+    return d_address_unwrap_redirect(uri);
 }
 
 static char *engine_path(void)
@@ -1534,83 +1510,52 @@ static void app_navigate(App *app, const char *uri, const char *method,
    Asynchronous, because the blocking fetch that serves a thumbnail is not
    usable for an episode: this one reports progress, can be cancelled, and
    renames into place only once the transfer has finished. */
-typedef struct MediaTransfer {
-    App *app;
-    GPid pid;
-    guint watch;
-    char *partial;      /* where the engine writes */
-    char *destination;  /* where it belongs once complete, or NULL to keep */
-    char *url;
-    bool play_when_done;
-} MediaTransfer;
-
+/* The transfer itself is the shared one (media_transfer.h): the engine run
+   with --fetch-media, heard through a descriptor. What is the desktop's own
+   is what happens once it ends -- a status line, a player -- so that is all
+   that is here. */
 static void transport_sync(App *app);
-
-static void media_transfer_free(MediaTransfer *transfer)
-{
-    if (!transfer) return;
-    g_free(transfer->partial);
-    g_free(transfer->destination);
-    g_free(transfer->url);
-    g_free(transfer);
-}
 
 static void media_transfer_cancel(App *app)
 {
-    MediaTransfer *transfer = app->transfer;
-    if (!transfer) return;
+    if (!app->transfer) return;
+    if (app->transfer_watch) g_source_remove(app->transfer_watch);
+    app->transfer_watch = 0;
+    d_media_transfer_cancel(app->transfer);
     app->transfer = NULL;
-    if (transfer->watch) g_source_remove(transfer->watch);
-    if (transfer->pid > 0) { kill(transfer->pid, SIGTERM); g_spawn_close_pid(transfer->pid); }
-    /* A cancelled transfer leaves nothing behind. */
-    if (transfer->partial) unlink(transfer->partial);
-    media_transfer_free(transfer);
     gtk_widget_hide(app->transfer_row);
     set_status(app, "Transfer cancelled");
 }
 
-static void media_transfer_finished(GPid pid, gint status, gpointer data)
+static gboolean media_transfer_ready(gint fd, GIOCondition condition, gpointer data)
 {
-    MediaTransfer *transfer = data;
-    App *app = transfer->app;
-    if (app->transfer != transfer) { media_transfer_free(transfer); return; }
+    (void)fd; (void)condition;
+    App *app = data;
+    DMediaTransfer *transfer = app->transfer;
+    if (!transfer) { app->transfer_watch = 0; return G_SOURCE_REMOVE; }
+    DTransferState state = d_media_transfer_poll(transfer);
+    if (state == D_TRANSFER_RUNNING) return G_SOURCE_CONTINUE;
     app->transfer = NULL;
-    g_spawn_close_pid(pid);
-    GError *error = NULL;
-    bool ok = g_spawn_check_wait_status(status, &error);
+    app->transfer_watch = 0;
     gtk_widget_hide(app->transfer_row);
-    if (!ok) {
-        if (transfer->partial) unlink(transfer->partial);
+    if (state == D_TRANSFER_FAILED) {
         char *message = g_strdup_printf("Could not fetch the media: %s",
-                                        error ? error->message : "the engine failed");
+                                        d_media_transfer_error(transfer));
         set_status(app, message);
         g_free(message);
-        if (error) g_error_free(error);
-        media_transfer_free(transfer);
-        return;
-    }
-    if (transfer->destination) {
-        /* Rename only now. A partial file that looks like a finished one is
-           worse than no file at all. */
-        if (g_rename(transfer->partial, transfer->destination) != 0) {
-            char *message = g_strdup_printf("Downloaded, but could not be saved as %s: %s",
-                                            transfer->destination, g_strerror(errno));
-            set_status(app, message);
-            g_free(message);
-            unlink(transfer->partial);
-        } else {
-            char *message = g_strdup_printf("Saved to %s", transfer->destination);
-            set_status(app, message);
-            g_free(message);
-        }
-    } else if (transfer->play_when_done) {
+    } else if (!app->transfer_play) {
+        char *message = g_strdup_printf("Saved to %s", d_media_transfer_path(transfer));
+        set_status(app, message);
+        g_free(message);
+    } else {
+        if (app->audio_file) unlink(app->audio_file);
         g_free(app->audio_file);
-        app->audio_file = g_strdup(transfer->partial);
-        if (!media_audio_open(app->audio_file, transfer->url)) {
-            MediaAudioState state;
-            media_audio_snapshot(&state);
+        app->audio_file = g_strdup(d_media_transfer_path(transfer));
+        if (!media_audio_open(app->audio_file, d_media_transfer_url(transfer))) {
+            MediaAudioState audio;
+            media_audio_snapshot(&audio);
             char *message = g_strdup_printf("Cannot play this file: %s",
-                                            state.error_message[0] ? state.error_message
+                                            audio.error_message[0] ? audio.error_message
                                                                    : "no decoder accepted it");
             set_status(app, message);
             g_free(message);
@@ -1620,7 +1565,8 @@ static void media_transfer_finished(GPid pid, gint status, gpointer data)
         }
         transport_sync(app);
     }
-    media_transfer_free(transfer);
+    d_media_transfer_free(transfer);
+    return G_SOURCE_REMOVE;
 }
 
 /* Fetch through the engine, which owns URL validation and the network. The
@@ -1629,47 +1575,26 @@ static bool media_transfer_start(App *app, const char *url, const char *destinat
                                  bool play_when_done)
 {
     if (app->transfer) media_transfer_cancel(app);
-    char *partial = destination ? g_strdup_printf("%s.part", destination)
-                                : temporary_path("distill-media-XXXXXX");
-    if (!partial) { set_status(app, "Unable to create a temporary file"); return false; }
     char *engine = engine_path();
-    GPtrArray *arguments = g_ptr_array_new_with_free_func(g_free);
-    add_arg(arguments, engine ? engine : "distill");
-    add_arg(arguments, "--url");
-    add_arg(arguments, url);
-    add_arg(arguments, "--fetch-media");
-    add_arg(arguments, partial);
+    char *error = NULL;
     /* Audio is going to a decoder, so the engine checks the bytes really are
        something this reader can decode. A download is going to disk as a copy
        of the source file, so it is not the engine's business what it holds. */
-    add_arg(arguments, "--fetch-kind");
-    add_arg(arguments, play_when_done ? "audio" : "any");
-    g_ptr_array_add(arguments, NULL);
-    GPid pid = 0;
-    GError *error = NULL;
-    gboolean spawned = g_spawn_async(NULL, (char **)arguments->pdata, NULL,
-                                     G_SPAWN_SEARCH_PATH | G_SPAWN_DO_NOT_REAP_CHILD,
-                                     NULL, NULL, &pid, &error);
-    g_ptr_array_free(arguments, TRUE);
+    DMediaTransfer *transfer = d_media_transfer_start(engine ? engine : "distill", url, destination,
+                                                      play_when_done ? "audio" : "any", &error);
     g_free(engine);
-    if (!spawned) {
-        char *message = g_strdup_printf("Could not start the fetch: %s",
-                                        error ? error->message : "unknown error");
+    if (!transfer) {
+        char *message = g_strdup_printf("Could not start the fetch: %s", error ? error : "unknown error");
         set_status(app, message);
         g_free(message);
-        if (error) g_error_free(error);
-        g_free(partial);
+        free(error);
         return false;
     }
-    MediaTransfer *transfer = g_new0(MediaTransfer, 1);
-    transfer->app = app;
-    transfer->pid = pid;
-    transfer->partial = partial;
-    transfer->destination = g_strdup(destination);
-    transfer->url = g_strdup(url);
-    transfer->play_when_done = play_when_done;
     app->transfer = transfer;
-    transfer->watch = g_child_watch_add(pid, media_transfer_finished, transfer);
+    app->transfer_play = play_when_done;
+    app->transfer_watch = g_unix_fd_add(d_media_transfer_fd(transfer),
+                                        G_IO_IN | G_IO_HUP | G_IO_ERR,
+                                        media_transfer_ready, app);
     gtk_label_set_text(GTK_LABEL(app->transfer_label),
                        play_when_done ? "Fetching audio\xe2\x80\xa6" : "Downloading\xe2\x80\xa6");
     gtk_widget_show(app->transfer_row);
@@ -2579,14 +2504,6 @@ static void submit_clicked(GtkWidget *widget, gpointer opaque)
     if (app) form_submit(app, control);
 }
 
-static size_t find_form_control_count(const App *app, unsigned int form_index)
-{
-    size_t count = 0;
-    for (size_t i = 0; i < app->control_count; ++i)
-        if (app->controls[i].box.form_index == form_index) ++count;
-    return count;
-}
-
 static bool form_type_is(const DFormBox *box, const char *type)
 {
     return box && type && strcasecmp(box->type, type) == 0;
@@ -2775,37 +2692,6 @@ static void add_native_controls(App *app)
     }
 }
 
-static char *form_encode(const char *text)
-{
-    DBuffer buffer;
-    dbuf_init(&buffer);
-    for (const unsigned char *p = (const unsigned char *)(text ? text : ""); *p; ++p) {
-        if ((*p >= 'a' && *p <= 'z') || (*p >= 'A' && *p <= 'Z') ||
-            (*p >= '0' && *p <= '9') || *p == '-' || *p == '_' ||
-            *p == '.' || *p == '~') {
-            dbuf_append(&buffer, (const char *)p, 1);
-        } else if (*p == ' ') {
-            dbuf_puts(&buffer, "+");
-        } else {
-            dbuf_printf(&buffer, "%%%02X", *p);
-        }
-    }
-    return dbuf_take(&buffer);
-}
-
-static void append_form_pair(DBuffer *data, const char *name, const char *value)
-{
-    if (!name || !*name) return;
-    if (data->length) dbuf_puts(data, "&");
-    char *encoded_name = form_encode(name);
-    char *encoded_value = form_encode(value ? value : "");
-    dbuf_puts(data, encoded_name);
-    dbuf_puts(data, "=");
-    dbuf_puts(data, encoded_value);
-    free(encoded_name);
-    free(encoded_value);
-}
-
 static const char *control_value(const FormControl *control, char **owned)
 {
     *owned = NULL;
@@ -2828,101 +2714,50 @@ static const char *control_value(const FormControl *control, char **owned)
     return control->box.value;
 }
 
-static bool radio_group_is_active(const App *app, const FormControl *radio)
-{
-    if (!app || !radio) return false;
-    for (size_t i = 0; i < app->control_count; ++i) {
-        const FormControl *candidate = &app->controls[i];
-        if (candidate->box.form_index != radio->box.form_index ||
-            !form_type_is(&candidate->box, "radio") ||
-            strcmp(candidate->box.name, radio->box.name) != 0 ||
-            !GTK_IS_TOGGLE_BUTTON(candidate->widget)) continue;
-        if (gtk_toggle_button_get_active(GTK_TOGGLE_BUTTON(candidate->widget))) return true;
-    }
-    return false;
-}
-
-static bool form_control_is_empty(const App *app, const FormControl *control)
-{
-    if (!control) return true;
-    if (form_type_is(&control->box, "radio")) return !radio_group_is_active(app, control);
-    if (form_control_is_choice(control))
-        return !control->widget || !gtk_toggle_button_get_active(GTK_TOGGLE_BUTTON(control->widget));
-    char *owned = NULL;
-    const char *value = control_value(control, &owned);
-    bool empty = !value || !*value;
-    g_free(owned);
-    return empty;
-}
-
-static bool form_control_is_successful(const FormControl *control,
-                                       const FormControl *submit_control)
-{
-    if (!control || control->box.disabled || !control->box.name[0]) return false;
-    if (form_control_is_submit(control)) return control == submit_control;
-    if (form_type_is(&control->box, "reset") || form_type_is(&control->box, "button"))
-        return false;
-    if (form_control_is_choice(control))
-        return control->widget && gtk_toggle_button_get_active(GTK_TOGGLE_BUTTON(control->widget));
-    return true;
-}
-
-static char *append_query(const char *action, const char *data)
-{
-    const char *hash = strchr(action, '#');
-    size_t prefix_length = hash ? (size_t)(hash - action) : strlen(action);
-    char *prefix = d_strndup(action, prefix_length);
-    const char *separator = strchr(prefix, '?') ? (data && *data ? "&" : "") : (data && *data ? "?" : "");
-    char *out = d_cat4(prefix, separator, data ? data : "", hash ? hash : "");
-    free(prefix);
-    return out;
-}
-
 static void form_submit(App *app, const FormControl *submit_control)
 {
     if (!submit_control) return;
-    unsigned int form_index = submit_control->box.form_index;
-    if (!find_form_control_count(app, form_index)) return;
-    DBuffer data;
-    dbuf_init(&data);
-    const char *action = submit_control->box.action;
-    const char *method = submit_control->box.method[0] ? submit_control->box.method : "get";
+    /* What each control holds now, handed to the rules every front end
+       submits by: the terminal sends exactly what this sends. */
+    DFormField *fields = app->control_count ? g_new0(DFormField, app->control_count) : NULL;
+    char **owned = app->control_count ? g_new0(char *, app->control_count) : NULL;
+    size_t submitter = app->control_count;
     for (size_t i = 0; i < app->control_count; ++i) {
         const FormControl *control = &app->controls[i];
-        if (control->box.form_index != form_index || control->box.disabled ||
-            !control->box.required || form_control_is_submit(control) ||
-            form_type_is(&control->box, "reset") || form_type_is(&control->box, "button")) continue;
-        if (form_control_is_empty(app, control)) {
-            char *message = g_strdup_printf("Complete required field: %s",
-                                            control->box.name[0] ? control->box.name : "field");
-            set_status(app, message);
-            g_free(message);
-            dbuf_free(&data);
-            return;
-        }
+        bool choice = form_control_is_choice(control);
+        fields[i] = (DFormField){
+            .form_index = control->box.form_index,
+            .tag = control->box.tag,
+            .type = control->box.type,
+            .name = control->box.name,
+            .value = choice ? control->box.value : control_value(control, &owned[i]),
+            .checked = choice && control->widget &&
+                       gtk_toggle_button_get_active(GTK_TOGGLE_BUTTON(control->widget)),
+            .disabled = control->box.disabled,
+            .required = control->box.required,
+        };
+        if (control == submit_control) submitter = i;
     }
-    for (size_t i = 0; i < app->control_count; ++i) {
-        const FormControl *control = &app->controls[i];
-        if (control->box.form_index != form_index) continue;
-        if (!form_control_is_successful(control, submit_control)) continue;
-        char *owned = NULL;
-        const char *value = control_value(control, &owned);
-        append_form_pair(&data, control->box.name, value);
-        g_free(owned);
-    }
-    if (!page_uri_allowed(action)) {
+    DFormRequest request;
+    DFormStatus status = d_form_build(fields, app->control_count, submitter,
+                                      submit_control->box.action,
+                                      submit_control->box.method[0] ? submit_control->box.method : "get",
+                                      &request);
+    for (size_t i = 0; i < app->control_count; ++i) g_free(owned[i]);
+    g_free(owned);
+    g_free(fields);
+    if (status == D_FORM_MISSING_REQUIRED) {
+        char *message = g_strdup_printf("Complete required field: %s", request.missing);
+        set_status(app, message);
+        g_free(message);
+    } else if (status == D_FORM_BLOCKED) {
         set_status(app, "Form blocked: unsupported action URI scheme");
-        dbuf_free(&data);
-        return;
+    } else if (status == D_FORM_OK) {
+        bool post = strcmp(request.method, "POST") == 0;
+        app_navigate(app, request.target, post ? "POST" : NULL, post ? request.body : NULL,
+                     false, false);
     }
-    char *target = NULL;
-    if (strcasecmp(method, "post") == 0) target = g_strdup(action);
-    else target = append_query(action, data.data ? data.data : "");
-    app_navigate(app, target, strcasecmp(method, "post") == 0 ? "POST" : NULL,
-                 strcasecmp(method, "post") == 0 ? (data.data ? data.data : "") : NULL,
-                 false, false);
-    g_free(target);
-    dbuf_free(&data);
+    d_form_request_free(&request);
 }
 
 /* Lay out one document and take everything the shell needs from it. Both a
@@ -3147,58 +2982,7 @@ static void app_navigate(App *app, const char *uri, const char *method,
    and typing a scheme forces navigation. */
 static bool entry_looks_like_url(const char *text)
 {
-    if (!text || !*text) return false;
-    if (has_scheme(text, "http") || has_scheme(text, "https") || has_scheme(text, "file")) return true;
-    for (const char *p = text; *p; ++p) {
-        if (*p == ' ' || *p == '\t') return false;
-    }
-    if (text[0] == '/' || text[0] == '~' ||
-        strncmp(text, "./", 2) == 0 || strncmp(text, "../", 3) == 0) return true;
-    /* A scheme we do not handle is not a search term either; let the
-       navigation check reject it by name. */
-    const char *colon = strchr(text, ':');
-    const char *slash = strchr(text, '/');
-    if (colon && (!slash || colon < slash)) {
-        bool port = true;
-        for (const char *p = colon + 1; *p && *p != '/'; ++p) {
-            if (*p < '0' || *p > '9') { port = false; break; }
-        }
-        if (!port) return false;
-    }
-    const char *host_end = strpbrk(text, "/?#");
-    size_t host_len = host_end ? (size_t)(host_end - text) : strlen(text);
-    char *host = g_strndup(text, host_len);
-    if (colon && colon < text + host_len) host[colon - text] = '\0';
-    bool ok = false;
-    if (g_ascii_strcasecmp(host, "localhost") == 0) {
-        ok = true;
-    } else {
-        const char *dot = strrchr(host, '.');
-        if (dot && dot != host && dot[1]) {
-            /* A top-level domain is alphabetic, which is what separates a
-               hostname from a version number: "3.14" is not a host. An
-               address is the other accepted form, and must be four numeric
-               labels rather than merely digits and dots. */
-            bool alpha = true;
-            size_t label = 0;
-            for (const char *p = dot + 1; *p; ++p, ++label) {
-                if (!g_ascii_isalpha(*p)) alpha = false;
-            }
-            ok = alpha && label >= 2;
-            if (!ok && strspn(host, "0123456789.") == strlen(host)) {
-                char **parts = g_strsplit(host, ".", -1);
-                size_t count = g_strv_length(parts);
-                bool address = count == 4;
-                for (size_t i = 0; address && i < count; ++i) {
-                    if (!*parts[i] || strlen(parts[i]) > 3) address = false;
-                }
-                g_strfreev(parts);
-                ok = address;
-            }
-        }
-    }
-    g_free(host);
-    return ok;
+    return d_address_looks_like_url(text);
 }
 
 /* Turn what was typed into something to fetch. When the scheme is this
@@ -3206,31 +2990,7 @@ static bool entry_looks_like_url(const char *text)
    the engine is then allowed to correct it, and only then. */
 static char *resolve_entry_input(const char *raw, bool *https_guessed)
 {
-    if (https_guessed) *https_guessed = false;
-    char *text = g_strstrip(g_strdup(raw ? raw : ""));
-    if (!*text) { g_free(text); return NULL; }
-    if (entry_looks_like_url(text)) {
-        if (has_scheme(text, "http") || has_scheme(text, "https") || has_scheme(text, "file") ||
-            text[0] == '/' || text[0] == '~' ||
-            strncmp(text, "./", 2) == 0 || strncmp(text, "../", 3) == 0) {
-            return text;
-        }
-        /* Loopback names have no certificate to present, so asking for https
-           there fails for a reason that has nothing to do with the request. */
-        bool loopback = g_ascii_strncasecmp(text, "localhost", 9) == 0 ||
-                        g_ascii_strncasecmp(text, "127.0.0.1", 9) == 0;
-        if (https_guessed) *https_guessed = !loopback;
-        char *url = g_strconcat(loopback ? "http://" : "https://", text, NULL);
-        g_free(text);
-        return url;
-    }
-    const char *engine = g_getenv("DISTILL_SEARCH_URL");
-    if (!engine || !*engine) engine = DISTILL_DEFAULT_SEARCH_URL;
-    char *query = form_encode(text);
-    char *url = g_strconcat(engine, query, NULL);
-    free(query);
-    g_free(text);
-    return url;
+    return d_address_resolve(raw, https_guessed);
 }
 
 static void url_activate(GtkWidget *widget, gpointer opaque)
