@@ -17,6 +17,17 @@
 #define DISTILL_SOURCE_DIR "."
 #endif
 
+/* What we tell servers we are. The HTTP header and navigator.userAgent must
+   carry the same string: a page that compares what the server saw against what
+   the DOM reports is checking exactly this pair, and two literals drifting
+   apart is not a difference anyone would notice until a site did.
+
+   Claiming Chrome is a content-fidelity decision, not a disguise -- it
+   materially changes what HTML servers send. The forced HTTP/2 below belongs
+   to the same decision. */
+#define DISTILL_USER_AGENT \
+    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/152.0.0.0 Safari/537.36"
+
 /* Reader zoom, as a percentage of the design size. The bounds are part of the
    command line, so they are defined outside the renderer's build. */
 #define READER_ZOOM_MIN 50
@@ -498,8 +509,7 @@ static void configure_curl_common(Engine *engine, CURL *easy, const char *refere
     if (engine->cookie_jar_path) {
         curl_easy_setopt(easy, CURLOPT_COOKIEJAR, engine->cookie_jar_path);
     }
-    curl_easy_setopt(easy, CURLOPT_USERAGENT,
-                     "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/152.0.0.0 Safari/537.36");
+    curl_easy_setopt(easy, CURLOPT_USERAGENT, DISTILL_USER_AGENT);
     curl_easy_setopt(easy, CURLOPT_ACCEPT_ENCODING, "");
     /* A client presenting a Chrome user agent should negotiate the protocol
        version Chrome negotiates. HTTP/1.1-only traffic from a self-declared
@@ -1573,8 +1583,8 @@ static const char *HOST_JS =
 "globalThis.sessionStorage = {__data: Object.create(null), getItem(k) { return this.__data[k] === undefined ? null : this.__data[k]; }, setItem(k,v) { this.__data[k] = String(v); }, removeItem(k) { delete this.__data[k]; }, clear() { this.__data = Object.create(null); }, key(i) { return Object.keys(this.__data)[i] ?? null; }};"
 "Object.defineProperty(sessionStorage, 'length', {get() { return Object.keys(this.__data).length; }});"
 "__setWindow('localStorage', localStorage); __setWindow('sessionStorage', sessionStorage);"
-"globalThis.navigator = window.navigator || {userAgent: 'Mozilla/5.0 Distill', language: 'en-US', platform: 'Linux'};"
-"Object.defineProperty(navigator, 'userAgent', {value:'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/152.0.0.0 Safari/537.36', configurable:true}); if (!navigator.language) navigator.language = 'en-US'; __setWindow('navigator', navigator);"
+"globalThis.navigator = window.navigator || {userAgent: '" DISTILL_USER_AGENT "', language: 'en-US', platform: 'Linux'};"
+"Object.defineProperty(navigator, 'userAgent', {value:'" DISTILL_USER_AGENT "', configurable:true}); if (!navigator.language) navigator.language = 'en-US'; __setWindow('navigator', navigator);"
 "globalThis.screen = {width: 1280, height: 1024}; __setWindow('screen', screen);"
 "globalThis.visualViewport = {width:1280, height:1024, offsetLeft:0, offsetTop:0, pageLeft:0, pageTop:0, scale:1, addEventListener() {}, removeEventListener() {}}; __setWindow('visualViewport', visualViewport);"
 "globalThis.crypto = {getRandomValues(a) { for (let i=0;i<a.length;i++) a[i] = (i * 73 + 41) & 255; return a; }}; __setWindow('crypto', crypto);"
@@ -1608,6 +1618,21 @@ static const char *HOST_JS =
 "globalThis.MutationObserver = class { constructor(callback) { this.callback = callback; } observe() { this.callback([{}], this); } disconnect() {} };"
 "globalThis.XMLHttpRequest = class { constructor() { this.readyState=0; this.status=0; this.responseText=''; this.responseURL=''; this.onreadystatechange=null; this.onload=null; this.onerror=null; this._headers=Object.create(null); this._responseHeaders=Object.create(null); } open(method,url,async=true) { this._method=method || 'GET'; this._url=url; this._async=async; this.readyState=1; } setRequestHeader(name,value) { const key=String(name).toLowerCase(); this._headers[key]=this._headers[key] ? this._headers[key]+', '+String(value) : String(value); } getResponseHeader(name) { return this._responseHeaders[String(name).toLowerCase()] || null; } getAllResponseHeaders() { return Object.keys(this._responseHeaders).map(k=>k+': '+this._responseHeaders[k]).join('\\r\\n'); } send(body) { fetch(this._url,{method:this._method,body,headers:this._headers}).then(r => { this.status=r.status; this.responseURL=r.url || this._url; r.headers.forEach((v,k)=>{this._responseHeaders[k.toLowerCase()]=v;}); return r.text(); }).then(t => { this.responseText=t; this.readyState=4; if (this.onreadystatechange) this.onreadystatechange(); if (this.onload) this.onload(); }).catch(error => { if (this.onerror) this.onerror(error); }); } };"
 "__setWindow('XMLHttpRequest', XMLHttpRequest); __setWindow('IntersectionObserver', IntersectionObserver); __setWindow('MutationObserver', MutationObserver);"
+/* Audio is a no-op that remembers what it was handed. A page whose player is
+   built in script would otherwise throw mid-settle and take the rest of the
+   page down with it, so this is content fidelity first; the recorded URLs are
+   reported as diagnostics, and never become media references -- the reader
+   plays declarative sources only. See src/documents/MEDIA_PLAYBACK_PLAN.md. */
+"globalThis.__distillScriptAudio = [];"
+"globalThis.Audio = class { constructor(src) { this.src = src == null ? '' : String(src); if (this.src) __distillScriptAudio.push(this.src); this.currentTime=0; this.duration=NaN; this.paused=true; this.ended=false; this.volume=1; this.muted=false; this.loop=false; this.autoplay=false; this.preload='none'; this.readyState=0; this.networkState=0; this.crossOrigin=null; this.error=null; this.__listeners=Object.create(null); } play() { this.paused=false; return Promise.resolve(); } pause() { this.paused=true; } load() {} canPlayType() { return ''; } addEventListener(type, callback) { if (typeof callback !== 'function') return; (this.__listeners[type] = this.__listeners[type] || []).push(callback); } removeEventListener(type, callback) { const list=this.__listeners[type]; if (list) this.__listeners[type]=list.filter(item => item !== callback); } dispatchEvent(event) { const list=this.__listeners[event && event.type]; if (list) for (const callback of list.slice()) callback.call(this, event); return true; } }; __setWindow('Audio', Audio);"
+/* The same courtesy for declarative media elements: linkedom parses <audio>
+   and <video> but gives them no playback methods, and a script calling play()
+   on one is ordinary. Patch the prototypes where they exist, the nodes the
+   document already has, and anything created later. */
+"globalThis.__distillMediaMethods = function(node) { if (!node || typeof node.play === 'function') return node; node.play = function() { return Promise.resolve(); }; node.pause = function() {}; node.load = function() {}; node.canPlayType = function() { return ''; }; return node; };"
+"for (const name of ['HTMLMediaElement','HTMLAudioElement','HTMLVideoElement']) try { const type=globalThis[name]; if (type && type.prototype) __distillMediaMethods(type.prototype); } catch (e) {}"
+"try { for (const node of document.querySelectorAll('audio,video')) __distillMediaMethods(node); } catch (e) {}"
+"if (document.createElement) { const __createElement=document.createElement.bind(document); document.createElement=function(name, options) { const node=__createElement(name, options); const tag=String(name || '').toLowerCase(); if (tag === 'audio' || tag === 'video') __distillMediaMethods(node); return node; }; }"
 "__setWindow('Node', globalThis.Node || {ELEMENT_NODE:1,TEXT_NODE:3,DOCUMENT_NODE:9,DOCUMENT_FRAGMENT_NODE:11});";
 
 static bool evaluate(Engine *engine, const char *source, size_t length,
@@ -1943,6 +1968,8 @@ static const char *challenge_kind(const char *data, size_t length, size_t limit)
         {"pardon the interruption", "bot-mitigation"},
         {"px-captcha", "perimeterx"},
         {"_px_captcha", "perimeterx"},
+        {"vercel security checkpoint", "vercel-security-checkpoint"},
+        {"enable javascript to continue", "vercel-security-checkpoint"},
         {"captcha-delivery.com", "datadome"},
         {"awswafcookiedomainlist", "aws-waf"},
         {"window.gokuprops", "aws-waf"},
@@ -2002,9 +2029,9 @@ static char *serialize_document(Engine *engine)
 #ifndef DISTILL_NO_EXTRACT
 #include "extraction.inc"
 #else
-static char *run_extraction(Engine *engine, const char *serialized)
+static char *run_extraction(Engine *engine, const char *serialized, bool include_readability)
 {
-    (void)engine; (void)serialized;
+    (void)engine; (void)serialized; (void)include_readability;
     return d_strdup("{\"schema\":1,\"readability\":null}");
 }
 #endif
@@ -2142,6 +2169,13 @@ static char *annotate_extraction(Engine *engine, const char *json, const char *s
     JS_SetPropertyStr(engine->context, diagnostics, "settled_score", JS_NewInt64(engine->context, settled->score));
     JS_SetPropertyStr(engine->context, diagnostics, "script_errors", JS_NewInt64(engine->context, (int64_t)engine->script_errors));
     JS_SetPropertyStr(engine->context, diagnostics, "cap_hit", JS_NewBool(engine->context, engine->cap_hit));
+    /* How much audio the page built in script rather than in markup. Not a
+       media reference -- a count, so the decision to chase JS players stays a
+       measurement rather than a guess. */
+    JSValue script_audio = JS_GetPropertyStr(engine->context, engine->global, "__distillScriptAudio");
+    int64_t script_audio_count = JS_IsArray(script_audio) ? json_array_length_for_context(engine->context, script_audio) : 0;
+    JS_FreeValue(engine->context, script_audio);
+    JS_SetPropertyStr(engine->context, diagnostics, "script_audio", JS_NewInt64(engine->context, script_audio_count));
     JS_SetPropertyStr(engine->context, parsed, "diagnostics", diagnostics);
     JSValue serialized = JS_JSONStringify(engine->context, parsed, JS_UNDEFINED, JS_UNDEFINED);
     char *result = JS_IsException(serialized) ? d_strdup(json ? json : "") : js_string(engine->context, serialized);
@@ -2152,20 +2186,22 @@ static char *annotate_extraction(Engine *engine, const char *json, const char *s
 }
 
 static char *select_extraction(Engine *engine, const char *initial_json,
-                               const char *settled_json)
+                               const char *settled_json, bool scripts_failed)
 {
     ExtractionCandidate initial = score_extraction(engine, initial_json);
     ExtractionCandidate settled = score_extraction(engine, settled_json);
-    bool choose_initial = initial.useful &&
+    bool choose_initial = scripts_failed || (initial.useful &&
                           (!settled.useful || settled.error_like ||
-                           initial.score > settled.score + settled.score / 4L);
+                           initial.score > settled.score + settled.score / 4L));
     const char *source = choose_initial ? "initial-html" : "settled-dom";
     const char *reason = choose_initial
-        ? (!settled.useful ? "settled DOM has no useful content"
+        ? (scripts_failed ? "script discovery failed; initial HTML preserved"
+                          : !settled.useful ? "settled DOM has no useful content"
                            : settled.error_like ? "settled DOM is an error or placeholder"
                                                  : "initial HTML has substantially more content")
-        : (initial.useful ? "settled DOM is coherent or improves the page"
-                          : "initial HTML has no useful content");
+        : (!initial_json ? "settled DOM accepted without fallback extraction"
+                         : initial.useful ? "settled DOM is coherent or improves the page"
+                                          : "initial HTML has no useful content");
     const char *selected = choose_initial ? initial_json : settled_json;
     return annotate_extraction(engine, selected, source, reason, &initial, &settled);
 }
@@ -2202,6 +2238,18 @@ static bool json_property_bool(Engine *engine, JSValueConst object, const char *
 {
     JSValue value = JS_GetPropertyStr(engine->context, object, name);
     bool result = JS_ToBool(engine->context, value);
+    JS_FreeValue(engine->context, value);
+    return result;
+}
+
+static double json_property_number(Engine *engine, JSValueConst object, const char *name)
+{
+    JSValue value = JS_GetPropertyStr(engine->context, object, name);
+    double result = 0;
+    if (JS_ToFloat64(engine->context, &result, value) < 0) {
+        JS_FreeValue(engine->context, JS_GetException(engine->context));
+        result = 0;
+    }
     JS_FreeValue(engine->context, value);
     return result;
 }
@@ -2654,6 +2702,75 @@ static void append_display_url(DBuffer *output, const char *url)
     append_html_escaped(output, text + length - tail);
 }
 
+/* Elapsed/total in the form a reader expects to see, not in seconds. */
+static void append_duration(DBuffer *output, double seconds)
+{
+    if (!(seconds > 0)) return;
+    long total = (long)(seconds + 0.5);
+    long hours = total / 3600, minutes = (total % 3600) / 60, rest = total % 60;
+    char text[32];
+    if (hours) snprintf(text, sizeof text, "%ld:%02ld:%02ld", hours, minutes, rest);
+    else snprintf(text, sizeof text, "%ld:%02ld", minutes, rest);
+    dbuf_puts(output, text);
+}
+
+static void append_media_action(DBuffer *output, const char *scheme, const char *url,
+                                const char *label, bool primary)
+{
+    dbuf_printf(output, "<a class=\"button%s\" href=\"", primary ? "" : " button-secondary");
+    dbuf_puts(output, scheme);
+    append_html_escaped(output, url);
+    dbuf_puts(output, "\">");
+    dbuf_puts(output, label);
+    dbuf_puts(output, "</a>");
+}
+
+/* Audio is the one medium the reader plays itself, and it says plainly when it
+   cannot: an Opus or AAC file is a download, not a Play button that fails. */
+static void append_json_audio(Engine *engine, JSValueConst audio, DBuffer *output)
+{
+    int64_t count = json_array_length(engine, audio);
+    for (int64_t i = 0; i < count; ++i) {
+        JSValue item = JS_GetPropertyUint32(engine->context, audio, (uint32_t)i);
+        char *title = json_property_string(engine, item, "title");
+        char *url = json_property_string(engine, item, "url");
+        char *mime = json_property_string(engine, item, "mime");
+        double duration = json_property_number(engine, item, "duration");
+        bool playable = json_property_bool(engine, item, "playable");
+        if (*url) {
+            if (i == 0) append_section_marker(output, "audio");
+            dbuf_puts(output, i == 0
+                              ? "<section id=\"audio\" class=\"audio-card\"><p class=\"eyebrow\">Audio</p><h2>"
+                              : "<section class=\"audio-card\"><p class=\"eyebrow\">Audio</p><h2>");
+            append_html_escaped(output, *title ? title : "Audio");
+            dbuf_puts(output, "</h2>");
+            if (duration > 0 || *mime) {
+                dbuf_puts(output, "<p class=\"media-meta\">");
+                append_duration(output, duration);
+                if (duration > 0 && *mime) dbuf_puts(output, " \xc2\xb7 ");
+                if (*mime) append_html_escaped(output, mime);
+                dbuf_puts(output, "</p>");
+            }
+            if (playable) {
+                append_media_action(output, "distill-play:", url, "Play", true);
+                append_media_action(output, "distill-download:", url, "Download", false);
+            } else {
+                dbuf_puts(output, "<p>This reader decodes MP3, WAV and FLAC. This file is something else, so it is offered as a download.</p>");
+                append_media_action(output, "distill-download:", url, "Download", true);
+                append_media_action(output, "distill-open:", url, "Open externally", false);
+            }
+            dbuf_puts(output, "<p class=\"media-url\">");
+            append_display_url(output, url);
+            dbuf_puts(output, "</p></section>");
+        }
+        free(title); free(url); free(mime);
+        JS_FreeValue(engine->context, item);
+    }
+}
+
+/* The action follows what the reference is. A direct file can be downloaded
+   and never played here; an embed is somebody else's player, so there is
+   nothing to download and the hand-off is the only honest offer. */
 static void append_json_videos(Engine *engine, JSValueConst videos, DBuffer *output)
 {
     int64_t count = json_array_length(engine, videos);
@@ -2662,21 +2779,44 @@ static void append_json_videos(Engine *engine, JSValueConst videos, DBuffer *out
         char *title = json_property_string(engine, video, "title");
         char *url = json_property_string(engine, video, "url");
         char *poster = json_property_string(engine, video, "poster");
+        char *mime = json_property_string(engine, video, "mime");
+        double duration = json_property_number(engine, video, "duration");
+        bool direct = json_property_bool(engine, video, "direct");
         if (i == 0) append_section_marker(output, "videos");
         dbuf_puts(output, i == 0
                          ? "<section id=\"videos\" class=\"video-card\"><p class=\"eyebrow\">Video reference</p><h2>"
                          : "<section class=\"video-card\"><p class=\"eyebrow\">Video reference</p><h2>");
         append_html_escaped(output, *title ? title : "External video");
-        dbuf_puts(output, "</h2><p>This reader keeps playback outside the page.</p><a class=\"button\"");
-        if (*url) append_json_attr(output, "href", url);
-        dbuf_puts(output, ">Open externally</a>");
+        dbuf_puts(output, "</h2>");
+        if (duration > 0 || (*mime && direct)) {
+            dbuf_puts(output, "<p class=\"media-meta\">");
+            append_duration(output, duration);
+            if (duration > 0 && *mime && direct) dbuf_puts(output, " \xc2\xb7 ");
+            if (*mime && direct) append_html_escaped(output, mime);
+            dbuf_puts(output, "</p>");
+        }
+        if (!*url) {
+            dbuf_puts(output, "<p>The page names a video here but gives no address for it.</p>");
+        } else if (direct) {
+            dbuf_puts(output, "<p>This reader keeps playback outside the page. The file can be saved and played later.</p>");
+            append_media_action(output, "distill-download:", url, "Download", true);
+            append_media_action(output, "distill-open:", url, "Open externally", false);
+        } else {
+            dbuf_puts(output, "<p>This is an embedded player, not a file, so there is nothing here to download.</p>");
+            append_media_action(output, "distill-open:", url, "Open externally", true);
+        }
+        if (*url) {
+            dbuf_puts(output, "<p class=\"media-url\">");
+            append_display_url(output, url);
+            dbuf_puts(output, "</p>");
+        }
         if (*poster) {
             dbuf_puts(output, "<p class=\"media-url\">");
             append_display_url(output, poster);
             dbuf_puts(output, "</p>");
         }
         dbuf_puts(output, "</section>");
-        free(title); free(url); free(poster);
+        free(title); free(url); free(poster); free(mime);
         JS_FreeValue(engine->context, video);
     }
 }
@@ -2816,6 +2956,7 @@ static char *reader_template(Engine *engine, const char *json, const char *theme
     JSValue results = JS_GetPropertyStr(engine->context, parsed, "search_results");
     JSValue forms = JS_GetPropertyStr(engine->context, parsed, "forms");
     JSValue videos = JS_GetPropertyStr(engine->context, parsed, "videos");
+    JSValue audio = JS_GetPropertyStr(engine->context, parsed, "audio");
     JSValue media = JS_GetPropertyStr(engine->context, parsed, "media");
     JSValue links = JS_GetPropertyStr(engine->context, parsed, "links");
     JSValue embedded_data = JS_GetPropertyStr(engine->context, parsed, "embedded_data");
@@ -2963,7 +3104,7 @@ static char *reader_template(Engine *engine, const char *json, const char *theme
         "blockquote{margin-left:1.2em;padding-left:1em;border-left:3px solid var(--border);color:var(--muted);}"
         "img,video,iframe{max-width:100%;height:auto;}"
         "table{width:100%;border-collapse:collapse;margin:0 0 1.5em;}th,td{text-align:left;padding:.55em .6em;border-bottom:1px solid var(--border);}"
-        ".table-card,.form-card,.video-card,.media-gallery,.result-list{margin:2em 0;padding:1.2em;background:var(--card-background);border:1px solid var(--border);border-radius:5px;}"
+        ".table-card,.form-card,.video-card,.audio-card,.media-gallery,.result-list{margin:2em 0;padding:1.2em;background:var(--card-background);border:1px solid var(--border);border-radius:5px;}"
         ".result-card{padding:.7em 0;border-bottom:1px solid var(--border);}.result-card h3{margin:0 0 .3em;}"
         ".form-card form{margin:0;background:transparent;text-align:left;}"
         ".form-field-label{display:block;margin:.7em 0 0;color:var(--page-text);text-align:left;}");
@@ -2982,7 +3123,10 @@ static char *reader_template(Engine *engine, const char *json, const char *theme
         ".form-choice span{vertical-align:middle;}"
         ".form-card form>button{margin:.7em .45em 0 0;text-align:left;}"
         "button,.button{display:inline-block;padding:.55em .85em;border:0;border-radius:3px;background:var(--link);color:white;text-decoration:none;font:inherit;}"
-        ".video-card h2,.table-card h2,.form-card h2,.media-gallery h2,.result-list h2{margin-top:0;}"
+        ".video-card h2,.audio-card h2,.table-card h2,.form-card h2,.media-gallery h2,.result-list h2{margin-top:0;}"
+        ".media-meta{color:var(--muted);margin:0 0 0.8em 0;}"
+        ".button-secondary{background:var(--card-background);border:1px solid var(--border);color:var(--page-text);}"
+        ".video-card .button,.audio-card .button{margin:0 .5em .5em 0;}"
         ".eyebrow,.media-url{font-size:.78em;color:var(--muted);}"
         ".section-anchor{display:block;width:1px;height:1px;overflow:hidden;}"
         ".media-item{margin:0 0 .75em;}"
@@ -3035,9 +3179,13 @@ static char *reader_template(Engine *engine, const char *json, const char *theme
             append_json_blocks(engine, blocks, &output, true);
             append_json_table(engine, tables, &output);
             append_json_results(engine, results, &output);
-            append_json_videos(engine, videos, &output);
             append_json_media(engine, media, &output);
         }
+        /* A media reference is not a text block either, and a video inside
+           main is the ordinary case, not the exception -- leaving it to the
+           "rest of the page" branch meant a page with a <main> offered no
+           video action at all. Same reasoning as forms, below. */
+        append_json_videos(engine, videos, &output);
         /* Forms are separate interactive content, not text blocks. Keep them
            available even when the reader selected the whole page as main. */
         append_json_forms(engine, forms, &output);
@@ -3071,6 +3219,11 @@ static char *reader_template(Engine *engine, const char *json, const char *theme
         append_json_videos(engine, videos, &output);
         append_json_media(engine, media, &output);
     }
+    /* Audio is the one medium the reader plays itself, and no shape decision
+       should be able to swallow it: a podcast page is an article, a station
+       page is a link index, and the player is the point of both. Rendered once
+       here rather than per branch, after whatever the shape chose. */
+    append_json_audio(engine, audio, &output);
     if (embedded_mapped) append_json_navigation(engine, embedded_navigation, &output);
     dbuf_puts(&output, "</main></body></html>");
     free(shape_kind);
@@ -3085,6 +3238,7 @@ static char *reader_template(Engine *engine, const char *json, const char *theme
     JS_FreeValue(engine->context, results);
     JS_FreeValue(engine->context, forms);
     JS_FreeValue(engine->context, videos);
+    JS_FreeValue(engine->context, audio);
     JS_FreeValue(engine->context, media);
     JS_FreeValue(engine->context, links);
     JS_FreeValue(engine->context, embedded_blocks);
@@ -3359,10 +3513,28 @@ static bool set_document_base(Engine *engine)
     return true;
 }
 
+/* The formats the audio core actually decodes, recognised from the bytes
+   rather than from a served content type the page controls. Keeping this in
+   step with media_is_playable in the extractor is the point: a card offers
+   Play only for these, and the fetch refuses anything else. */
+static const char *audio_format_name(const unsigned char *data, size_t length)
+{
+    if (!data || length < 12) return "";
+    if (memcmp(data, "RIFF", 4) == 0 && memcmp(data + 8, "WAVE", 4) == 0) return "WAV";
+    if (memcmp(data, "fLaC", 4) == 0) return "FLAC";
+    if (memcmp(data, "ID3", 3) == 0) return "MP3";
+    /* A bare MPEG audio frame: sync bits set, and neither a reserved layer
+       nor a reserved bitrate index. */
+    if (data[0] == 0xff && (data[1] & 0xe0) == 0xe0 &&
+        (data[1] & 0x06) != 0x00 && (data[2] & 0xf0) != 0xf0) return "MP3";
+    return "";
+}
+
 static int run_page(const char *input, uint64_t cap_ms, uint64_t memory_mb,
                     uint64_t max_scripts, bool dump_dom, bool extract,
                     const char *render_path, const char *viewer_path, int media_index,
                     const char *save_media_path, const char *fetch_media_path,
+                    const char *fetch_kind,
                     int render_width, int render_height,
                     const char *font_dir, const char *template_path,
                     const char *theme, bool native_forms, int zoom,
@@ -3453,14 +3625,26 @@ static int run_page(const char *input, uint64_t cap_ms, uint64_t memory_mb,
        page controlled, and a file that says image/png while holding something
        else must not reach a decoder as if it were a PNG. */
     if (fetch_media_path) {
-        const char *format = d_image_format_name((const unsigned char *)html.data, html.length);
+        /* What the bytes are allowed to be depends on what the caller will do
+           with them. The viewer decodes an image, so it keeps the strict check
+           that has always been here. The audio core decodes a sound file, so
+           it gets the same treatment against audio magic. A download decodes
+           nothing at all -- it is a copy of the source file, unmodified -- so
+           it takes whatever the server sent. */
+        const char *format = d_eq(fetch_kind, "audio")
+                             ? audio_format_name((const unsigned char *)html.data, html.length)
+                             : d_eq(fetch_kind, "any")
+                             ? "file"
+                             : d_image_format_name((const unsigned char *)html.data, html.length);
         bool ok = *format && write_file_bytes(fetch_media_path, html.data, html.length);
         if (!ok && !*format)
-            fprintf(stderr, "not an image: %s\n", engine.source_url);
+            fprintf(stderr, "not %s: %s\n",
+                    d_eq(fetch_kind, "audio") ? "audio this reader can decode" : "an image",
+                    engine.source_url);
         else if (!ok)
             fprintf(stderr, "unable to write %s\n", fetch_media_path);
         else
-            fprintf(stderr, "fetched %s image, %zu bytes\n", format, html.length);
+            fprintf(stderr, "fetched %s, %zu bytes\n", format, html.length);
         dbuf_free(&html);
         free(initial_html);
         engine_cleanup(&engine);
@@ -3508,19 +3692,21 @@ static int run_page(const char *input, uint64_t cap_ms, uint64_t memory_mb,
     dbuf_free(&html);
     set_document_base(&engine);
     bool needs_extraction = viewer_path || render_path || template_path || extract;
-    char *initial_json = needs_extraction ? run_extraction(&engine, initial_html) : NULL;
+    char *initial_json = NULL;
     report_progress(&engine, PROGRESS_FETCH_END, "scripts");
+    bool scripts_failed = false;
     if (!engine.challenge) {
         if (!discover_scripts(&engine)) {
-            free(initial_json);
-            free(initial_html);
-            engine_cleanup(&engine);
-#ifdef DISTILL_RENDER
-            free(owned_font_dir);
-#endif
-            return 2;
+            /* Script discovery can be interrupted by a page whose DOM or
+               inline data is too costly for the compatibility layer to walk.
+               The fetched response and its extraction are still valid; keep
+               them and continue with the untouched document instead of
+               turning a script failure into a transport failure. */
+            fprintf(stderr, "script discovery failed; continuing with initial document\n");
+            scripts_failed = true;
+        } else {
+            settle(&engine);
         }
-        settle(&engine);
     }
     /* The settle cap stops page activity; it must not interrupt our own
        final DOM snapshot or extraction pass. */
@@ -3542,8 +3728,21 @@ static int run_page(const char *input, uint64_t cap_ms, uint64_t memory_mb,
     int result = 0;
     char *selected_json = NULL;
     if (needs_extraction) {
-        char *settled_json = run_extraction(&engine, serialized);
-        selected_json = select_extraction(&engine, initial_json, settled_json);
+        char *settled_json = NULL;
+        if (scripts_failed || engine.cap_hit) {
+            initial_json = run_extraction(&engine, initial_html, false);
+            ExtractionCandidate initial_candidate = score_extraction(&engine, initial_json);
+            if (scripts_failed || initial_candidate.useful)
+                settled_json = d_strdup("");
+            else
+                settled_json = run_extraction(&engine, serialized, true);
+        } else {
+            settled_json = run_extraction(&engine, serialized, true);
+            ExtractionCandidate settled_candidate = score_extraction(&engine, settled_json);
+            if (!settled_candidate.useful || settled_candidate.error_like)
+                initial_json = run_extraction(&engine, initial_html, true);
+        }
+        selected_json = select_extraction(&engine, initial_json, settled_json, scripts_failed);
         free(settled_json);
         free(initial_json);
         initial_json = NULL;
@@ -3697,6 +3896,7 @@ int main(int argc, char **argv)
     const char *template_path = NULL;
     const char *save_media_path = NULL;
     const char *fetch_media_path = NULL;
+    const char *fetch_kind = "image";
     const char *font_dir = NULL;
     const char *theme = "warm";
     const char *request_method = NULL;
@@ -3720,6 +3920,7 @@ int main(int argc, char **argv)
         else if (d_eq(argv[i], "--media-index") && i + 1 < argc) media_index = (int)strtol(argv[++i], NULL, 10);
         else if (d_eq(argv[i], "--save-media") && i + 1 < argc) save_media_path = argv[++i];
         else if (d_eq(argv[i], "--fetch-media") && i + 1 < argc) fetch_media_path = argv[++i];
+        else if (d_eq(argv[i], "--fetch-kind") && i + 1 < argc) fetch_kind = argv[++i];
         else if (d_eq(argv[i], "--width") && i + 1 < argc) render_width = (int)strtol(argv[++i], NULL, 10);
         else if (d_eq(argv[i], "--height") && i + 1 < argc) render_height = (int)strtol(argv[++i], NULL, 10);
         else if (d_eq(argv[i], "--font-dir") && i + 1 < argc) font_dir = argv[++i];
@@ -3762,6 +3963,7 @@ int main(int argc, char **argv)
     int result = run_page(url, cap_ms, memory_mb, max_scripts, dump_dom, extract,
                           render_path, viewer_path, media_index, save_media_path,
                           fetch_media_path,
+                          fetch_kind,
                           render_width, render_height, font_dir, template_path, theme,
                           native_forms, zoom,
                           request_method, request_data, session_file, progress,

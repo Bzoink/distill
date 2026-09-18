@@ -268,6 +268,15 @@ class CorpusHandler(SimpleHTTPRequestHandler):
             return "text/html"
         if path.endswith(".js"):
             return "text/javascript"
+        # Media fixtures must arrive with an honest type: the reader decides
+        # playable-or-download from the declared type, so a wrong one here
+        # would make the audio gates pass for the wrong reason.
+        media = {".mp3": "audio/mpeg", ".wav": "audio/wav", ".flac": "audio/flac",
+                 ".opus": "audio/opus", ".ogg": "audio/ogg", ".m4a": "audio/mp4",
+                 ".mp4": "video/mp4", ".webm": "video/webm"}
+        for suffix, declared in media.items():
+            if path.endswith(suffix):
+                return declared
         return ctype
 
     def end_headers(self):

@@ -1,7 +1,9 @@
 {
   "checks": [
     {"path": "shape.kind", "contains": "video"},
-    {"path": "videos[0].kind", "contains": "iframe"},
+    {"path": "videos[0].kind", "contains": "embed"},
+    {"path": "videos[0].element", "contains": "iframe"},
+    {"path": "videos[0].direct", "contains": "false"},
     {"path": "videos[0].url", "contains": "youtube.com/embed/distill-demo"},
     {"path": "videos[0].title", "contains": "A short history of the reader"}
   ]

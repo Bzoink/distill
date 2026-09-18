@@ -458,7 +458,10 @@
       "assertions": [
         {"stage": "extract", "path": "shape.kind", "expect": "video"},
         {"stage": "extract", "path": "videos[0].url", "expect": "youtube.com/embed/distill-demo"},
-        {"stage": "extract", "path": "videos[0].title", "expect": "A short history of the reader"}
+        {"stage": "extract", "path": "videos[0].title", "expect": "A short history of the reader"},
+        {"stage": "extract", "path": "videos[0].kind", "expect": "embed"},
+        {"stage": "extract", "path": "videos[0].direct", "expect": "false"},
+        {"stage": "template", "expect": "distill-open:https://www.youtube.com/embed/distill-demo"}
       ]
     },
     {
@@ -924,17 +927,52 @@
       "path": "35-folksam-embedded.html",
       "gate": true,
       "plan_section": "Phase 1 extraction breadth, embedded page data",
-      "exercises": ["next-data", "folksam-adapter", "relative-urls", "embedded-diagnostics"],
+      "exercises": [
+        "next-data",
+        "folksam-adapter",
+        "relative-urls",
+        "embedded-diagnostics"
+      ],
       "why": "Known page data can recover ordered content and actions without executing a framework component tree.",
       "assertions": [
-        {"stage": "extract", "path": "embedded_data.adapter", "expect": "folksam-page-content"},
-        {"stage": "extract", "path": "embedded_data.blocks", "expect": "A mapped heading"},
-        {"stage": "extract", "path": "blocks", "expect": "/shortcut"},
-        {"stage": "extract", "path": "links", "expect": "/card"},
-        {"stage": "extract", "path": "media", "expect": "/card.jpg"},
-        {"stage": "extract", "path": "embedded_data.navigation", "expect": "/insurance"},
-        {"stage": "template", "expect": "/insurance"},
-        {"stage": "template", "expect": "/card"}
+        {
+          "stage": "extract",
+          "path": "embedded_data.adapter",
+          "expect": "folksam-page-content"
+        },
+        {
+          "stage": "extract",
+          "path": "embedded_data.blocks",
+          "expect": "A mapped heading"
+        },
+        {
+          "stage": "extract",
+          "path": "blocks",
+          "expect": "/shortcut"
+        },
+        {
+          "stage": "extract",
+          "path": "links",
+          "expect": "/card"
+        },
+        {
+          "stage": "extract",
+          "path": "media",
+          "expect": "/card.jpg"
+        },
+        {
+          "stage": "extract",
+          "path": "embedded_data.navigation",
+          "expect": "/insurance"
+        },
+        {
+          "stage": "template",
+          "expect": "/insurance"
+        },
+        {
+          "stage": "template",
+          "expect": "/card"
+        }
       ]
     },
     {
@@ -959,6 +997,138 @@
           "selector": "#content",
           "expect_absent": [
             "CHALLENGE-SCRIPT-RAN"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "37-audio-media",
+      "path": "37-audio-media.html",
+      "gate": true,
+      "plan_section": "Phase 1 extraction breadth, audio references and direct/embed classification",
+      "exercises": [
+        "audio-element",
+        "source-child",
+        "json-ld-enclosure",
+        "direct-vs-embed",
+        "script-audio-stub"
+      ],
+      "why": "Audio is the one medium the reader plays itself, so it must be extracted from the shapes pages actually use: a <source> child rather than a src attribute, and an enclosure in JSON-LD. The same page pins the direct/embed split that decides whether a video card offers a download or a hand-off, and proves the Audio stub keeps a script-built player from throwing mid-settle.",
+      "golden": "golden/37-audio-media.json",
+      "assertions": [
+        {
+          "stage": "extract",
+          "path": "shape.kind",
+          "expect": "article"
+        },
+        {
+          "stage": "extract",
+          "path": "audio[0].url",
+          "expect": "/media/episode-14.mp3"
+        },
+        {
+          "stage": "extract",
+          "path": "audio[0].mime",
+          "expect": "audio/mpeg"
+        },
+        {
+          "stage": "extract",
+          "path": "audio[0].duration",
+          "expect": "2052"
+        },
+        {
+          "stage": "extract",
+          "path": "audio[0].playable",
+          "expect": "true"
+        },
+        {
+          "stage": "extract",
+          "path": "audio[1].playable",
+          "expect": "false"
+        },
+        {
+          "stage": "extract",
+          "path": "audio[2].source",
+          "expect": "json-ld"
+        },
+        {
+          "stage": "extract",
+          "path": "videos[0].direct",
+          "expect": "true"
+        },
+        {
+          "stage": "extract",
+          "path": "videos[1].direct",
+          "expect": "false"
+        },
+        {
+          "stage": "extract",
+          "path": "diagnostics.script_audio",
+          "expect": "1"
+        },
+        {
+          "stage": "template",
+          "expect": "/media/episode-14.mp3\">Play</a>"
+        },
+        {
+          "stage": "template",
+          "expect": "/media/bonus.opus\">Download</a>"
+        },
+        {
+          "stage": "template",
+          "expect_absent": [
+            "/media/bonus.opus\">Play</a>"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "38-video-direct",
+      "path": "38-video-direct.html",
+      "gate": true,
+      "plan_section": "Phase 1 extraction breadth, direct video files and adaptive-stream manifests",
+      "exercises": [
+        "video-source-child",
+        "direct-classification",
+        "manifest-rejection",
+        "duration-attribute"
+      ],
+      "why": "A <video> carrying only <source> children is the common form, and reading the src attribute alone left the card pointing at nothing. The reader never decodes video, so a direct file must offer a download -- and an HLS manifest must not, because it is a playlist of segments rather than a file.",
+      "golden": "golden/38-video-direct.json",
+      "assertions": [
+        {
+          "stage": "extract",
+          "path": "videos[0].url",
+          "expect": "/media/session-full.mp4"
+        },
+        {
+          "stage": "extract",
+          "path": "videos[0].direct",
+          "expect": "true"
+        },
+        {
+          "stage": "extract",
+          "path": "videos[0].mime",
+          "expect": "video/mp4"
+        },
+        {
+          "stage": "extract",
+          "path": "videos[0].duration",
+          "expect": "4350"
+        },
+        {
+          "stage": "extract",
+          "path": "videos[1].direct",
+          "expect": "false"
+        },
+        {
+          "stage": "template",
+          "expect": "/media/session-full.mp4\">Download</a>"
+        },
+        {
+          "stage": "template",
+          "expect_absent": [
+            "/media/live.m3u8\">Download</a>"
           ]
         }
       ]

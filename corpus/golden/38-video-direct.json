@@ -1,0 +1,11 @@
+{
+  "checks": [
+    {"path": "shape.kind", "contains": "video"},
+    {"path": "videos[0].kind", "contains": "video"},
+    {"path": "videos[0].element", "contains": "video"},
+    {"path": "videos[0].direct", "contains": "true"},
+    {"path": "videos[0].mime", "contains": "video/mp4"},
+    {"path": "videos[0].duration", "contains": "4350"},
+    {"path": "videos[1].direct", "contains": "false"}
+  ]
+}

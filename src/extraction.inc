@@ -17,6 +17,13 @@ typedef struct {
     size_t capacity;
 } StringVec;
 
+/* The initial fallback candidate only needs a fast content estimate. CSS
+   visibility resolution is retained for the authoritative settled pass, but
+   reparsing every stylesheet for every node is disproportionate on large
+   pages. The extractor is single-threaded, so this scoped flag avoids
+   threading it through the many structural walkers. */
+static bool extraction_fast_visibility = false;
+
 static void string_vec_push(StringVec *vec, char *value)
 {
     d_vec_reserve((void **)&vec->items, &vec->capacity, vec->length,
@@ -276,13 +283,14 @@ static bool hidden_node(lxb_dom_node_t *root, lxb_dom_node_t *node)
         if (!is_element(current)) continue;
         lxb_dom_element_t *element = lxb_dom_interface_element(current);
         if (has_attr(element, "hidden")) return true;
+        if (has_attr(element, "data-distill-visible")) return false;
         char *aria = attr_value(element, "aria-hidden");
         bool hidden = d_ieq(aria, "true"); free(aria);
         if (hidden) return true;
         char *style = attr_value(element, "style");
         hidden = declaration_has(style, "display", "none") || declaration_has(style, "visibility", "hidden");
         free(style);
-        if (hidden || css_hides(root, current)) return true;
+        if (hidden || (!extraction_fast_visibility && css_hides(root, current))) return true;
     }
     return false;
 }
@@ -898,6 +906,15 @@ static EmbeddedCandidate embedded_candidate(Engine *engine, lxb_dom_node_t *root
         char *body = d_trim(text); free(text);
         if (!*body) { free(body); continue; }
         candidate.detected = true;
+        /* This adapter only understands the Folksam pageContent tree. Avoid
+           handing every large application/json blob (for example a Contentful
+           or analytics state snapshot) to QuickJS just to discover that it
+           cannot match the schema. The byte scan is intentionally permissive;
+           the parsed route and shape checks below remain authoritative. */
+        if (!strstr(body, "\"pageProps\"") || !strstr(body, "\"pageContent\"")) {
+            free(body);
+            continue;
+        }
         JSValue parsed = JS_ParseJSON(engine->context, body, strlen(body), "distill-embedded.json");
         free(body);
         if (JS_IsException(parsed)) {
@@ -1851,19 +1868,311 @@ static char *forms_json(Engine *engine, lxb_dom_node_t *root, size_t *rejected)
     free(forms.items); dbuf_puts(&out, "]"); return dbuf_take(&out);
 }
 
+/* Seconds from the spellings pages actually use: a bare number, or an ISO-8601
+   duration. Unknown stays 0 rather than guessing -- the reader shows an
+   indeterminate bar for 0, which is honest, and a wrong number is not. */
+static double media_duration_seconds(const char *value)
+{
+    if (!value || !*value) return 0;
+    while (*value == ' ') ++value;
+    if (*value != 'P' && *value != 'p') {
+        char *end = NULL;
+        double seconds = strtod(value, &end);
+        if (end == value || seconds < 0) return 0;
+        /* HH:MM:SS, the other spelling that turns up in data- attributes. */
+        if (end && *end == ':') {
+            double parts[3] = {seconds, 0, 0}; size_t count = 1;
+            while (*end == ':' && count < 3) {
+                const char *next = end + 1; char *stop = NULL;
+                double part = strtod(next, &stop);
+                if (stop == next) break;
+                parts[count++] = part; end = stop;
+            }
+            if (count == 2) return parts[0] * 60 + parts[1];
+            if (count == 3) return parts[0] * 3600 + parts[1] * 60 + parts[2];
+        }
+        return seconds;
+    }
+    double total = 0; bool time_part = false;
+    for (const char *at = value + 1; *at; ++at) {
+        if (*at == 'T' || *at == 't') { time_part = true; continue; }
+        char *end = NULL;
+        double amount = strtod(at, &end);
+        if (end == at) break;
+        switch (*end) {
+            case 'H': case 'h': total += amount * 3600; break;
+            case 'M': case 'm': total += time_part ? amount * 60 : amount * 2592000; break;
+            case 'S': case 's': total += amount; break;
+            case 'D': case 'd': total += amount * 86400; break;
+            default: return total;
+        }
+        at = end;
+    }
+    return total;
+}
+
+/* A declared type wins; otherwise the extension is the only hint there is.
+   Both are hints, never a decision -- see media_is_playable. */
+static char *media_mime(const char *declared, const char *url)
+{
+    if (declared && *declared) {
+        char *out = d_lower(declared);
+        char *semicolon = strchr(out, ';');
+        if (semicolon) *semicolon = '\0';
+        return out;
+    }
+    static const char *const known[] = {
+        ".mp3", "audio/mpeg", ".m4a", "audio/mp4", ".aac", "audio/aac",
+        ".oga", "audio/ogg", ".ogg", "audio/ogg", ".opus", "audio/opus",
+        ".wav", "audio/wav", ".flac", "audio/flac",
+        ".mp4", "video/mp4", ".m4v", "video/mp4", ".webm", "video/webm",
+        ".ogv", "video/ogg", ".mov", "video/quicktime",
+        ".m3u8", "application/vnd.apple.mpegurl", ".mpd", "application/dash+xml",
+    };
+    char *lower = d_lower(url ? url : "");
+    size_t length = strcspn(lower, "?#");
+    char *out = d_strdup("");
+    for (size_t i = 0; i < sizeof(known) / sizeof(known[0]); i += 2) {
+        size_t suffix = strlen(known[i]);
+        if (length > suffix && memcmp(lower + length - suffix, known[i], suffix) == 0) {
+            free(out); out = d_strdup(known[i + 1]); break;
+        }
+    }
+    free(lower);
+    return out;
+}
+
+/* A manifest is a playlist of segments, not a file. Offering to download one
+   would hand the user a few kilobytes of XML and call it a video. */
+static bool media_is_manifest(const char *mime, const char *url)
+{
+    if (d_contains(mime, "mpegurl") || d_contains(mime, "dash+xml")) return true;
+    char *lower = d_lower(url ? url : "");
+    size_t length = strcspn(lower, "?#");
+    bool manifest = (length > 5 && memcmp(lower + length - 5, ".m3u8", 5) == 0) ||
+                    (length > 4 && memcmp(lower + length - 4, ".mpd", 4) == 0);
+    free(lower);
+    return manifest;
+}
+
+/* The decoders the audio core actually ships: WAV, MP3, FLAC. Anything else
+   is a download, and the card must not offer a Play it cannot honour. */
+static bool media_is_playable(const char *mime)
+{
+    static const char *const playable[] = {
+        "audio/mpeg", "audio/mp3", "audio/wav", "audio/x-wav", "audio/wave",
+        "audio/vnd.wave", "audio/flac", "audio/x-flac",
+    };
+    for (size_t i = 0; i < sizeof(playable) / sizeof(playable[0]); ++i)
+        if (d_eq(mime, playable[i])) return true;
+    return false;
+}
+
+/* The file behind a media element, wherever the page put it. A <video> or
+   <audio> carrying only <source> children is the common form, and reading the
+   src attribute alone left those cards pointing at nothing. */
+static char *media_source_url(Engine *engine, lxb_dom_node_t *node,
+                              char **declared_type, size_t *rejected)
+{
+    lxb_dom_element_t *element = lxb_dom_interface_element(node);
+    char *raw = attr_value(element, "src");
+    char *url = safe_uri(engine, raw, rejected);
+    free(raw);
+    if (*url) { if (declared_type) *declared_type = attr_value(element, "type"); return url; }
+    free(url);
+    for (lxb_dom_node_t *child = node->first_child; child; child = child->next) {
+        char *tag = node_tag(child);
+        bool source = d_eq(tag, "source");
+        free(tag);
+        if (!source) continue;
+        lxb_dom_element_t *candidate = lxb_dom_interface_element(child);
+        char *candidate_raw = attr_value(candidate, "src");
+        char *candidate_url = safe_uri(engine, candidate_raw, rejected);
+        free(candidate_raw);
+        if (!*candidate_url) { free(candidate_url); continue; }
+        if (declared_type) *declared_type = attr_value(candidate, "type");
+        return candidate_url;
+    }
+    if (declared_type) *declared_type = d_strdup("");
+    return d_strdup("");
+}
+
+/* Pages spell a duration in whichever attribute their player wanted. */
+static char *media_duration_attr(lxb_dom_element_t *element)
+{
+    const char *names[] = {"data-duration", "duration", "data-length"};
+    for (size_t i = 0; i < sizeof(names) / sizeof(names[0]); ++i) {
+        char *value = attr_value(element, names[i]);
+        if (*value) return value;
+        free(value);
+    }
+    return d_strdup("");
+}
+
+/* A label for the card. The element's own words first; the page's title is a
+   fallback, not an answer, so it is used only when nothing else exists. */
+static char *media_label(lxb_dom_node_t *root, lxb_dom_element_t *element)
+{
+    const char *names[] = {"title", "aria-label", "data-title", "alt"};
+    for (size_t i = 0; i < sizeof(names) / sizeof(names[0]); ++i) {
+        char *value = attr_value(element, names[i]);
+        if (*value) return value;
+        free(value);
+    }
+    return meta_value(root, "og:title");
+}
+
+/* Video references, classified by what they are rather than by what their URL
+   looks like. A <video> stands in front of a file; an iframe, <embed> or
+   <object> stands in front of somebody else's player. Only the first can be
+   downloaded, and neither is ever decoded here -- see MEDIA_PLAYBACK_PLAN.md. */
 static char *videos_json(Engine *engine, lxb_dom_node_t *root, size_t *rejected)
 {
-    DBuffer out; dbuf_init(&out); dbuf_puts(&out, "["); bool first = true; const char *tags[] = {"video", "iframe", "embed", "object"};
+    DBuffer out; dbuf_init(&out); dbuf_puts(&out, "["); bool first = true;
+    const char *tags[] = {"video", "iframe", "embed", "object"};
     for (size_t t = 0; t < 4; ++t) {
         NodeVec nodes = find_selector(root, tags[t]);
         for (size_t i = 0; i < nodes.length; ++i) {
-            lxb_dom_element_t *element = lxb_dom_interface_element(nodes.items[i]); char *raw = attr_value(element, "src"); char *url = safe_uri(engine, raw, rejected); free(raw); char *poster_raw = attr_value(element, "poster"); char *poster = safe_uri(engine, poster_raw, rejected); free(poster_raw); char *title = attr_value(element, "title"); if (!*title) { free(title); title = meta_value(root, "og:title"); }
-            if (!first) dbuf_puts(&out, ","); first = false; char *qk = json_quote(tags[t]), *qu = json_quote(url), *qp = json_quote(poster), *qt = json_quote(title); dbuf_printf(&out, "{\"kind\":%s,\"url\":%s,\"poster\":%s,\"title\":%s}", qk, qu, qp, qt); free(qk); free(qu); free(qp); free(qt); free(url); free(poster); free(title);
+            lxb_dom_element_t *element = lxb_dom_interface_element(nodes.items[i]);
+            bool is_video = d_eq(tags[t], "video");
+            char *declared = NULL, *url = NULL;
+            if (is_video) {
+                url = media_source_url(engine, nodes.items[i], &declared, rejected);
+            } else {
+                char *raw = attr_value(element, "src");
+                if (!*raw) { free(raw); raw = attr_value(element, "data"); }
+                url = safe_uri(engine, raw, rejected); free(raw);
+                declared = attr_value(element, "type");
+            }
+            char *mime = media_mime(declared, url); free(declared);
+            char *poster_raw = attr_value(element, "poster");
+            char *poster = safe_uri(engine, poster_raw, rejected); free(poster_raw);
+            char *title = attr_value(element, "title");
+            if (!*title) { free(title); title = meta_value(root, "og:title"); }
+            char *duration_raw = media_duration_attr(element);
+            double duration = media_duration_seconds(duration_raw); free(duration_raw);
+            bool direct = is_video && *url && !media_is_manifest(mime, url);
+            if (!first) dbuf_puts(&out, ","); first = false;
+            char *qk = json_quote(is_video ? "video" : "embed"), *qu = json_quote(url),
+                 *qp = json_quote(poster), *qt = json_quote(title), *qm = json_quote(mime);
+            dbuf_printf(&out, "{\"kind\":%s,\"url\":%s,\"poster\":%s,\"title\":%s,\"mime\":%s,\"duration\":%.0f,\"direct\":%s,\"element\":\"%s\"}",
+                        qk, qu, qp, qt, qm, duration, direct ? "true" : "false", tags[t]);
+            free(qk); free(qu); free(qp); free(qt); free(qm);
+            free(url); free(poster); free(title); free(mime);
         }
         free(nodes.items);
     }
-    if (first) { char *raw = meta_value(root, "og:video"); if (*raw) { char *url = safe_uri(engine, raw, rejected); char *poster_raw = meta_value(root, "og:image"); char *poster = safe_uri(engine, poster_raw, rejected); free(poster_raw); char *title = meta_value(root, "og:title"); char *qk = json_quote("metadata"), *qu = json_quote(url), *qp = json_quote(poster), *qt = json_quote(title); dbuf_printf(&out, "{\"kind\":%s,\"url\":%s,\"poster\":%s,\"title\":%s}", qk, qu, qp, qt); free(qk); free(qu); free(qp); free(qt); free(url); free(poster); free(title); } free(raw); }
+    if (first) {
+        char *raw = meta_value(root, "og:video");
+        if (*raw) {
+            char *url = safe_uri(engine, raw, rejected);
+            char *poster_raw = meta_value(root, "og:image");
+            char *poster = safe_uri(engine, poster_raw, rejected); free(poster_raw);
+            char *title = meta_value(root, "og:title");
+            char *declared = meta_value(root, "og:video:type");
+            char *mime = media_mime(declared, url); free(declared);
+            char *duration_raw = meta_value(root, "og:video:duration");
+            double duration = media_duration_seconds(duration_raw); free(duration_raw);
+            char *qk = json_quote("embed"), *qu = json_quote(url), *qp = json_quote(poster),
+                 *qt = json_quote(title), *qm = json_quote(mime);
+            dbuf_printf(&out, "{\"kind\":%s,\"url\":%s,\"poster\":%s,\"title\":%s,\"mime\":%s,\"duration\":%.0f,\"direct\":false,\"element\":\"metadata\"}",
+                        qk, qu, qp, qt, qm, duration);
+            free(qk); free(qu); free(qp); free(qt); free(qm);
+            free(url); free(poster); free(title);
+        }
+        free(raw);
+    }
     dbuf_puts(&out, "]"); return dbuf_take(&out);
+}
+
+typedef struct { DBuffer out; bool first; size_t seen; size_t *rejected; } AudioSink;
+
+static void audio_sink_add(AudioSink *sink, const char *url, const char *title,
+                           const char *mime, double duration, const char *source)
+{
+    if (!url || !*url || sink->seen >= 64) return;
+    if (!sink->first) dbuf_puts(&sink->out, ",");
+    sink->first = false; ++sink->seen;
+    char *qu = json_quote(url), *qt = json_quote(title), *qm = json_quote(mime), *qs = json_quote(source);
+    dbuf_printf(&sink->out, "{\"kind\":\"audio\",\"url\":%s,\"title\":%s,\"mime\":%s,\"duration\":%.0f,\"direct\":true,\"playable\":%s,\"source\":%s}",
+                qu, qt, qm, duration, media_is_playable(mime) ? "true" : "false", qs);
+    free(qu); free(qt); free(qm); free(qs);
+}
+
+/* Schema.org describes an episode's file as an AudioObject hanging off the
+   record, under whichever of these names the publisher's CMS emits. */
+static void json_ld_collect_audio(Engine *engine, JSValueConst value, AudioSink *sink, int depth)
+{
+    if (depth > 5 || !JS_IsObject(value)) return;
+    if (JS_IsArray(value)) {
+        int64_t count = json_array_length_for_context(engine->context, value);
+        for (int64_t i = 0; i < count; ++i) {
+            JSValue item = JS_GetPropertyUint32(engine->context, value, (uint32_t)i);
+            json_ld_collect_audio(engine, item, sink, depth + 1);
+            JS_FreeValue(engine->context, item);
+        }
+        return;
+    }
+    char *type = json_ld_string(engine, value, "@type");
+    char *lower = d_lower(type); free(type);
+    if (d_contains(lower, "audioobject") || d_contains(lower, "podcastepisode")) {
+        char *url = json_ld_string(engine, value, "contentUrl");
+        if (!*url) { free(url); url = json_ld_string(engine, value, "url"); }
+        char *name = json_ld_string(engine, value, "name");
+        char *encoding = json_ld_string(engine, value, "encodingFormat");
+        char *duration = json_ld_string(engine, value, "duration");
+        char *safe = safe_uri(engine, url, sink->rejected);
+        char *mime = media_mime(encoding, safe);
+        audio_sink_add(sink, safe, name, mime, media_duration_seconds(duration), "json-ld");
+        free(url); free(name); free(encoding); free(duration); free(safe); free(mime);
+    }
+    free(lower);
+    const char *containers[] = {"@graph", "audio", "associatedMedia", "mainEntity",
+                                "itemListElement", "hasPart", "encoding"};
+    for (size_t c = 0; c < sizeof(containers) / sizeof(containers[0]); ++c) {
+        JSValue child = JS_GetPropertyStr(engine->context, value, containers[c]);
+        json_ld_collect_audio(engine, child, sink, depth + 1);
+        JS_FreeValue(engine->context, child);
+    }
+}
+
+/* Audio references: the one medium the reader plays itself. Declarative
+   sources only -- a player assembled in JavaScript is source-site UI, out of
+   scope on the same grounds as a div-built date picker. */
+static char *audio_json(Engine *engine, lxb_dom_node_t *root, size_t *rejected)
+{
+    AudioSink sink = {.first = true, .rejected = rejected};
+    dbuf_init(&sink.out); dbuf_puts(&sink.out, "[");
+    NodeVec nodes = find_selector(root, "audio");
+    for (size_t i = 0; i < nodes.length; ++i) {
+        lxb_dom_element_t *element = lxb_dom_interface_element(nodes.items[i]);
+        char *declared = NULL;
+        char *url = media_source_url(engine, nodes.items[i], &declared, rejected);
+        char *mime = media_mime(declared, url); free(declared);
+        char *title = media_label(root, element);
+        char *duration_raw = media_duration_attr(element);
+        audio_sink_add(&sink, url, title, mime, media_duration_seconds(duration_raw), "element");
+        free(url); free(mime); free(title); free(duration_raw);
+    }
+    free(nodes.items);
+    NodeVec scripts = find_selector(root, "script");
+    for (size_t i = 0; i < scripts.length; ++i) {
+        lxb_dom_element_t *element = lxb_dom_interface_element(scripts.items[i]);
+        char *raw_type = attr_value(element, "type");
+        char *type = d_lower(raw_type); free(raw_type);
+        bool ld = d_contains(type, "ld+json");
+        free(type);
+        if (!ld) continue;
+        char *text = node_text(scripts.items[i]);
+        JSValue parsed = JS_ParseJSON(engine->context, text, strlen(text), "distill-audio-ld.json");
+        if (JS_IsException(parsed)) JS_FreeValue(engine->context, JS_GetException(engine->context));
+        else json_ld_collect_audio(engine, parsed, &sink, 0);
+        JS_FreeValue(engine->context, parsed);
+        free(text);
+    }
+    free(scripts.items);
+    dbuf_puts(&sink.out, "]");
+    return dbuf_take(&sink.out);
 }
 
 static char *media_json(Engine *engine, lxb_dom_node_t *root, size_t *rejected)
@@ -1948,23 +2257,30 @@ static char *structured_data_json(Engine *engine, lxb_dom_node_t *root)
     dbuf_puts(&out, "]"); return dbuf_take(&out);
 }
 
-static char *run_extraction(Engine *engine, const char *serialized)
+static char *run_extraction(Engine *engine, const char *serialized, bool include_readability)
 {
     lxb_html_document_t *document = lxb_html_document_create();
     if (!document || lxb_html_document_parse(document, (const lxb_char_t *)serialized, strlen(serialized)) != LXB_STATUS_OK) { if (document) lxb_html_document_destroy(document); return d_strdup("{\"schema\":1,\"readability\":null}"); }
+    bool previous_fast_visibility = extraction_fast_visibility;
+    extraction_fast_visibility = !include_readability;
     lxb_dom_node_t *root = lxb_dom_interface_node(document);
     NodeVec all_elements = find_selector(root, "*");
     for (size_t i = 0; i < all_elements.length; ++i) {
-        if (!hidden_node(root, all_elements.items[i])) continue;
-        lxb_dom_element_set_attribute(lxb_dom_interface_element(all_elements.items[i]),
-                                      (const lxb_char_t *)"hidden", 6,
-                                      (const lxb_char_t *)"true", 4);
+        lxb_dom_element_t *element = lxb_dom_interface_element(all_elements.items[i]);
+        if (hidden_node(root, all_elements.items[i])) {
+            lxb_dom_element_set_attribute(element, (const lxb_char_t *)"hidden", 6,
+                                          (const lxb_char_t *)"true", 4);
+        } else {
+            lxb_dom_element_set_attribute(element, (const lxb_char_t *)"data-distill-visible", 20,
+                                          (const lxb_char_t *)"true", 4);
+        }
     }
     free(all_elements.items);
     lexbor_str_t filtered = {0};
-    lxb_html_serialize_tree_str(root, &filtered);
+    if (include_readability) lxb_html_serialize_tree_str(root, &filtered);
     const char *readability_input = filtered.data ? (const char *)filtered.data : serialized;
-    ExtractShape shape = shape_for(root); ReadabilityFields readability = run_readability(engine, readability_input); size_t rejected = 0;
+    ExtractShape shape = shape_for(root); ReadabilityFields readability = {0}; size_t rejected = 0;
+    if (include_readability) readability = run_readability(engine, readability_input);
     MainContentProfile profile = {0};
     main_content_profile_load(engine, engine->source_url, &profile);
     /* Locate the requested item before anything renders, so the block list can
@@ -1992,7 +2308,7 @@ static char *run_extraction(Engine *engine, const char *serialized)
                       ((profile_selected || headline_selected) ? main_chars > 0 :
                        main_chars >= DISTILL_MAIN_CONTENT_FLOOR &&
                        main_content_is_a_minority(root, &item));
-    char *content = sanitize_content(readability.content); char *tables = table_json(root); char *search = search_json(engine, root, &rejected); char *forms = forms_json(engine, root, &rejected); char *videos = videos_json(engine, root, &rejected); char *media = media_json(engine, root, &rejected); char *links = links_json(engine, root, &rejected); char *structured = structured_data_json(engine, root);
+    char *content = sanitize_content(readability.content); char *tables = table_json(root); char *search = search_json(engine, root, &rejected); char *forms = forms_json(engine, root, &rejected); char *videos = videos_json(engine, root, &rejected); char *audio = audio_json(engine, root, &rejected); char *media = media_json(engine, root, &rejected); char *links = links_json(engine, root, &rejected); char *structured = structured_data_json(engine, root);
     EmbeddedCandidate embedded = embedded_candidate(engine, root, &rejected);
     char *embedded_blocks = embedded_array_take(&embedded.blocks);
     char *embedded_links = embedded_array_take(&embedded.links);
@@ -2025,11 +2341,11 @@ static char *run_extraction(Engine *engine, const char *serialized)
     char *qembedded_adapter = json_quote(embedded.adapter);
     char *qembedded_version = json_quote(embedded.version);
     char *qembedded_title = json_quote(embedded.title);
-    dbuf_printf(&out, ",\"blocks\":%s,\"tables\":%s,\"search_results\":%s,\"forms\":%s,\"videos\":%s,\"media\":%s,\"links\":%s,\"structured_data\":%s,\"embedded_data\":{\"detected\":%s,\"matched\":%s,\"adapter\":%s,\"version\":%s,\"title\":%s,\"unknown_components\":[", blocks, tables, search, forms, videos, media, links, structured, embedded.detected ? "true" : "false", embedded.matched ? "true" : "false", qembedded_adapter, qembedded_version, qembedded_title);
+    dbuf_printf(&out, ",\"blocks\":%s,\"tables\":%s,\"search_results\":%s,\"forms\":%s,\"videos\":%s,\"audio\":%s,\"media\":%s,\"links\":%s,\"structured_data\":%s,\"embedded_data\":{\"detected\":%s,\"matched\":%s,\"adapter\":%s,\"version\":%s,\"title\":%s,\"unknown_components\":[", blocks, tables, search, forms, videos, audio, media, links, structured, embedded.detected ? "true" : "false", embedded.matched ? "true" : "false", qembedded_adapter, qembedded_version, qembedded_title);
     for (size_t i = 0; i < embedded.unknown.length; ++i) {
         if (i) dbuf_puts(&out, ",");
         char *quoted = json_quote(embedded.unknown.items[i]); dbuf_puts(&out, quoted); free(quoted);
     }
     dbuf_printf(&out, "],\"blocks\":%s,\"links\":%s,\"media\":%s,\"navigation\":%s},\"sanitization\":{\"allowed_schemes\":[\"http\",\"https\",\"mailto\",\"tel\"],\"rejected_uris\":%zu}}", embedded_blocks, embedded_links, embedded_media, embedded_navigation, rejected);
-    free(qembedded_adapter); free(qembedded_version); free(qembedded_title); free(qurl); free(qbase); free(qtitle); free(page_title); free(qkind); free(qevidence); free(qselected); free(content); free(tables); free(search); free(forms); free(videos); free(media); free(links); free(structured); free(blocks); free(dom_blocks); free(embedded_blocks); free(embedded_links); free(embedded_media); free(embedded_navigation); free(shape.kind); free(shape.evidence); free(main_blocks_json); embedded_free(&embedded); free_main_content(&item); free_main_content_profile(&profile); free_readability(&readability); lxb_html_document_destroy(document); return dbuf_take(&out);
+    free(qembedded_adapter); free(qembedded_version); free(qembedded_title); free(qurl); free(qbase); free(qtitle); free(page_title); free(qkind); free(qevidence); free(qselected); free(content); free(tables); free(search); free(forms); free(videos); free(audio); free(media); free(links); free(structured); free(blocks); free(dom_blocks); free(embedded_blocks); free(embedded_links); free(embedded_media); free(embedded_navigation); free(shape.kind); free(shape.evidence); free(main_blocks_json); embedded_free(&embedded); free_main_content(&item); free_main_content_profile(&profile); free_readability(&readability); lxb_html_document_destroy(document); extraction_fast_visibility = previous_fast_visibility; return dbuf_take(&out);
 }

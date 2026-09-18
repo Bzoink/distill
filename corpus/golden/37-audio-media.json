@@ -1,0 +1,19 @@
+{
+  "checks": [
+    {"path": "shape.kind", "contains": "article"},
+    {"path": "audio[0].kind", "contains": "audio"},
+    {"path": "audio[0].url", "contains": "/media/episode-14.mp3"},
+    {"path": "audio[0].mime", "contains": "audio/mpeg"},
+    {"path": "audio[0].duration", "contains": "2052"},
+    {"path": "audio[0].playable", "contains": "true"},
+    {"path": "audio[0].source", "contains": "element"},
+    {"path": "audio[1].url", "contains": "/media/bonus.opus"},
+    {"path": "audio[1].playable", "contains": "false"},
+    {"path": "audio[2].url", "contains": "/media/episode-14-lossless.flac"},
+    {"path": "audio[2].source", "contains": "json-ld"},
+    {"path": "videos[0].kind", "contains": "video"},
+    {"path": "videos[0].direct", "contains": "true"},
+    {"path": "videos[1].kind", "contains": "embed"},
+    {"path": "videos[1].direct", "contains": "false"}
+  ]
+}

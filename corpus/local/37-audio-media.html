@@ -1,0 +1,82 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>Episode 14: what a reader owes the page</title>
+<main>
+  <h1>Episode 14: what a reader owes the page</h1>
+  <p>A podcast episode carries its audio the way most of them do: nothing is in
+  the markup the server sent. The player is assembled after load, the file
+  hangs off a <code>source</code> child rather than a <code>src</code>
+  attribute, and the episode metadata arrives as JSON-LD written by the same
+  script. Every assertion on this page fails against the initial HTML.</p>
+  <p>The transcript below is the reason the page is still an article: the audio
+  is the subject, but the prose is what dominates, and shape classification is
+  decided by proportion rather than by the presence of a media element.</p>
+  <p>We talk about the difference between fetching a page and reading one, why
+  a reader that runs scripts is not the same thing as a browser, and what it
+  means to hand a medium back to the user instead of rendering it. The
+  conversation runs to a little over half an hour and covers the settle policy,
+  the extraction contract, and the long argument about whether a reader should
+  ever play anything at all.</p>
+  <div id="player"></div>
+</main>
+<script>
+  /* The page builds its own player, which is the whole point of the fixture:
+     an <audio> with a <source> child, a direct <video> file, and an embedded
+     player that is not a file at all. */
+  var player = document.getElementById('player');
+
+  var audio = document.createElement('audio');
+  audio.setAttribute('title', 'What a reader owes the page');
+  audio.setAttribute('controls', '');
+  audio.setAttribute('data-duration', 'PT34M12S');
+  var audioSource = document.createElement('source');
+  audioSource.setAttribute('src', '/media/episode-14.mp3');
+  audioSource.setAttribute('type', 'audio/mpeg');
+  audio.appendChild(audioSource);
+  player.appendChild(audio);
+
+  var video = document.createElement('video');
+  video.setAttribute('title', 'Studio session, cut short');
+  video.setAttribute('poster', '/images/session-poster.jpg');
+  var videoSource = document.createElement('source');
+  videoSource.setAttribute('src', '/media/session-clip.mp4');
+  videoSource.setAttribute('type', 'video/mp4');
+  video.appendChild(videoSource);
+  player.appendChild(video);
+
+  var embed = document.createElement('iframe');
+  embed.setAttribute('title', 'The same conversation, elsewhere');
+  embed.setAttribute('src', 'https://www.youtube.com/embed/distill-episode-14');
+  player.appendChild(embed);
+
+  /* A second file the reader cannot decode. The card must offer a download
+     rather than a Play button that would fail. */
+  var bonus = document.createElement('audio');
+  bonus.setAttribute('title', 'Bonus segment');
+  var bonusSource = document.createElement('source');
+  bonusSource.setAttribute('src', '/media/bonus.opus');
+  bonusSource.setAttribute('type', 'audio/opus');
+  bonus.appendChild(bonusSource);
+  player.appendChild(bonus);
+
+  var ld = document.createElement('script');
+  ld.setAttribute('type', 'application/ld+json');
+  ld.textContent = JSON.stringify({
+    '@context': 'https://schema.org',
+    '@type': 'PodcastEpisode',
+    name: 'Episode 14: what a reader owes the page',
+    associatedMedia: {
+      '@type': 'AudioObject',
+      contentUrl: '/media/episode-14-lossless.flac',
+      encodingFormat: 'audio/flac',
+      duration: 'PT34M12S',
+      name: 'Episode 14, lossless'
+    }
+  });
+  document.head.appendChild(ld);
+
+  /* A script-built player the reader deliberately does not surface. It must
+     not throw, and it must be counted. */
+  var preview = new Audio('/media/episode-14-preview.mp3');
+  preview.play();
+</script>

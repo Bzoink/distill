@@ -1,0 +1,33 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>Session recording</title>
+<main>
+  <h1>Session recording</h1>
+  <div id="stage"></div>
+</main>
+<script>
+  /* A direct video file, delivered the way pages deliver one: a <source>
+     child written after load, with no src attribute on the element itself.
+     The reader does not decode video, so the only honest offer is a
+     download -- and it can only make that offer if it found the file. */
+  var stage = document.getElementById('stage');
+  var video = document.createElement('video');
+  video.setAttribute('title', 'Session recording, full length');
+  video.setAttribute('poster', '/images/session-poster.jpg');
+  video.setAttribute('data-duration', '1:12:30');
+  var source = document.createElement('source');
+  source.setAttribute('src', '/media/session-full.mp4');
+  source.setAttribute('type', 'video/mp4');
+  video.appendChild(source);
+  stage.appendChild(video);
+
+  /* An adaptive stream is a manifest of segments, not a file. Downloading it
+     would hand the user a few kilobytes of playlist and call it a video. */
+  var stream = document.createElement('video');
+  stream.setAttribute('title', 'Live stream');
+  var streamSource = document.createElement('source');
+  streamSource.setAttribute('src', '/media/live.m3u8');
+  streamSource.setAttribute('type', 'application/vnd.apple.mpegurl');
+  stream.appendChild(streamSource);
+  stage.appendChild(stream);
+</script>

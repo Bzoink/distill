@@ -1,6 +1,9 @@
 #define _POSIX_C_SOURCE 200809L
 
 #include "app_state.h"
+#include "media_audio.h"
+#include <glib/gstdio.h>
+#include <signal.h>
 #include "image.h"
 
 /* For the self-test's PNG writer only; zlib arrives transitively through the
@@ -35,6 +38,12 @@
 #ifndef DISTILL_SOURCE_DIR
 #define DISTILL_SOURCE_DIR ""
 #endif
+
+/* The engine still uses a distinct process status for a recognised access
+   challenge. The desktop shell can display the resulting checkpoint template
+   even though GLib would otherwise turn that intentional status into a
+   generic "child process exited" error. */
+#define DISTILL_ENGINE_CHALLENGE_EXIT 4
 
 /* What the shell opens when it is given nothing else. "welcome" is the page
    that ships with the browser, "blank" is an empty reader, and anything else
@@ -143,6 +152,13 @@ static const PageSection page_sections[PAGE_SECTION_COUNT] = {
 /* Internal destinations. They are not URLs to fetch, they are things for
    the shell to do, so they never reach the navigation path. */
 #define MEDIA_SCHEME "distill-media:"
+/* The media actions. The reader template writes these; the shell resolves
+   them. They are things to do, not pages to fetch, so they never reach the
+   navigation path -- and an http(s) media URL must not either, or clicking
+   "Open externally" would navigate to an mp4 instead of handing it over. */
+#define MEDIA_PLAY_SCHEME "distill-play:"
+#define MEDIA_DOWNLOAD_SCHEME "distill-download:"
+#define MEDIA_OPEN_SCHEME "distill-open:"
 #define CLOSE_URI "distill-close:"
 #define SECTION_SCHEME "distill-section:"
 
@@ -195,6 +211,7 @@ typedef struct {
     int zoom;
     char *error;
     bool ok;
+    bool challenge;
     guint serial;
     bool replace_current;
 } LoadResult;
@@ -258,6 +275,19 @@ struct App {
     double reader_scroll_y;
     guint restore_scroll_source;
     guint load_serial;
+    /* Media. The transport is an adapter over the audio core; the transfer is
+       the one download mechanism both media actions share. */
+    struct MediaTransfer *transfer;
+    GtkWidget *transfer_row;
+    GtkWidget *transfer_label;
+    GtkWidget *transport_row;
+    GtkWidget *transport_play;
+    GtkWidget *transport_stop;
+    GtkWidget *transport_scale;
+    GtkWidget *transport_time;
+    bool transport_seeking;
+    guint transport_tick_id;
+    char *audio_file;
     unsigned int references;
     bool closing;
     bool loading;
@@ -974,8 +1004,10 @@ static void read_engine_output(int out_fd, int err_fd, LoadProgress *progress,
 }
 
 static bool run_engine(const LoadRequest *request, const char *template_path,
-                       char **error_message, char **final_url)
+                       char **error_message, char **final_url,
+                       bool *challenge)
 {
+    if (challenge) *challenge = false;
     char *engine = engine_path();
     if (!engine) return false;
     GPtrArray *arguments = g_ptr_array_new_with_free_func(g_free);
@@ -1054,7 +1086,11 @@ static bool run_engine(const LoadRequest *request, const char *template_path,
         unlink(body_path);
         g_free(body_path);
     }
-    bool ok = spawned && waited && g_spawn_check_wait_status(wait_status, &error);
+    bool access_challenge = spawned && waited && WIFEXITED(wait_status) &&
+                            WEXITSTATUS(wait_status) == DISTILL_ENGINE_CHALLENGE_EXIT;
+    if (challenge) *challenge = access_challenge;
+    bool ok = spawned && waited &&
+              (access_challenge || g_spawn_check_wait_status(wait_status, &error));
     if (!ok && error_message) {
         const char *message = error ? error->message
                                     : (diagnostics->len ? diagnostics->str : "engine failed");
@@ -1085,7 +1121,8 @@ static void load_worker(GTask *task, gpointer source_object, gpointer task_data,
     } else {
         char *final_url = NULL;
         result->ok = run_engine(request, result->template_path,
-                                &result->error, &final_url);
+                                &result->error, &final_url,
+                                &result->challenge);
         /* Record where the page came from, not where the request was aimed.
            A redirect -- or a scheme the engine had to correct -- means those
            differ, and reloading or going back to the address that only
@@ -1454,6 +1491,383 @@ static void collect_page_media(App *app);
 static void app_navigate(App *app, const char *uri, const char *method,
                          const char *data, bool replace_current,
                          bool https_guessed);
+/* One download mechanism serves both media actions. Audio fetches to a private
+   temporary file and hands it to the decoder; a download fetches to the
+   destination the reader chose. They differ in where the bytes land and what
+   happens afterwards, so they share everything up to that point.
+
+   Asynchronous, because the blocking fetch that serves a thumbnail is not
+   usable for an episode: this one reports progress, can be cancelled, and
+   renames into place only once the transfer has finished. */
+typedef struct MediaTransfer {
+    App *app;
+    GPid pid;
+    guint watch;
+    char *partial;      /* where the engine writes */
+    char *destination;  /* where it belongs once complete, or NULL to keep */
+    char *url;
+    bool play_when_done;
+} MediaTransfer;
+
+static void transport_sync(App *app);
+
+static void media_transfer_free(MediaTransfer *transfer)
+{
+    if (!transfer) return;
+    g_free(transfer->partial);
+    g_free(transfer->destination);
+    g_free(transfer->url);
+    g_free(transfer);
+}
+
+static void media_transfer_cancel(App *app)
+{
+    MediaTransfer *transfer = app->transfer;
+    if (!transfer) return;
+    app->transfer = NULL;
+    if (transfer->watch) g_source_remove(transfer->watch);
+    if (transfer->pid > 0) { kill(transfer->pid, SIGTERM); g_spawn_close_pid(transfer->pid); }
+    /* A cancelled transfer leaves nothing behind. */
+    if (transfer->partial) unlink(transfer->partial);
+    media_transfer_free(transfer);
+    gtk_widget_hide(app->transfer_row);
+    set_status(app, "Transfer cancelled");
+}
+
+static void media_transfer_finished(GPid pid, gint status, gpointer data)
+{
+    MediaTransfer *transfer = data;
+    App *app = transfer->app;
+    if (app->transfer != transfer) { media_transfer_free(transfer); return; }
+    app->transfer = NULL;
+    g_spawn_close_pid(pid);
+    GError *error = NULL;
+    bool ok = g_spawn_check_wait_status(status, &error);
+    gtk_widget_hide(app->transfer_row);
+    if (!ok) {
+        if (transfer->partial) unlink(transfer->partial);
+        char *message = g_strdup_printf("Could not fetch the media: %s",
+                                        error ? error->message : "the engine failed");
+        set_status(app, message);
+        g_free(message);
+        if (error) g_error_free(error);
+        media_transfer_free(transfer);
+        return;
+    }
+    if (transfer->destination) {
+        /* Rename only now. A partial file that looks like a finished one is
+           worse than no file at all. */
+        if (g_rename(transfer->partial, transfer->destination) != 0) {
+            char *message = g_strdup_printf("Downloaded, but could not be saved as %s: %s",
+                                            transfer->destination, g_strerror(errno));
+            set_status(app, message);
+            g_free(message);
+            unlink(transfer->partial);
+        } else {
+            char *message = g_strdup_printf("Saved to %s", transfer->destination);
+            set_status(app, message);
+            g_free(message);
+        }
+    } else if (transfer->play_when_done) {
+        g_free(app->audio_file);
+        app->audio_file = g_strdup(transfer->partial);
+        if (!media_audio_open(app->audio_file, transfer->url)) {
+            MediaAudioState state;
+            media_audio_snapshot(&state);
+            char *message = g_strdup_printf("Cannot play this file: %s",
+                                            state.error_message[0] ? state.error_message
+                                                                   : "no decoder accepted it");
+            set_status(app, message);
+            g_free(message);
+        } else if (media_audio_play()) {
+            gtk_widget_show(app->transport_row);
+            set_status(app, "Playing");
+        }
+        transport_sync(app);
+    }
+    media_transfer_free(transfer);
+}
+
+/* Fetch through the engine, which owns URL validation and the network. The
+   shell never opens a socket of its own. */
+static bool media_transfer_start(App *app, const char *url, const char *destination,
+                                 bool play_when_done)
+{
+    if (app->transfer) media_transfer_cancel(app);
+    char *partial = destination ? g_strdup_printf("%s.part", destination)
+                                : temporary_path("distill-media-XXXXXX");
+    if (!partial) { set_status(app, "Unable to create a temporary file"); return false; }
+    char *engine = engine_path();
+    GPtrArray *arguments = g_ptr_array_new_with_free_func(g_free);
+    add_arg(arguments, engine ? engine : "distill");
+    add_arg(arguments, "--url");
+    add_arg(arguments, url);
+    add_arg(arguments, "--fetch-media");
+    add_arg(arguments, partial);
+    /* Audio is going to a decoder, so the engine checks the bytes really are
+       something this reader can decode. A download is going to disk as a copy
+       of the source file, so it is not the engine's business what it holds. */
+    add_arg(arguments, "--fetch-kind");
+    add_arg(arguments, play_when_done ? "audio" : "any");
+    g_ptr_array_add(arguments, NULL);
+    GPid pid = 0;
+    GError *error = NULL;
+    gboolean spawned = g_spawn_async(NULL, (char **)arguments->pdata, NULL,
+                                     G_SPAWN_SEARCH_PATH | G_SPAWN_DO_NOT_REAP_CHILD,
+                                     NULL, NULL, &pid, &error);
+    g_ptr_array_free(arguments, TRUE);
+    g_free(engine);
+    if (!spawned) {
+        char *message = g_strdup_printf("Could not start the fetch: %s",
+                                        error ? error->message : "unknown error");
+        set_status(app, message);
+        g_free(message);
+        if (error) g_error_free(error);
+        g_free(partial);
+        return false;
+    }
+    MediaTransfer *transfer = g_new0(MediaTransfer, 1);
+    transfer->app = app;
+    transfer->pid = pid;
+    transfer->partial = partial;
+    transfer->destination = g_strdup(destination);
+    transfer->url = g_strdup(url);
+    transfer->play_when_done = play_when_done;
+    app->transfer = transfer;
+    transfer->watch = g_child_watch_add(pid, media_transfer_finished, transfer);
+    gtk_label_set_text(GTK_LABEL(app->transfer_label),
+                       play_when_done ? "Fetching audio\xe2\x80\xa6" : "Downloading\xe2\x80\xa6");
+    gtk_widget_show(app->transfer_row);
+    set_status(app, play_when_done ? "Fetching audio" : "Downloading");
+    return true;
+}
+
+/* A safe initial name: what the URL's last path segment says, with anything
+   that could steer a path stripped out. The reader picks the destination. */
+static char *suggested_filename(const char *url)
+{
+    const char *tail = url ? strrchr(url, '/') : NULL;
+    char *name = g_strdup(tail && tail[1] ? tail + 1 : "download");
+    char *cut = strpbrk(name, "?#");
+    if (cut) *cut = '\0';
+    for (char *at = name; *at; ++at)
+        if (*at == '/' || *at == '\\' || *at == ':') *at = '-';
+    if (!*name || g_str_has_prefix(name, ".")) {
+        char *safe = g_strdup_printf("download%s", name);
+        g_free(name);
+        name = safe;
+    }
+    return name;
+}
+
+static void media_download(App *app, const char *url)
+{
+    if (!external_uri_allowed(url)) {
+        set_status(app, "Download blocked: unsupported URI scheme");
+        return;
+    }
+    GtkWidget *chooser = gtk_file_chooser_dialog_new("Save media", GTK_WINDOW(app->window),
+                                                     GTK_FILE_CHOOSER_ACTION_SAVE,
+                                                     "Cancel", GTK_RESPONSE_CANCEL,
+                                                     "Save", GTK_RESPONSE_ACCEPT, NULL);
+    gtk_file_chooser_set_do_overwrite_confirmation(GTK_FILE_CHOOSER(chooser), TRUE);
+    char *name = suggested_filename(url);
+    gtk_file_chooser_set_current_name(GTK_FILE_CHOOSER(chooser), name);
+    g_free(name);
+    if (gtk_dialog_run(GTK_DIALOG(chooser)) == GTK_RESPONSE_ACCEPT) {
+        char *destination = gtk_file_chooser_get_filename(GTK_FILE_CHOOSER(chooser));
+        if (destination) media_transfer_start(app, url, destination, false);
+        g_free(destination);
+    }
+    gtk_widget_destroy(chooser);
+}
+
+static void media_play(App *app, const char *url)
+{
+    if (!external_uri_allowed(url)) {
+        set_status(app, "Playback blocked: unsupported URI scheme");
+        return;
+    }
+    MediaAudioState state;
+    media_audio_snapshot(&state);
+    /* Asking for what is already loaded is a transport command, not a refetch. */
+    if (state.phase != MEDIA_AUDIO_STOPPED && state.phase != MEDIA_AUDIO_ERROR &&
+        strcmp(state.item, url) == 0) {
+        if (state.phase == MEDIA_AUDIO_PLAYING) media_audio_pause();
+        else media_audio_play();
+        transport_sync(app);
+        return;
+    }
+    media_audio_close();
+    media_transfer_start(app, url, NULL, true);
+}
+
+/* The GTK transport is an adapter over the audio core, never its owner: it
+   reads a snapshot on its own tick and sends commands back. The framebuffer
+   and TUI shells will draw their own controls over the same API. */
+static void append_clock(GString *out, double seconds)
+{
+    if (seconds < 0 || !(seconds == seconds)) seconds = 0;
+    long total = (long)(seconds + 0.5);
+    long hours = total / 3600, minutes = (total % 3600) / 60, rest = total % 60;
+    if (hours) g_string_append_printf(out, "%ld:%02ld:%02ld", hours, minutes, rest);
+    else g_string_append_printf(out, "%ld:%02ld", minutes, rest);
+}
+
+static void transport_sync(App *app)
+{
+    if (!app || !app->transport_row) return;
+    MediaAudioState state;
+    media_audio_snapshot(&state);
+    bool live = state.phase != MEDIA_AUDIO_STOPPED || state.item[0] != '\0';
+    if (!live) { gtk_widget_hide(app->transport_row); return; }
+    gtk_button_set_label(GTK_BUTTON(app->transport_play),
+                         state.phase == MEDIA_AUDIO_PLAYING ? "Pause" : "Play");
+    GString *text = g_string_new(NULL);
+    append_clock(text, state.position_seconds);
+    if (state.duration_seconds > 0) {
+        g_string_append(text, " / ");
+        append_clock(text, state.duration_seconds);
+    }
+    if (state.phase == MEDIA_AUDIO_ERROR && state.error_message[0])
+        g_string_append_printf(text, " \xe2\x80\x94 %s", state.error_message);
+    gtk_label_set_text(GTK_LABEL(app->transport_time), text->str);
+    g_string_free(text, TRUE);
+    /* A drag owns the handle until it is released: writing the decoder's
+       position back under the pointer is how a seek fights itself. */
+    if (!app->transport_seeking) {
+        double fraction = state.duration_seconds > 0
+                          ? state.position_seconds / state.duration_seconds : 0;
+        gtk_range_set_value(GTK_RANGE(app->transport_scale), fraction * 1000.0);
+    }
+    gtk_widget_set_sensitive(app->transport_scale, state.seekable);
+    gtk_widget_show(app->transport_row);
+}
+
+static gboolean transport_tick(gpointer data)
+{
+    App *app = data;
+    if (app->closing) return G_SOURCE_CONTINUE;
+    transport_sync(app);
+    return G_SOURCE_CONTINUE;
+}
+
+static void transport_play_clicked(GtkButton *button, gpointer data)
+{
+    (void)button;
+    App *app = data;
+    MediaAudioState state;
+    media_audio_snapshot(&state);
+    if (state.phase == MEDIA_AUDIO_PLAYING) media_audio_pause();
+    else media_audio_play();
+    transport_sync(app);
+}
+
+static void transport_stop_clicked(GtkButton *button, gpointer data)
+{
+    (void)button;
+    App *app = data;
+    media_audio_stop();
+    transport_sync(app);
+}
+
+static gboolean transport_scale_press(GtkWidget *widget, GdkEventButton *event, gpointer data)
+{
+    (void)widget; (void)event;
+    ((App *)data)->transport_seeking = true;
+    return FALSE;
+}
+
+static gboolean transport_scale_release(GtkWidget *widget, GdkEventButton *event, gpointer data)
+{
+    (void)event;
+    App *app = data;
+    MediaAudioState state;
+    media_audio_snapshot(&state);
+    if (state.duration_seconds > 0) {
+        double fraction = gtk_range_get_value(GTK_RANGE(widget)) / 1000.0;
+        media_audio_seek(fraction * state.duration_seconds);
+    }
+    app->transport_seeking = false;
+    transport_sync(app);
+    return FALSE;
+}
+
+static void transport_volume_changed(GtkRange *range, gpointer data)
+{
+    (void)data;
+    media_audio_set_volume((float)(gtk_range_get_value(range) / 100.0));
+}
+
+static void transport_cancel_clicked(GtkButton *button, gpointer data)
+{
+    (void)button;
+    media_transfer_cancel((App *)data);
+}
+
+/* Built once and hidden until there is something to play. */
+static GtkWidget *build_transport_row(App *app)
+{
+    GtkWidget *row = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 6);
+    gtk_widget_set_no_show_all(row, TRUE);
+    gtk_widget_set_margin_start(row, 10);
+    gtk_widget_set_margin_end(row, 10);
+    app->transport_play = gtk_button_new_with_label("Play");
+    g_signal_connect(app->transport_play, "clicked", G_CALLBACK(transport_play_clicked), app);
+    gtk_box_pack_start(GTK_BOX(row), app->transport_play, FALSE, FALSE, 0);
+    app->transport_stop = gtk_button_new_with_label("Stop");
+    g_signal_connect(app->transport_stop, "clicked", G_CALLBACK(transport_stop_clicked), app);
+    gtk_box_pack_start(GTK_BOX(row), app->transport_stop, FALSE, FALSE, 0);
+    app->transport_scale = gtk_scale_new_with_range(GTK_ORIENTATION_HORIZONTAL, 0, 1000, 1);
+    gtk_scale_set_draw_value(GTK_SCALE(app->transport_scale), FALSE);
+    gtk_widget_add_events(app->transport_scale, GDK_BUTTON_PRESS_MASK | GDK_BUTTON_RELEASE_MASK);
+    g_signal_connect(app->transport_scale, "button-press-event",
+                     G_CALLBACK(transport_scale_press), app);
+    g_signal_connect(app->transport_scale, "button-release-event",
+                     G_CALLBACK(transport_scale_release), app);
+    gtk_box_pack_start(GTK_BOX(row), app->transport_scale, TRUE, TRUE, 0);
+    app->transport_time = gtk_label_new("0:00");
+    gtk_box_pack_start(GTK_BOX(row), app->transport_time, FALSE, FALSE, 0);
+    GtkWidget *volume = gtk_scale_new_with_range(GTK_ORIENTATION_HORIZONTAL, 0, 100, 1);
+    gtk_scale_set_draw_value(GTK_SCALE(volume), FALSE);
+    gtk_range_set_value(GTK_RANGE(volume), 100);
+    gtk_widget_set_size_request(volume, 90, -1);
+    g_signal_connect(volume, "value-changed", G_CALLBACK(transport_volume_changed), app);
+    gtk_box_pack_start(GTK_BOX(row), volume, FALSE, FALSE, 0);
+    gtk_widget_show_all(row);
+    gtk_widget_hide(row);
+    return row;
+}
+
+static GtkWidget *build_transfer_row(App *app)
+{
+    GtkWidget *row = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 6);
+    gtk_widget_set_no_show_all(row, TRUE);
+    gtk_widget_set_margin_start(row, 10);
+    gtk_widget_set_margin_end(row, 10);
+    app->transfer_label = gtk_label_new("Downloading\xe2\x80\xa6");
+    gtk_widget_set_halign(app->transfer_label, GTK_ALIGN_START);
+    gtk_box_pack_start(GTK_BOX(row), app->transfer_label, TRUE, TRUE, 0);
+    GtkWidget *cancel = gtk_button_new_with_label("Cancel");
+    g_signal_connect(cancel, "clicked", G_CALLBACK(transport_cancel_clicked), app);
+    gtk_box_pack_start(GTK_BOX(row), cancel, FALSE, FALSE, 0);
+    gtk_widget_show_all(row);
+    gtk_widget_hide(row);
+    return row;
+}
+
+/* Playback belongs to the page it came from. Leaving that page releases the
+   device and takes the fetched file with it -- an episode that keeps playing
+   over the next article is a surprise, and a temporary file nobody will ask
+   for again is litter. */
+static void media_release(App *app)
+{
+    if (app->transfer) media_transfer_cancel(app);
+    media_audio_close();
+    if (app->audio_file) { unlink(app->audio_file); g_free(app->audio_file); app->audio_file = NULL; }
+    if (app->transport_row) gtk_widget_hide(app->transport_row);
+}
+
 static void open_link(App *app, const char *uri);
 
 /* Ask the laid-out document, not the collected boxes. Only block-level
@@ -1956,6 +2370,18 @@ static void open_link(App *app, const char *uri)
     if (!uri || !*uri) return;
     if (strncmp(uri, MEDIA_SCHEME, strlen(MEDIA_SCHEME)) == 0) {
         enter_viewer(app, uri + strlen(MEDIA_SCHEME));
+        return;
+    }
+    if (strncmp(uri, MEDIA_PLAY_SCHEME, strlen(MEDIA_PLAY_SCHEME)) == 0) {
+        media_play(app, uri + strlen(MEDIA_PLAY_SCHEME));
+        return;
+    }
+    if (strncmp(uri, MEDIA_DOWNLOAD_SCHEME, strlen(MEDIA_DOWNLOAD_SCHEME)) == 0) {
+        media_download(app, uri + strlen(MEDIA_DOWNLOAD_SCHEME));
+        return;
+    }
+    if (strncmp(uri, MEDIA_OPEN_SCHEME, strlen(MEDIA_OPEN_SCHEME)) == 0) {
+        open_external(app, uri + strlen(MEDIA_OPEN_SCHEME));
         return;
     }
     if (strcmp(uri, CLOSE_URI) == 0) { leave_viewer(app); return; }
@@ -2615,7 +3041,9 @@ static void load_done(GObject *source_object, GAsyncResult *result, gpointer opa
     const DAppPage *page = d_app_history_current(&app->history);
     load_surface(app, page);
     gtk_window_set_title(GTK_WINDOW(app->window), page && page->url ? page->url : "Distill");
-    set_status(app, "Ready");
+    set_status(app, loaded->challenge
+                    ? "Access challenge: page content was not available"
+                    : "Ready");
     free_load_result(loaded);
     app_unref(app);
 }
@@ -2630,6 +3058,7 @@ static void app_begin_load(App *app, const char *uri, const char *method,
         g_free(unwrapped);
         return;
     }
+    media_release(app);
     if (!page_uri_allowed(uri)) {
         set_status(app, "Navigation blocked: use an http(s), file, or local path URL");
         return;
@@ -3011,6 +3440,8 @@ static void app_destroy(GtkWidget *widget, gpointer opaque)
     (void)widget;
     App *app = opaque;
     app->closing = true;
+    if (app->transport_tick_id) { g_source_remove(app->transport_tick_id); app->transport_tick_id = 0; }
+    media_release(app);
     cancel_reader_scroll_restore(app);
     cancel_relayout(app);
     stop_load_feedback(app);
@@ -3126,6 +3557,14 @@ static void app_activate(GtkApplication *application, gpointer opaque)
     gtk_overlay_add_overlay(GTK_OVERLAY(overlay), app->form_layer);
     gtk_overlay_set_overlay_pass_through(GTK_OVERLAY(overlay), app->form_layer, FALSE);
     set_surface_size(app, reader_page_width(app), PAGE_HEIGHT);
+
+    app->transfer_row = build_transfer_row(app);
+    gtk_box_pack_start(GTK_BOX(root), app->transfer_row, FALSE, FALSE, 0);
+    app->transport_row = build_transport_row(app);
+    gtk_box_pack_start(GTK_BOX(root), app->transport_row, FALSE, FALSE, 0);
+    /* One tick drives the handle. The core is never asked to call into the
+       front end, and the front end never blocks on the core. */
+    app->transport_tick_id = g_timeout_add(200, transport_tick, app);
 
     GtkWidget *status_row = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 8);
     gtk_widget_set_margin_start(status_row, 10);
@@ -3469,7 +3908,27 @@ static bool run_media_self_test(void)
     ok = !page_uri_allowed(MEDIA_SCHEME "https://example.com/a.png") && ok;
     ok = !page_uri_allowed(CLOSE_URI) && ok;
     ok = !external_uri_allowed(MEDIA_SCHEME "https://example.com/a.png") && ok;
+    ok = !page_uri_allowed(MEDIA_PLAY_SCHEME "https://example.com/a.mp3") && ok;
+    ok = !page_uri_allowed(MEDIA_DOWNLOAD_SCHEME "https://example.com/a.mp3") && ok;
+    ok = !page_uri_allowed(MEDIA_OPEN_SCHEME "https://example.com/a.mp4") && ok;
+    ok = !external_uri_allowed(MEDIA_PLAY_SCHEME "https://example.com/a.mp3") && ok;
     if (!ok) fprintf(stderr, "media: an internal destination was treated as a URL\n");
+
+    /* The payload inside a media action still has to clear the allowlist: the
+       action scheme is the shell's own, what it carries is the page's. */
+    ok = external_uri_allowed("https://example.com/a.mp3") && ok;
+    ok = !external_uri_allowed("file:///etc/passwd") && ok;
+    ok = !external_uri_allowed("javascript:alert(1)") && ok;
+    if (!ok) fprintf(stderr, "media: a media action carried an unsupported scheme\n");
+
+    /* The audio core starts idle and refuses what it cannot decode, so a
+       reader who never asks for audio never has a device opened for them. */
+    MediaAudioState audio_state;
+    media_audio_snapshot(&audio_state);
+    ok = (audio_state.phase == MEDIA_AUDIO_STOPPED) && ok;
+    ok = !media_audio_open_silent("/nonexistent/not-a-file.mp3", "missing") && ok;
+    media_audio_close();
+    if (!ok) fprintf(stderr, "media: the audio core did not start idle\n");
 
     /* Viewer mode's page, laid out by the renderer the shell actually uses.
        Markup and renderer have to agree about the image or the reader gets an

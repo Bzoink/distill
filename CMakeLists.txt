@@ -66,6 +66,20 @@ target_link_libraries(distill-litehtml-geometry-test PRIVATE
 distill_enable_assertions(distill-litehtml-geometry-test)
 add_test(NAME distill-litehtml-geometry COMMAND distill-litehtml-geometry-test)
 
+# The audio core. miniaudio is a single-source third-party header, vendored
+# under external/ like every other dependency, and compiled in exactly one
+# translation unit. Its warnings are not ours to fix, so they are quieted for
+# that file alone -- the C23 code around it keeps the project's warning level.
+add_library(distill-media-audio STATIC src/media_audio.c)
+target_include_directories(distill-media-audio PUBLIC src PRIVATE "${CMAKE_SOURCE_DIR}/external/src/miniaudio")
+target_compile_options(distill-media-audio PRIVATE -w)
+target_link_libraries(distill-media-audio PUBLIC Threads::Threads ${CMAKE_DL_LIBS} m)
+
+add_executable(distill-media-audio-test tests/media_audio_test.c)
+target_link_libraries(distill-media-audio-test PRIVATE distill-media-audio m)
+distill_enable_assertions(distill-media-audio-test)
+add_test(NAME distill-media-audio COMMAND distill-media-audio-test)
+
 add_library(distill-render-core STATIC src/render.c src/shaper.c src/image.c)
 target_link_libraries(distill-render-core PUBLIC PkgConfig::DISTILL_RENDER PkgConfig::DISTILL_IMAGE)
 
@@ -115,6 +129,7 @@ if(DISTILL_GTK_FOUND)
     )
     target_link_directories(distill-gtk PRIVATE "${EXTERNAL_PREFIX}/lib")
     target_link_libraries(distill-gtk PRIVATE
+    distill-media-audio
         litehtml
         gumbo
         distill-render-core

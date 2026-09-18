@@ -22,7 +22,7 @@ Patching that engine in place turned out to be the wrong shape of fix: the synta
 Scope cuts made up front, so effort doesn't quietly drift toward rebuilding a general-purpose browser.
 
 1. **Not a layout engine for other people's CSS.** No flexbox/grid solver for arbitrary sites — that's the single hardest, most open-ended part of any browser, and we don't need it if we render our own template instead of theirs. This holds for interactive elements too: a native `<select>` or `<input>` gets extracted and re-rendered as *our* control, same as an article's headings and paragraphs; a bespoke JS-driven control (a custom dropdown, a date picker built from `div`s) is source-site UI, not a native form control, and is out of scope the same way its CSS is. Note the one honest consequence of this cut, spelled out under [What we tell the page about layout](#what-we-tell-the-page-about-layout): with no layout solver, the geometry APIs can't tell the truth, so we give them a deliberate, consistent fiction instead.
-2. **Not a media engine.** No WebGL, no video/audio pipeline, no WebAssembly, no in-app playback. Text, structure, and images are the target. A page that embeds video (YouTube/Vimeo iframe, `<video>` tag, OpenGraph/oEmbed video metadata) is still content worth surfacing, though: we extract what metadata is available — title, thumbnail, duration, source URL — and present it as a card with a hand-off action to an external player, rather than trying to decode or play it ourselves.
+2. **Not a media engine.** No WebGL, no video pipeline, no WebAssembly, no in-app video playback. Text, structure, images and audio are the target. A page that embeds video (YouTube/Vimeo iframe, `<video>` tag, OpenGraph/oEmbed video metadata) is still content worth surfacing: we extract what metadata is available — title, thumbnail, duration, source URL — and present it as a card offering a download for a direct file or an external hand-off for an embed, rather than decoding it ourselves. *(Corrected. The original cut lumped audio in with video because both are "media"; they have different costs. Video's cost is A/V sync, frame timing and a per-target paint path, on top of a container/codec stack. Audio's is a ring buffer and a decoder, and it is the one medium whose output path is identical on desktop, framebuffer and TUI. The external hand-off that makes video cheap makes audio useless exactly where this project is going: a framebuffer console has nowhere to hand off to, and an SSH'd TUI hands off to the wrong machine. Audio playback is therefore in scope, scoped to direct MP3/WAV/FLAC, one stream at a time, no autoplay. Video's cut stands unchanged, and the media-presentation model — nothing fetched until activated — governs audio too. See [MEDIA_PLAYBACK_PLAN.md](MEDIA_PLAYBACK_PLAN.md).)*
 3. **Not a bot-challenge solver.** Cloudflare-style JS challenges fingerprint the whole browser and are an adversarial problem, not a capability gap. Sites gated this way are out of scope, not a bug to fix.
 4. **Not full spec coverage.** We implement the DOM/JS surface real pages actually exercise, driven by what Phase 0 telemetry hits — not the complete WHATWG/W3C surface NetSurf's own gap list runs to 1,500+ items long. The same discipline governs typography: we shape the scripts our corpus actually contains, not the Unicode repertoire.
 
@@ -233,6 +233,8 @@ Classification happens during Extract (step 4b), reusing Readability's own image
 - **Decorative** (empty `alt=""`, icon/spacer-sized, CSS `background-image`) — dropped entirely, never a placeholder.
 - **In-flow content images** — kept inline at their original position, as a placeholder.
 - **No clear anchor** (gallery/carousel markup, sidebar images Readability judged content-relevant but couldn't place in the paragraph flow) — collected into an end-of-content list instead of guessing where to attach them.
+
+**Audio is the one medium the reader plays itself.** An `<audio>` element, a `<source>` child or a JSON-LD enclosure becomes a media reference with a **Play** action, decoded in-process from a file fetched on activation — see [MEDIA_PLAYBACK_PLAN.md](MEDIA_PLAYBACK_PLAN.md) for why audio and not video, and for the scope that keeps it small. A direct video file offers a download; an embed keeps the external hand-off. Playback is never automatic, and one stream plays at a time.
 
 Nothing is fetched until a placeholder is activated — no bandwidth or decode cost for content the user never looks at. Activating an image opens **viewer mode**; activating a video reference hands off externally, after scheme validation.
 
@@ -537,7 +539,8 @@ What this project is actually building, once the borrowed parts are set aside.
 - The layout fiction (geometry-API surface) and the minimal style resolver
 - Page-shape classification, extractor dispatch, and confidence scoring, plus the extractors behind it
 - Base-URL resolution, sanitization, and the URI scheme allowlist
-- Video metadata extraction + external-player hand-off (no playback)
+- Video metadata extraction, direct/embed classification, download + external-player hand-off (no video playback)
+- The audio playback core (miniaudio behind a C23 API) and the shared download core
 - Form extraction, native re-render, and the submit → refetch → re-pipeline loop
 - Media-reference classification and lazy fetch on activation
 - The run shaper (scoped small) and the font matcher
