@@ -2727,21 +2727,57 @@ static void append_media_action(DBuffer *output, const char *scheme, const char 
 
 /* Audio is the one medium the reader plays itself, and it says plainly when it
    cannot: an Opus or AAC file is a download, not a Play button that fails. */
+/* A page offering files for download can name dozens of them, and a full card
+   each would bury the prose that explains what they are. A reference found as
+   a link carries no duration or declared type to show anyway, so it gets one
+   row: what it is called, and what can be done with it. */
+static void append_json_audio_list(Engine *engine, JSValueConst audio, DBuffer *output,
+                                   int64_t count)
+{
+    bool opened = false;
+    for (int64_t i = 0; i < count; ++i) {
+        JSValue item = JS_GetPropertyUint32(engine->context, audio, (uint32_t)i);
+        char *source = json_property_string(engine, item, "source");
+        char *url = json_property_string(engine, item, "url");
+        char *title = json_property_string(engine, item, "title");
+        bool playable = json_property_bool(engine, item, "playable");
+        if (d_eq(source, "link") && *url) {
+            if (!opened) {
+                append_section_marker(output, "audio");
+                dbuf_puts(output, "<section id=\"audio\" class=\"audio-card\">"
+                                  "<p class=\"eyebrow\">Audio</p><h2>Audio files on this page</h2>");
+                opened = true;
+            }
+            dbuf_puts(output, "<p class=\"audio-row\"><span class=\"audio-name\">");
+            append_html_escaped(output, *title ? title : "Audio");
+            dbuf_puts(output, "</span>");
+            if (playable) append_media_action(output, "distill-play:", url, "Play", true);
+            append_media_action(output, "distill-download:", url, "Download", false);
+            dbuf_puts(output, "</p>");
+        }
+        free(source); free(url); free(title);
+        JS_FreeValue(engine->context, item);
+    }
+    if (opened) dbuf_puts(output, "</section>");
+}
+
 static void append_json_audio(Engine *engine, JSValueConst audio, DBuffer *output)
 {
     int64_t count = json_array_length(engine, audio);
+    append_json_audio_list(engine, audio, output, count);
     for (int64_t i = 0; i < count; ++i) {
         JSValue item = JS_GetPropertyUint32(engine->context, audio, (uint32_t)i);
+        char *found_by = json_property_string(engine, item, "source");
+        bool from_link = d_eq(found_by, "link");
+        free(found_by);
+        if (from_link) { JS_FreeValue(engine->context, item); continue; }
         char *title = json_property_string(engine, item, "title");
         char *url = json_property_string(engine, item, "url");
         char *mime = json_property_string(engine, item, "mime");
         double duration = json_property_number(engine, item, "duration");
         bool playable = json_property_bool(engine, item, "playable");
         if (*url) {
-            if (i == 0) append_section_marker(output, "audio");
-            dbuf_puts(output, i == 0
-                              ? "<section id=\"audio\" class=\"audio-card\"><p class=\"eyebrow\">Audio</p><h2>"
-                              : "<section class=\"audio-card\"><p class=\"eyebrow\">Audio</p><h2>");
+            dbuf_puts(output, "<section class=\"audio-card\"><p class=\"eyebrow\">Audio</p><h2>");
             append_html_escaped(output, *title ? title : "Audio");
             dbuf_puts(output, "</h2>");
             if (duration > 0 || *mime) {
@@ -3125,6 +3161,8 @@ static char *reader_template(Engine *engine, const char *json, const char *theme
         "button,.button{display:inline-block;padding:.55em .85em;border:0;border-radius:3px;background:var(--link);color:white;text-decoration:none;font:inherit;}"
         ".video-card h2,.audio-card h2,.table-card h2,.form-card h2,.media-gallery h2,.result-list h2{margin-top:0;}"
         ".media-meta{color:var(--muted);margin:0 0 0.8em 0;}"
+        ".audio-row{margin:0 0 .5em 0;}"
+        ".audio-name{display:inline-block;min-width:17em;}"
         ".button-secondary{background:var(--card-background);border:1px solid var(--border);color:var(--page-text);}"
         ".video-card .button,.audio-card .button{margin:0 .5em .5em 0;}"
         ".eyebrow,.media-url{font-size:.78em;color:var(--muted);}"
@@ -3530,6 +3568,118 @@ static const char *audio_format_name(const unsigned char *data, size_t length)
     return "";
 }
 
+/* Not every URL is a document. A link to an .mp3 is an ordinary link on an
+   ordinary page, and following it handed 600 KB of audio to the HTML parser,
+   which produced an empty document and a reader page with no title and
+   nothing on it.
+ *
+ * The bytes decide, as everywhere else here: a served content type is page
+ * controlled. What comes back is a small document describing the resource,
+ * so the rest of the pipeline treats it as any other page and the reader
+ * renders the same audio or video card it would render for an embedded one.
+ */
+typedef struct { const char *kind; const char *mime; } MediaResource;
+
+static MediaResource media_resource_kind(const unsigned char *data, size_t length)
+{
+    if (!data || length < 12) return (MediaResource){NULL, NULL};
+    const char *audio = audio_format_name(data, length);
+    if (*audio) {
+        if (d_eq(audio, "WAV")) return (MediaResource){"audio", "audio/wav"};
+        if (d_eq(audio, "FLAC")) return (MediaResource){"audio", "audio/flac"};
+        return (MediaResource){"audio", "audio/mpeg"};
+    }
+    /* Ogg carries either, and the codec name is inside the first page; the
+       reader offers a download for both, so the distinction can wait. */
+    if (memcmp(data, "OggS", 4) == 0) return (MediaResource){"audio", "audio/ogg"};
+    if (memcmp(data + 4, "ftyp", 4) == 0) {
+        const unsigned char *brand = data + 8;
+        if (memcmp(brand, "M4A", 3) == 0) return (MediaResource){"audio", "audio/mp4"};
+        return (MediaResource){"video", "video/mp4"};
+    }
+    if (memcmp(data, "\x1a\x45\xdf\xa3", 4) == 0) return (MediaResource){"video", "video/webm"};
+    if (memcmp(data, "\x89PNG\r\n\x1a\n", 8) == 0) return (MediaResource){"image", "image/png"};
+    if (memcmp(data, "\xff\xd8\xff", 3) == 0) return (MediaResource){"image", "image/jpeg"};
+    if (memcmp(data, "GIF8", 4) == 0) return (MediaResource){"image", "image/gif"};
+    if (memcmp(data, "RIFF", 4) == 0 && memcmp(data + 8, "WEBP", 4) == 0)
+        return (MediaResource){"image", "image/webp"};
+    if (memcmp(data, "%PDF-", 5) == 0) return (MediaResource){"document", "application/pdf"};
+    return (MediaResource){NULL, NULL};
+}
+
+/* The reader's own escaper lives in the render-only half of this file, and
+   this document has to be built in every build. */
+static void media_escaped(DBuffer *out, const char *text)
+{
+    for (const char *at = text ? text : ""; *at; ++at) {
+        switch (*at) {
+            case '&': dbuf_puts(out, "&amp;"); break;
+            case '<': dbuf_puts(out, "&lt;"); break;
+            case '>': dbuf_puts(out, "&gt;"); break;
+            case '"': dbuf_puts(out, "&quot;"); break;
+            default: dbuf_printf(out, "%c", *at); break;
+        }
+    }
+}
+
+/* The last path segment, which is the only name a bare file has. */
+static char *media_resource_name(const char *url)
+{
+    const char *tail = url ? strrchr(url, '/') : NULL;
+    char *name = d_strdup(tail && tail[1] ? tail + 1 : (url ? url : "file"));
+    char *cut = strpbrk(name, "?#");
+    if (cut) *cut = '\0';
+    if (!*name) { free(name); name = d_strdup("file"); }
+    return name;
+}
+
+/* A document standing in for the resource. Deliberately built from the same
+   markup a page would use, so extraction, shape classification and the reader
+   template all take their ordinary paths and there is no second way for a
+   media card to be produced. */
+static char *media_resource_document(const MediaResource *resource, const char *url,
+                                     size_t bytes)
+{
+    char *name = media_resource_name(url);
+    DBuffer out; dbuf_init(&out);
+    dbuf_puts(&out, "<!doctype html><html><head><meta charset=\"utf-8\"><title>");
+    media_escaped(&out, name);
+    dbuf_puts(&out, "</title></head><body><main><h1>");
+    media_escaped(&out, name);
+    dbuf_puts(&out, "</h1>");
+    if (d_eq(resource->kind, "audio") || d_eq(resource->kind, "video")) {
+        bool audio = d_eq(resource->kind, "audio");
+        dbuf_puts(&out, audio ? "<audio title=\"" : "<video title=\"");
+        media_escaped(&out, name);
+        dbuf_puts(&out, "\"><source src=\"");
+        media_escaped(&out, url ? url : "");
+        dbuf_puts(&out, "\" type=\"");
+        media_escaped(&out, resource->mime ? resource->mime : "");
+        dbuf_puts(&out, "\"></");
+        dbuf_puts(&out, audio ? "audio>" : "video>");
+    } else if (d_eq(resource->kind, "image")) {
+        dbuf_puts(&out, "<img src=\"");
+        media_escaped(&out, url ? url : "");
+        dbuf_puts(&out, "\" alt=\"");
+        media_escaped(&out, name);
+        dbuf_puts(&out, "\">");
+    } else {
+        /* Nothing this reader renders, but still something it can hand over
+           rather than pretend to have opened. */
+        dbuf_puts(&out, "<p>This is a ");
+        media_escaped(&out, resource->mime ? resource->mime : "binary");
+        dbuf_printf(&out, " file of %zu bytes. The reader does not display it, "
+                          "but it can be saved.</p><p><a href=\"", bytes);
+        media_escaped(&out, url ? url : "");
+        dbuf_puts(&out, "\">");
+        media_escaped(&out, name);
+        dbuf_puts(&out, "</a></p>");
+    }
+    dbuf_puts(&out, "</main></body></html>");
+    free(name);
+    return dbuf_take(&out);
+}
+
 static int run_page(const char *input, uint64_t cap_ms, uint64_t memory_mb,
                     uint64_t max_scripts, bool dump_dom, bool extract,
                     const char *render_path, const char *viewer_path, int media_index,
@@ -3652,6 +3802,22 @@ static int run_page(const char *input, uint64_t cap_ms, uint64_t memory_mb,
         return ok ? 0 : 2;
     }
 #endif
+    /* A resource that is not a document must not be parsed as one. Stand a
+       small document in for it before anything else looks at the bytes, so
+       extraction, shape classification and the reader template all run their
+       ordinary course and produce the same card an embedded reference gets. */
+    MediaResource resource = media_resource_kind((const unsigned char *)html.data, html.length);
+    if (resource.kind) {
+        fprintf(stderr, "%s resource (%s), %zu bytes: presenting it rather than parsing it\n",
+                resource.kind, resource.mime, html.length);
+        char *document = media_resource_document(&resource, engine.source_url, html.length);
+        dbuf_free(&html);
+        dbuf_init(&html);
+        dbuf_puts(&html, document);
+        free(initial_html);
+        initial_html = d_strdup(document);
+        free(document);
+    }
     engine.challenge = challenge_kind(html.data, html.length,
                                       DISTILL_CHALLENGE_SERVED_BYTES);
     if (engine.challenge) {

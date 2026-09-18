@@ -1213,6 +1213,109 @@
           ]
         }
       ]
+    },
+    {
+      "id": "40-audio-links",
+      "path": "40-audio-links.html",
+      "gate": true,
+      "plan_section": "Phase 1 extraction breadth, audio offered as links",
+      "exercises": [
+        "audio-link",
+        "duplicate-link-collapse",
+        "non-audio-link",
+        "undecodable-format"
+      ],
+      "why": "A download listing offers audio as links and carries no audio element at all, so a reader that only looks for <audio> can play files it will never show. The same file linked twice must collapse to one reference, a PDF link must not become audio, and a format the core cannot decode must be offered as a download rather than a Play that fails.",
+      "assertions": [
+        {
+          "stage": "extract",
+          "path": "audio[0].source",
+          "expect": "link"
+        },
+        {
+          "stage": "extract",
+          "path": "audio[0].title",
+          "expect": "Voice recording"
+        },
+        {
+          "stage": "extract",
+          "path": "audio[1].mime",
+          "expect": "audio/wav"
+        },
+        {
+          "stage": "extract",
+          "path": "audio[2].mime",
+          "expect": "audio/flac"
+        },
+        {
+          "stage": "extract",
+          "path": "audio[3].playable",
+          "expect": "false"
+        },
+        {
+          "stage": "extract",
+          "path": "audio",
+          "expect_absent": [
+            "handbook.pdf"
+          ]
+        },
+        {
+          "stage": "template",
+          "expect": "Audio files on this page"
+        },
+        {
+          "stage": "template",
+          "expect": "/media/voice-sample.mp3\">Play</a>"
+        },
+        {
+          "stage": "template",
+          "expect_absent": [
+            "/media/speech.opus\">Play</a>"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "41-media-resource",
+      "path": "media/41-tone.wav",
+      "gate": true,
+      "plan_section": "Phase 1, a resource that is not a document",
+      "exercises": [
+        "non-html-resource",
+        "byte-sniffed-media",
+        "media-landing-page"
+      ],
+      "why": "Following a link to a media file handed its bytes to the HTML parser, which produced an empty document and a reader page with no title and nothing on it. The bytes decide what a resource is, as everywhere else here, and what comes back is the same card an embedded reference gets.",
+      "assertions": [
+        {
+          "stage": "extract",
+          "path": "title",
+          "expect": "41-tone.wav"
+        },
+        {
+          "stage": "extract",
+          "path": "audio[0].mime",
+          "expect": "audio/wav"
+        },
+        {
+          "stage": "extract",
+          "path": "audio[0].playable",
+          "expect": "true"
+        },
+        {
+          "stage": "extract",
+          "path": "audio[0].direct",
+          "expect": "true"
+        },
+        {
+          "stage": "template",
+          "expect": "41-tone.wav"
+        },
+        {
+          "stage": "template",
+          "expect": "distill-play:"
+        }
+      ]
     }
   ],
   "live": [

@@ -2169,6 +2169,17 @@ static char *media_source_url(Engine *engine, lxb_dom_node_t *node,
     return d_strdup("");
 }
 
+/* The last path segment: what a file is called when nothing else names it. */
+static char *media_file_name(const char *url)
+{
+    const char *tail = url ? strrchr(url, '/') : NULL;
+    char *name = d_strdup(tail && tail[1] ? tail + 1 : "audio");
+    char *cut = strpbrk(name, "?#");
+    if (cut) *cut = '\0';
+    if (!*name) { free(name); name = d_strdup("audio"); }
+    return name;
+}
+
 /* Pages spell a duration in whichever attribute their player wanted. */
 static char *media_duration_attr(lxb_dom_element_t *element)
 {
@@ -2257,12 +2268,17 @@ static char *videos_json(Engine *engine, lxb_dom_node_t *root, size_t *rejected)
     dbuf_puts(&out, "]"); return dbuf_take(&out);
 }
 
-typedef struct { DBuffer out; bool first; size_t seen; size_t *rejected; } AudioSink;
+typedef struct { DBuffer out; bool first; size_t seen; size_t *rejected; StringVec urls; } AudioSink;
 
 static void audio_sink_add(AudioSink *sink, const char *url, const char *title,
                            const char *mime, double duration, const char *source)
 {
     if (!url || !*url || sink->seen >= 64) return;
+    /* A listing often links the same file twice, once from a heading and once
+       from a "Download" button. One file, one reference. */
+    for (size_t i = 0; i < sink->urls.length; ++i)
+        if (d_eq(sink->urls.items[i], url)) return;
+    string_vec_push(&sink->urls, d_strdup(url));
     if (!sink->first) dbuf_puts(&sink->out, ",");
     sink->first = false; ++sink->seen;
     char *qu = json_quote(url), *qt = json_quote(title), *qm = json_quote(mime), *qs = json_quote(source);
@@ -2327,6 +2343,28 @@ static char *audio_json(Engine *engine, lxb_dom_node_t *root, size_t *rejected)
         free(url); free(mime); free(title); free(duration_raw);
     }
     free(nodes.items);
+    /* A link to an audio file is as declarative as an <audio> element, and on
+       a page that offers files for download it is the only form there is.
+       Recorded as a reference so the reader can play it where it stands
+       rather than making it a navigation that lands on a bare file. */
+    NodeVec anchors = find_selector(root, "a");
+    for (size_t i = 0; i < anchors.length; ++i) {
+        if (hidden_node(root, anchors.items[i])) continue;
+        lxb_dom_element_t *element = lxb_dom_interface_element(anchors.items[i]);
+        char *raw = attr_value(element, "href");
+        char *url = safe_uri(engine, raw, rejected);
+        free(raw);
+        char *mime = media_mime(NULL, url);
+        if (!*url || !d_starts(mime, "audio/")) { free(url); free(mime); continue; }
+        /* "Download" is what these links usually say, which names the action
+           rather than the file; the file name is the more useful label. */
+        char *text = compact_text(anchors.items[i]);
+        char *name = media_file_name(url);
+        bool useful = *text && !d_ieq(text, "download") && strlen(text) > 3;
+        audio_sink_add(&sink, url, useful ? text : name, mime, 0, "link");
+        free(text); free(name); free(url); free(mime);
+    }
+    free(anchors.items);
     NodeVec scripts = find_selector(root, "script");
     for (size_t i = 0; i < scripts.length; ++i) {
         lxb_dom_element_t *element = lxb_dom_interface_element(scripts.items[i]);
@@ -2344,6 +2382,7 @@ static char *audio_json(Engine *engine, lxb_dom_node_t *root, size_t *rejected)
     }
     free(scripts.items);
     dbuf_puts(&sink.out, "]");
+    string_vec_free(&sink.urls);
     return dbuf_take(&sink.out);
 }
 

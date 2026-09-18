@@ -1,0 +1,38 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>Sample audio files</title>
+<main>
+  <h1>Sample audio files</h1>
+  <p>A page that offers audio the way download listings actually do: as links,
+  with no audio element anywhere. A reader that plays audio has to recognise
+  them, or the files it can play are the ones it never shows.</p>
+  <div id="listing"></div>
+</main>
+<script>
+  /* Written after load, so the assertions cannot pass against the served
+     HTML. The same file is linked twice -- once by name and once from a
+     "Download" button -- which is what listings do and what the reference
+     list has to collapse. */
+  var listing = document.getElementById('listing');
+  var files = [
+    ['Voice recording', '/media/voice-sample.mp3'],
+    ['Sound effects', '/media/sfx.wav'],
+    ['Lossless master', '/media/master.flac'],
+    ['Opus encode', '/media/speech.opus']
+  ];
+  files.forEach(function (file) {
+    var named = document.createElement('a');
+    named.setAttribute('href', file[1]);
+    named.textContent = file[0];
+    listing.appendChild(named);
+    var button = document.createElement('a');
+    button.setAttribute('href', file[1]);
+    button.textContent = 'Download';
+    listing.appendChild(button);
+  });
+  /* Not audio, and must not be collected as if it were. */
+  var doc = document.createElement('a');
+  doc.setAttribute('href', '/media/handbook.pdf');
+  doc.textContent = 'Handbook';
+  listing.appendChild(doc);
+</script>
