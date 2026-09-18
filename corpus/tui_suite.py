@@ -227,9 +227,27 @@ def run(binary, base):
         t.send("\x1b", 0.4)
         check("Go to:" not in t.text(), "Escape closes the prompt without navigating")
         t.send("?")
-        check(t.wait_for("Keys"), "? shows the keys")
+        check(t.wait_for("Links and fields") and "\u256d" in t.text(), "? shows the keys in a box")
         t.send("x")
-        check(t.wait_gone("Tab S-Tab"), "any key closes the key list")
+        check(t.wait_gone("Links and fields"), "any key closes the key list")
+        t.quit()
+    finally:
+        t.close()
+
+    # On a short terminal the key list scrolls instead of being cut off.
+    t = term(f"{base}/09-article.html", columns=50, rows=14)
+    try:
+        t.wait_for("A careful reader")
+        t.send("?")
+        t.wait_for("Reading")
+        check("more" in t.text() and "Pictures" not in t.text(), "a short key list says there is more",
+              t.text())
+        for _ in range(40):
+            t.send("j", 0.05)
+        t.pump(0.3)
+        check("Pictures" in t.text() and "quit" in t.text(), "j scrolls the key list to its end", t.text())
+        t.send("x")
+        check(t.wait_gone("Pictures"), "another key closes the scrolled list")
         t.quit()
     finally:
         t.close()

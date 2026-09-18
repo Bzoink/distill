@@ -155,6 +155,7 @@ typedef struct {
     bool popup_open;
     Popup popup;
     bool help;
+    int help_scroll, help_most;
     Viewer viewer;
 
     DMediaTransfer *transfer;
@@ -1561,32 +1562,189 @@ static void draw_popup(void)
     }
 }
 
-static const char *const help_lines[] = {
-    "j k \xe2\x86\x93 \xe2\x86\x91     scroll          Space PgDn  page down",
-    "b PgUp        page up         g G         top, bottom",
-    "Tab S-Tab     next, previous link or field",
-    "Enter         follow, press, edit",
-    "o Ctrl-L      go to an address or search",
-    "Backspace H   back            L           forward",
-    "r             reload          t           theme",
-    "Alt-1..9      jump to a section",
-    "< >           scroll a wide table sideways",
-    "Audio:  Space play/pause  s stop  \xe2\x86\x90 \xe2\x86\x92 seek  [ ] volume  x close",
-    "Images: \xe2\x86\x90 \xe2\x86\x92 step   Esc close",
-    "Esc stops a load or a transfer    q quits",
+typedef struct {
+    const char *keys, *what;
+} HelpEntry;
+
+typedef struct {
+    const char *title;
+    HelpEntry entries[8];
+} HelpGroup;
+
+/* In reading order for one column; help_left and help_right arrange them
+   in two when the terminal is wide enough. */
+static const HelpGroup help_groups[] = {
+    {"Reading", {{"j k \xe2\x86\x93 \xe2\x86\x91", "scroll a line"},
+                 {"Space PgDn", "page down"},
+                 {"b PgUp", "page up"},
+                 {"g Home", "top"},
+                 {"G End", "bottom"},
+                 {"Alt-1\xe2\x80\xa6" "9", "jump to a section"},
+                 {"< > \xe2\x86\x90 \xe2\x86\x92", "scroll a wide table"}}},
+    {"Links and fields", {{"Tab", "next link or field"},
+                          {"S-Tab", "previous one"},
+                          {"Enter", "follow, press, edit"},
+                          {"Esc", "let go of it"}}},
+    {"Going places", {{"o Ctrl-L", "address or search"},
+                      {"Backspace H", "back"},
+                      {"L", "forward"},
+                      {"r F5", "reload"},
+                      {"Esc", "stop loading"}}},
+    {"Audio", {{"Space", "play, pause"},
+               {"s", "stop"},
+               {"\xe2\x86\x90 \xe2\x86\x92", "seek 5 seconds"},
+               {"[ ]", "volume"},
+               {"x", "close the player"}}},
+    {"Pictures", {{"Enter", "open"},
+                  {"\xe2\x86\x90 \xe2\x86\x92", "previous, next"},
+                  {"d", "save"},
+                  {"Esc", "close"}}},
+    {"Distill", {{"t", "change the theme"},
+                 {"?", "these keys"},
+                 {"q", "quit"}}},
 };
+
+static const size_t help_left[] = {0, 1, 5}, help_right[] = {2, 3, 4},
+                    help_single[] = {0, 1, 2, 3, 4, 5};
+
+enum { HELP_GROUPS = sizeof(help_groups) / sizeof(help_groups[0]), HELP_KEY_GAP = 2, HELP_COLUMN_GAP = 4 };
+
+/* One laid-out row of a help column: a group title or an entry. */
+typedef struct {
+    const HelpGroup *group;
+    const HelpEntry *entry;
+} HelpRow;
+
+static int help_entry_count(const HelpGroup *group)
+{
+    int n = 0;
+    while (n < 8 && group->entries[n].keys) ++n;
+    return n;
+}
+
+/* Lay the given groups out as one column, a blank row between groups.
+   Returns the row count. */
+static int help_column(const size_t *order, size_t count, HelpRow *rows)
+{
+    int n = 0;
+    for (size_t i = 0; i < count; ++i) {
+        const HelpGroup *group = &help_groups[order[i]];
+        if (i) rows[n++] = (HelpRow){0};
+        rows[n++] = (HelpRow){group, NULL};
+        for (int e = 0; e < help_entry_count(group); ++e) rows[n++] = (HelpRow){group, &group->entries[e]};
+    }
+    return n;
+}
+
+/* A horizontal border row: corners, a rule, and optional text set into it. */
+static void help_border(int x0, int y, int width, bool top, const char *label, bool label_right,
+                        Look edge, Look title)
+{
+    d_screen_text(&tui.screen, x0, y, x0 + 1, top ? "\xe2\x95\xad" : "\xe2\x95\xb0", edge.fg, edge.bg, edge.attrs);
+    for (int x = x0 + 1; x < x0 + width - 1; ++x)
+        d_screen_text(&tui.screen, x, y, x + 1, "\xe2\x94\x80", edge.fg, edge.bg, edge.attrs);
+    d_screen_text(&tui.screen, x0 + width - 1, y, x0 + width, top ? "\xe2\x95\xae" : "\xe2\x95\xaf",
+                  edge.fg, edge.bg, edge.attrs);
+    if (!label) return;
+    int cells = reader_text_cells(label, strlen(label)) + 2;
+    if (cells > width - 6) return;
+    int x = label_right ? x0 + width - 3 - cells : x0 + 3;
+    d_screen_text(&tui.screen, x, y, x + cells, " ", title.fg, title.bg, title.attrs);
+    d_screen_text(&tui.screen, x + 1, y, x + cells - 1, label, title.fg, title.bg, title.attrs);
+    d_screen_text(&tui.screen, x + cells - 1, y, x + cells, " ", title.fg, title.bg, title.attrs);
+}
 
 static void draw_help(void)
 {
     if (!tui.help) return;
-    int lines = (int)(sizeof(help_lines) / sizeof(help_lines[0]));
-    int width = 64 < tui.width - 2 ? 64 : tui.width - 2;
-    int x0 = (tui.width - width) / 2, y0 = 1 + (view_height() - lines - 2) / 2;
-    if (y0 < 1) y0 = 1;
-    draw_box(x0, y0, width, lines + 2, "Keys");
-    Look bar = bar_look();
-    for (int i = 0; i < lines; ++i)
-        d_screen_text(&tui.screen, x0 + 2, y0 + 1 + i, x0 + width - 1, help_lines[i], bar.fg, bar.bg, bar.attrs);
+    int key_width = 0, what_width = 0;
+    for (size_t g = 0; g < HELP_GROUPS; ++g) {
+        int title = reader_text_cells(help_groups[g].title, strlen(help_groups[g].title));
+        if (title > what_width) what_width = title;
+        for (int e = 0; e < help_entry_count(&help_groups[g]); ++e) {
+            const HelpEntry *entry = &help_groups[g].entries[e];
+            int k = reader_text_cells(entry->keys, strlen(entry->keys));
+            int w = reader_text_cells(entry->what, strlen(entry->what));
+            if (k > key_width) key_width = k;
+            if (w > what_width) what_width = w;
+        }
+    }
+    int column = key_width + HELP_KEY_GAP + what_width;
+    int room_x = tui.width - 2, room_y = view_height();
+    /* Border plus side padding of three cells, or one when space is short. */
+    int pad = 3;
+    bool two = 2 + 2 * pad + 2 * column + HELP_COLUMN_GAP <= room_x;
+    if (!two && 2 + 2 * 2 + 2 * column + HELP_COLUMN_GAP <= room_x) { two = true; pad = 2; }
+    HelpRow left[64], right[64];
+    int left_rows = two ? help_column(help_left, 3, left) : help_column(help_single, HELP_GROUPS, left);
+    int right_rows = two ? help_column(help_right, 3, right) : 0;
+    int content = left_rows > right_rows ? left_rows : right_rows;
+
+    int inner = two ? 2 * column + HELP_COLUMN_GAP : column;
+    if (!two) pad = 2 + inner + 2 * 3 <= room_x ? 3 : 1;
+    int width = 2 + 2 * pad + inner;
+    if (width > room_x) width = room_x;
+    /* A blank row above and below the keys, dropped before anything is cut. */
+    int vpad = content + 4 <= room_y ? 1 : 0;
+    int height = content + 2 + 2 * vpad;
+    if (height > room_y) height = room_y;
+    int visible = height - 2 - 2 * vpad;
+    if (visible < 0) visible = 0;
+    int most = content - visible > 0 ? content - visible : 0;
+    if (tui.help_scroll > most) tui.help_scroll = most;
+    if (tui.help_scroll < 0) tui.help_scroll = 0;
+    tui.help_most = most;
+
+    int x0 = (tui.width - width) / 2, y0 = view_top() + (room_y - height) / 2;
+    Look box = bar_look();
+    Look edge = look_for(READER_ROLE_BORDER, 0, true, false);
+    Look title = look_for(READER_ROLE_HEADING, 0, true, false);
+    Look keys = look_for(READER_ROLE_LINK, 0, true, false);
+    Look muted = look_for(READER_ROLE_MUTED, 0, true, false);
+    edge.bg = title.bg = keys.bg = muted.bg = box.bg;
+    title.attrs |= D_SCREEN_BOLD;
+    keys.attrs |= D_SCREEN_BOLD;
+    if (!themed()) {
+        /* Reverse video carries the box on a plain terminal; colours would
+           fight it, so keep only the weights. A dim rule vanishes in
+           reverse, so the border is drawn at full strength. */
+        edge.fg = title.fg = keys.fg = muted.fg = box.fg;
+        edge.attrs = box.attrs;
+        title.attrs |= box.attrs;
+        keys.attrs |= box.attrs;
+        muted.attrs |= box.attrs;
+    }
+
+    for (int y = y0; y < y0 + height; ++y) {
+        d_screen_fill(&tui.screen, x0, y, x0 + width, box.fg, box.bg, box.attrs);
+        if (y == y0 || y == y0 + height - 1) continue;
+        d_screen_text(&tui.screen, x0, y, x0 + 1, "\xe2\x94\x82", edge.fg, edge.bg, edge.attrs);
+        d_screen_text(&tui.screen, x0 + width - 1, y, x0 + width, "\xe2\x94\x82", edge.fg, edge.bg, edge.attrs);
+    }
+    const char *hint = most == 0 ? "any key closes"
+                     : tui.help_scroll < most ? "\xe2\x86\x93 more \xc2\xb7 any other key closes"
+                     : "\xe2\x86\x91 back \xc2\xb7 any other key closes";
+    help_border(x0, y0, width, true, "Keys", false, edge, title);
+    help_border(x0, y0 + height - 1, width, false, hint, true, edge, muted);
+
+    int limit = x0 + width - 1;
+    for (int c = 0; c < (two ? 2 : 1); ++c) {
+        const HelpRow *rows = c ? right : left;
+        int count = c ? right_rows : left_rows;
+        int x = x0 + 1 + pad + c * (column + HELP_COLUMN_GAP);
+        for (int i = 0; i < visible && tui.help_scroll + i < count; ++i) {
+            const HelpRow *row = &rows[tui.help_scroll + i];
+            int y = y0 + 1 + vpad + i;
+            if (!row->group) continue;
+            if (!row->entry) {
+                d_screen_text(&tui.screen, x, y, limit, row->group->title, title.fg, title.bg, title.attrs);
+                continue;
+            }
+            d_screen_text(&tui.screen, x, y, limit, row->entry->keys, keys.fg, keys.bg, keys.attrs);
+            d_screen_text(&tui.screen, x + key_width + HELP_KEY_GAP, y, limit, row->entry->what,
+                          box.fg, box.bg, box.attrs);
+        }
+    }
 }
 
 static void draw_viewer(DBuffer *after)
@@ -1922,7 +2080,7 @@ static void page_key(const struct tb_event *event)
         reload();
         break;
     }
-    case '?': tui.help = true; break;
+    case '?': tui.help = true; tui.help_scroll = 0; break;
     case 'q': tui.quit = true; break;
     default: break;
     }
@@ -1998,6 +2156,17 @@ static void mouse(const struct tb_event *event)
     else if (link >= 0) { focus_on(FOCUS_LINK, (size_t)link); follow_link((size_t)link); }
 }
 
+/* The key list scrolls when it does not fit; any other key closes it. */
+static void help_key(const struct tb_event *event)
+{
+    if (!tui.help_most) tui.help = false;
+    else if (event->key == TB_KEY_ARROW_DOWN || event->ch == 'j') ++tui.help_scroll;
+    else if (event->key == TB_KEY_ARROW_UP || event->ch == 'k') --tui.help_scroll;
+    else if (event->key == TB_KEY_PGDN || event->ch == ' ') tui.help_scroll += view_height() / 2;
+    else if (event->key == TB_KEY_PGUP || event->ch == 'b') tui.help_scroll -= view_height() / 2;
+    else tui.help = false;
+}
+
 static void handle(const struct tb_event *event)
 {
     if (event->type == TB_EVENT_RESIZE) {
@@ -2012,7 +2181,7 @@ static void handle(const struct tb_event *event)
     if (event->type == TB_EVENT_MOUSE) { mouse(event); return; }
     if (event->type != TB_EVENT_KEY) return;
     if (event->key == TB_KEY_CTRL_C || event->key == TB_KEY_CTRL_Q) { tui.quit = true; return; }
-    if (tui.help) { tui.help = false; return; }
+    if (tui.help) { help_key(event); return; }
     if (tui.prompt.kind) { prompt_key(event); return; }
     if (tui.popup_open) { popup_key(event); return; }
     if (tui.viewer.active) { viewer_key(event); return; }
