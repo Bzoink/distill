@@ -1843,7 +1843,6 @@ static void transport_cancel_clicked(GtkButton *button, gpointer data)
 static GtkWidget *build_transport_row(App *app)
 {
     GtkWidget *row = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 6);
-    gtk_widget_set_no_show_all(row, TRUE);
     gtk_widget_set_margin_start(row, 10);
     gtk_widget_set_margin_end(row, 10);
     app->transport_play = gtk_button_new_with_label("Play");
@@ -1868,7 +1867,11 @@ static GtkWidget *build_transport_row(App *app)
     gtk_widget_set_size_request(volume, 90, -1);
     g_signal_connect(volume, "value-changed", G_CALLBACK(transport_volume_changed), app);
     gtk_box_pack_start(GTK_BOX(row), volume, FALSE, FALSE, 0);
+    /* Show the children first: gtk_widget_show_all respects no-show-all, so
+       setting that flag before this call leaves every child hidden and a
+       later show() reveals an empty bar. */
     gtk_widget_show_all(row);
+    gtk_widget_set_no_show_all(row, TRUE);
     gtk_widget_hide(row);
     return row;
 }
@@ -1876,7 +1879,6 @@ static GtkWidget *build_transport_row(App *app)
 static GtkWidget *build_transfer_row(App *app)
 {
     GtkWidget *row = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 6);
-    gtk_widget_set_no_show_all(row, TRUE);
     gtk_widget_set_margin_start(row, 10);
     gtk_widget_set_margin_end(row, 10);
     app->transfer_label = gtk_label_new("Downloading\xe2\x80\xa6");
@@ -1885,7 +1887,11 @@ static GtkWidget *build_transfer_row(App *app)
     GtkWidget *cancel = gtk_button_new_with_label("Cancel");
     g_signal_connect(cancel, "clicked", G_CALLBACK(transport_cancel_clicked), app);
     gtk_box_pack_start(GTK_BOX(row), cancel, FALSE, FALSE, 0);
+    /* Show the children first: gtk_widget_show_all respects no-show-all, so
+       setting that flag before this call leaves every child hidden and a
+       later show() reveals an empty bar. */
     gtk_widget_show_all(row);
+    gtk_widget_set_no_show_all(row, TRUE);
     gtk_widget_hide(row);
     return row;
 }
