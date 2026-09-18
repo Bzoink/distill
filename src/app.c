@@ -739,6 +739,40 @@ static gboolean restore_reader_scroll(gpointer opaque)
     return G_SOURCE_REMOVE;
 }
 
+static void scroll_value_changed(GtkAdjustment *adjustment, gpointer opaque);
+
+/* Give the page the keys without letting it move under the reader.
+   The event box covers the whole document, so a scrolled window asked to
+   bring the newly focused child into view scrolls to its top edge, which
+   threw the reader back to the start of the page. It happened on the first
+   click only -- after that the box already holds the focus and the grab is
+   skipped -- and so looked like nothing at all on a page short enough to
+   have no scroll offset to lose.
+
+   GTK does that scrolling synchronously inside grab_focus, so the offset can
+   simply be put back. The repaint is held off across the whole operation
+   rather than undone afterwards: the view never actually changes, and
+   rendering the top of the document in between only produces a flicker. */
+static void grab_page_focus(App *app)
+{
+    if (!app || !app->event_box) return;
+    if (!app->vertical_adjustment || app->viewer_active) {
+        gtk_widget_grab_focus(app->event_box);
+        return;
+    }
+    double offset = gtk_adjustment_get_value(app->vertical_adjustment);
+    double across = app->horizontal_adjustment
+                    ? gtk_adjustment_get_value(app->horizontal_adjustment) : 0;
+    g_signal_handlers_block_by_func(app->vertical_adjustment, scroll_value_changed, app);
+    gtk_widget_grab_focus(app->event_box);
+    if (gtk_adjustment_get_value(app->vertical_adjustment) != offset)
+        gtk_adjustment_set_value(app->vertical_adjustment, offset);
+    if (app->horizontal_adjustment &&
+        gtk_adjustment_get_value(app->horizontal_adjustment) != across)
+        gtk_adjustment_set_value(app->horizontal_adjustment, across);
+    g_signal_handlers_unblock_by_func(app->vertical_adjustment, scroll_value_changed, app);
+}
+
 static void cancel_reader_scroll_restore(App *app)
 {
     if (!app->restore_scroll_source) return;
@@ -2424,7 +2458,7 @@ static gboolean reader_button_press(App *app, GtkWidget *widget, GdkEventButton 
        copies whatever is in the entry rather than what is selected. A
        form control is its own widget and takes focus for itself. */
     if (app->event_box && !gtk_widget_has_focus(app->event_box))
-        gtk_widget_grab_focus(app->event_box);
+        grab_page_focus(app);
     clear_selection(app);
     app->press_x = event->x;
     app->press_y = y;
