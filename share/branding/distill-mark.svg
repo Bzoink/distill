@@ -1,0 +1,10 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" width="64" height="64" role="img" aria-label="Distill">
+  <title>Distill</title>
+  <!-- A page narrowing to what is worth keeping. Inherits currentColor. -->
+  <g fill="currentColor">
+    <rect x="14" y="10" width="36" height="4" rx="2.0"/>
+    <rect x="19" y="19" width="26" height="4" rx="2.0"/>
+    <rect x="24" y="28" width="16" height="4" rx="2.0"/>
+    <path d="M32 36 C27 43 21 47 21 53 A11 11 0 0 0 43 53 C43 47 37 43 32 36 Z"/>
+  </g>
+</svg>
