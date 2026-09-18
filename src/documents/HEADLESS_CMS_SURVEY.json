@@ -1,0 +1,411 @@
+{
+  "observed_date": "2026-09-17",
+  "repository_revision": "b367725",
+  "method": "Separate curl capture and live Distill requests. Static = captured HTML with executable script elements removed, JSON scripts retained, and original base URL supplied. Default Distill budgets; 35-second external timeout; up to three diagnostic jobs concurrently. Counts are structural diagnostics, not browser-completeness scores.",
+  "samples": [
+    {
+      "name": "contentful",
+      "bytes": 869167,
+      "sha256": "0fb1b1c4e8119f31b18eec7d41d28642999733029881d80e95f8eb6837af6980",
+      "markers": {
+        "__NEXT_DATA__": 1,
+        "ctfassets.net": 388
+      },
+      "url": "https://www.bang-olufsen.com/en/us",
+      "http_status": 200,
+      "embedded_json": [
+        {
+          "attrs": {
+            "id": "__NEXT_DATA__",
+            "type": "application/json",
+            "nonce": "tcLfmWTrWWgxBzcH9hSWXOOVThuDtAsGk3r",
+            "crossorigin": "anonymous"
+          },
+          "chars": 430523,
+          "pageProps_keys": [
+            "isServer",
+            "store",
+            "initialState",
+            "initialProps"
+          ]
+        }
+      ],
+      "static": {
+        "exit": 0,
+        "shape": {
+          "kind": "article",
+          "confidence": 0.98,
+          "evidence": "article/main or paragraph body"
+        },
+        "main_found": true,
+        "readability": false,
+        "counts": {
+          "blocks": 68,
+          "links": 51,
+          "media": 6,
+          "forms": 1
+        }
+      },
+      "live": {
+        "exit": 2
+      }
+    },
+    {
+      "name": "sanity",
+      "bytes": 1936576,
+      "sha256": "0740e69d07b37714f956e9e0aa79f34389fe566871c756dd5bfd2d686f7f3b8b",
+      "markers": {
+        "self.__next_f": 140,
+        "cdn.sanity.io": 224,
+        "payload": 1
+      },
+      "url": "https://www.figma.com/blog/",
+      "http_status": 200,
+      "embedded_json": [],
+      "static": {
+        "exit": 0,
+        "shape": {
+          "kind": "article",
+          "confidence": 0.98,
+          "evidence": "article/main or paragraph body"
+        },
+        "main_found": true,
+        "readability": true,
+        "counts": {
+          "blocks": 190,
+          "links": 158,
+          "media": 13,
+          "forms": 2
+        }
+      },
+      "live": {
+        "exit": 0,
+        "shape": {
+          "kind": "article",
+          "confidence": 0.98,
+          "evidence": "article/main or paragraph body"
+        },
+        "main_found": true,
+        "readability": true,
+        "counts": {
+          "blocks": 190,
+          "links": 158,
+          "media": 13,
+          "forms": 2
+        }
+      }
+    },
+    {
+      "name": "storyblok",
+      "bytes": 237104,
+      "sha256": "6cfc4b3edd9c74b88438fb219db65a846749ff2c775d951a1ff456ddc779e02f",
+      "markers": {
+        "__NEXT_DATA__": 1,
+        "a.storyblok.com": 139
+      },
+      "url": "https://www.oatly.com/en-gb",
+      "http_status": 200,
+      "embedded_json": [
+        {
+          "attrs": {
+            "id": "__NEXT_DATA__",
+            "type": "application/json"
+          },
+          "chars": 203094,
+          "pageProps_keys": [
+            "isIndexPage",
+            "isWorkingInStoryblok",
+            "breadcrumbs",
+            "currentPage",
+            "locale",
+            "marketData",
+            "citationsRegistry",
+            "translations",
+            "queries",
+            "route",
+            "previewData",
+            "structuredData",
+            "canonicalHref",
+            "seoData",
+            "story"
+          ]
+        }
+      ],
+      "static": {
+        "exit": 0,
+        "shape": {
+          "kind": "article",
+          "confidence": 0.72,
+          "evidence": "article/main or paragraph body"
+        },
+        "main_found": true,
+        "readability": true,
+        "counts": {
+          "blocks": 36,
+          "links": 40,
+          "media": 0,
+          "forms": 0
+        }
+      },
+      "live": {
+        "exit": 0,
+        "shape": {
+          "kind": "structured-text",
+          "confidence": 0.55,
+          "evidence": "fallback structured text"
+        },
+        "main_found": false,
+        "readability": false,
+        "counts": {
+          "blocks": 0,
+          "links": 0,
+          "media": 0,
+          "forms": 0
+        }
+      }
+    },
+    {
+      "name": "strapi",
+      "bytes": 822570,
+      "sha256": "5f0c4550df030dcba7c2ab0a9a5fd2638a1c8ca51c02bc17783aa4b4447d4bac",
+      "markers": {
+        "self.__next_f": 108
+      },
+      "url": "https://moustachebikes.com/en-UK",
+      "http_status": 200,
+      "embedded_json": [],
+      "static": {
+        "exit": 0,
+        "shape": {
+          "kind": "article",
+          "confidence": 0.98,
+          "evidence": "article/main or paragraph body"
+        },
+        "main_found": false,
+        "readability": true,
+        "counts": {
+          "blocks": 237,
+          "links": 178,
+          "media": 97,
+          "forms": 0
+        }
+      },
+      "live": {
+        "exit": 0,
+        "shape": {
+          "kind": "article",
+          "confidence": 0.98,
+          "evidence": "article/main or paragraph body"
+        },
+        "main_found": false,
+        "readability": true,
+        "counts": {
+          "blocks": 237,
+          "links": 178,
+          "media": 97,
+          "forms": 0
+        }
+      }
+    },
+    {
+      "name": "prismic-zuiver",
+      "bytes": 61611,
+      "sha256": "0d9433f6a837dc91e8bcdb88dc13c0151860e7ca93462094dfb93f9bee1e4bcf",
+      "markers": {
+        "__NEXT_DATA__": 1,
+        "prismic.io": 41
+      },
+      "url": "https://salonzuiver.be/",
+      "http_status": 200,
+      "embedded_json": [
+        {
+          "attrs": {
+            "id": "__NEXT_DATA__",
+            "type": "application/json"
+          },
+          "chars": 14057,
+          "pageProps_keys": [
+            "doc",
+            "navigation",
+            "footer"
+          ]
+        }
+      ],
+      "static": {
+        "exit": 0,
+        "shape": {
+          "kind": "article",
+          "confidence": 0.98,
+          "evidence": "article/main or paragraph body"
+        },
+        "main_found": true,
+        "readability": true,
+        "counts": {
+          "blocks": 48,
+          "links": 7,
+          "media": 2,
+          "forms": 0
+        }
+      },
+      "live": {
+        "exit": 0,
+        "shape": {
+          "kind": "article",
+          "confidence": 0.98,
+          "evidence": "article/main or paragraph body"
+        },
+        "main_found": true,
+        "readability": true,
+        "counts": {
+          "blocks": 48,
+          "links": 7,
+          "media": 2,
+          "forms": 0
+        }
+      }
+    },
+    {
+      "name": "datocms",
+      "bytes": 161237,
+      "sha256": "5d5027b74bcea21cc45e8be0bfdfab27666c8dbd79c4d4bdffd929fb9edce431",
+      "markers": {
+        "___gatsby": 1,
+        "datocms-assets.com": 21
+      },
+      "url": "https://foryouandyourcustomers.com/",
+      "http_status": 200,
+      "embedded_json": [],
+      "static": {
+        "exit": 0,
+        "shape": {
+          "kind": "video",
+          "confidence": 0.92,
+          "evidence": "video or embed element without a prose body"
+        },
+        "main_found": true,
+        "readability": true,
+        "counts": {
+          "blocks": 182,
+          "links": 171,
+          "media": 0,
+          "forms": 0
+        }
+      },
+      "live": {
+        "exit": 0,
+        "shape": {
+          "kind": "video",
+          "confidence": 0.92,
+          "evidence": "video or embed element without a prose body"
+        },
+        "main_found": true,
+        "readability": true,
+        "counts": {
+          "blocks": 182,
+          "links": 171,
+          "media": 0,
+          "forms": 0
+        }
+      }
+    },
+    {
+      "name": "directus-agency",
+      "bytes": 512927,
+      "sha256": "17d9c22808c3c23632154425ec79b35b369531adaf7b30cdf012a149fff1b65f",
+      "markers": {
+        "__NUXT_DATA__": 1,
+        "__NUXT__": 2,
+        "directus": 142,
+        "payload": 1
+      },
+      "url": "https://www.agencyos.dev/",
+      "http_status": 200,
+      "embedded_json": [
+        {
+          "attrs": {
+            "type": "application/json",
+            "data-nuxt-data": "nuxt-app",
+            "data-ssr": "true",
+            "id": "__NUXT_DATA__"
+          },
+          "chars": 28819
+        }
+      ],
+      "static": {
+        "exit": 0,
+        "shape": {
+          "kind": "article",
+          "confidence": 0.98,
+          "evidence": "article/main or paragraph body"
+        },
+        "main_found": true,
+        "readability": true,
+        "counts": {
+          "blocks": 90,
+          "links": 19,
+          "media": 37,
+          "forms": 3
+        }
+      },
+      "live": {
+        "exit": 0,
+        "shape": {
+          "kind": "article",
+          "confidence": 0.98,
+          "evidence": "article/main or paragraph body"
+        },
+        "main_found": true,
+        "readability": true,
+        "counts": {
+          "blocks": 90,
+          "links": 19,
+          "media": 37,
+          "forms": 3
+        }
+      }
+    },
+    {
+      "name": "payload",
+      "bytes": 759907,
+      "sha256": "4ceefe89905d4e7cb1dcd7ef7aa2c4a4995a58df480b8aaed5ad2d6afa3015d3",
+      "markers": {
+        "self.__next_f": 354
+      },
+      "url": "https://www.papertriangles.com/",
+      "http_status": 200,
+      "embedded_json": [],
+      "static": {
+        "exit": 0,
+        "shape": {
+          "kind": "video",
+          "confidence": 0.92,
+          "evidence": "video or embed element without a prose body"
+        },
+        "main_found": true,
+        "readability": true,
+        "counts": {
+          "blocks": 6,
+          "links": 23,
+          "media": 20,
+          "forms": 0
+        }
+      },
+      "live": {
+        "exit": 0,
+        "shape": {
+          "kind": "video",
+          "confidence": 0.92,
+          "evidence": "video or embed element without a prose body"
+        },
+        "main_found": true,
+        "readability": true,
+        "counts": {
+          "blocks": 6,
+          "links": 23,
+          "media": 20,
+          "forms": 0
+        }
+      }
+    }
+  ]
+}
