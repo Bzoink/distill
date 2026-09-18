@@ -550,10 +550,25 @@ static void relayout(Page *page)
             page->focus = (int)i;
 }
 
+/* The reading column is a sheet of paper: the text keeps its measure and
+   the paper reaches past it on every side, as a printed page's margins do.
+   A cell is about twice as tall as it is wide, so six columns at the sides
+   match three rows at the head and foot. Scrolling counts the head rows,
+   so scroll 0 shows the top margin above the first line. */
+enum { PAPER_SIDE = 6, PAPER_HEAD = 3 };
+
+static int paper_side(const ReaderLayout *layout)
+{
+    int side = PAPER_SIDE, right = tui.width - layout->left - layout->measure;
+    if (side > layout->left) side = layout->left;
+    if (side > right) side = right;
+    return side < 0 ? 0 : side;
+}
+
 static void clamp_scroll(void)
 {
     if (!tui.has_page || !tui.page.layout) return;
-    int most = tui.page.layout->rows - view_height();
+    int most = tui.page.layout->rows + 2 * PAPER_HEAD - view_height();
     if (most < 0) most = 0;
     if (tui.page.scroll > most) tui.page.scroll = most;
     if (tui.page.scroll < 0) tui.page.scroll = 0;
@@ -568,6 +583,7 @@ static void scroll_by(int rows)
 static void reveal_row(int row)
 {
     int height = view_height();
+    row += PAPER_HEAD;
     if (row < tui.page.scroll || row >= tui.page.scroll + height)
         tui.page.scroll = row - height / 3;
     clamp_scroll();
@@ -1132,7 +1148,7 @@ static void jump_to_section(const char *id)
     ReaderLayout *layout = tui.page.layout;
     for (size_t i = 0; layout && i < layout->anchor_count; ++i) {
         if (strcmp(layout->anchors[i].id, id)) continue;
-        tui.page.scroll = layout->anchors[i].row;
+        tui.page.scroll = layout->anchors[i].row + PAPER_HEAD;
         clamp_scroll();
         return;
     }
@@ -1307,7 +1323,7 @@ static void move_focus(int direction)
         /* Start from what is on screen, not from the top of the page. */
         int first = -1;
         for (size_t i = 0; i < page->focus_count; ++i) {
-            int row = page->focusables[i].row;
+            int row = page->focusables[i].row + PAPER_HEAD;
             if (row >= page->scroll && row < page->scroll + view_height()) {
                 if (direction > 0 && first < 0) first = (int)i;
                 if (direction < 0) first = (int)i;
@@ -1384,11 +1400,12 @@ static void draw_page(void)
     ReaderLayout *layout = tui.page.layout;
     Look margin = look_for(READER_ROLE_TEXT, 0, false, false);
     Look column = look_for(READER_ROLE_TEXT, 0, true, false);
+    int side = layout ? paper_side(layout) : 0;
     for (int y = 0; y < height; ++y) {
         d_screen_fill(&tui.screen, 0, top + y, tui.width, margin.fg, margin.bg, 0);
         /* The reading column runs the height of the window, as it does on
            the desktop, not only as far as the page has words. */
-        if (layout) d_screen_fill(&tui.screen, layout->left, top + y, layout->left + layout->measure,
+        if (layout) d_screen_fill(&tui.screen, layout->left - side, top + y, layout->left + layout->measure + side,
                                   column.fg, column.bg, 0);
     }
     if (!layout) return;
@@ -1399,12 +1416,13 @@ static void draw_page(void)
         else focused_control = (int)focus->index;
     }
     for (int y = 0; y < height; ++y) {
-        int row = tui.page.scroll + y;
+        int row = tui.page.scroll + y - PAPER_HEAD;
+        if (row < 0) continue;
         if (row >= layout->rows) break;
         for (int x = 0; x < layout->columns && x < tui.width; ++x) {
             ReaderCell *cell = reader_layout_cell(layout, row, x);
             if (!cell->width) continue;
-            bool in_column = x >= layout->left && x < layout->left + layout->measure;
+            bool in_column = x >= layout->left - side && x < layout->left + layout->measure + side;
             bool focused = (focused_link >= 0 && cell->link == focused_link) ||
                            (focused_control >= 0 && cell->control == focused_control);
             Look look = look_for(cell->role, cell->attrs, in_column, focused);
@@ -1992,7 +2010,8 @@ static ReaderLayoutTable *visible_table(void)
     for (size_t i = 0; layout && i < layout->table_count; ++i) {
         ReaderLayoutTable *table = &layout->tables[i];
         if (table->full_width <= table->visible) continue;
-        if (table->row + table->rows > tui.page.scroll && table->row < tui.page.scroll + view_height())
+        int row = table->row + PAPER_HEAD;
+        if (row + table->rows > tui.page.scroll && row < tui.page.scroll + view_height())
             return table;
     }
     return NULL;
@@ -2102,8 +2121,8 @@ static void hit(int x, int y, int *link, int *control)
     *link = *control = -1;
     ReaderLayout *layout = tui.page.layout;
     if (!layout || tui.viewer.active || y < view_top() || y >= view_top() + view_height()) return;
-    int row = tui.page.scroll + y - view_top();
-    if (row >= layout->rows || x >= layout->columns) return;
+    int row = tui.page.scroll + y - view_top() - PAPER_HEAD;
+    if (row < 0 || row >= layout->rows || x >= layout->columns) return;
     ReaderCell *cell = reader_layout_cell(layout, row, x);
     while (!cell->width && x > 0) cell = reader_layout_cell(layout, row, --x);
     *link = cell->link;

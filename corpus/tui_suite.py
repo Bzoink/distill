@@ -193,6 +193,9 @@ def run(binary, base):
     t = term(f"{base}/09-article.html")
     try:
         check(t.wait_for("A careful reader"), "article renders in the terminal", t.text()[:200])
+        lines = t.text().split("\n")
+        check(all(not line.strip() for line in lines[1:4]) and lines[4].strip(),
+              "the page opens with a margin above its first line", "\n".join(lines[:6]))
         t.send("G", 0.5)
         check("This sentence was added after the page loaded" in t.text(),
               "G reaches the script-inserted paragraph", t.text()[-300:])
