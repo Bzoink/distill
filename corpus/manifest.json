@@ -936,6 +936,32 @@
         {"stage": "template", "expect": "/insurance"},
         {"stage": "template", "expect": "/card"}
       ]
+    },
+    {
+      "id": "36-vercel-challenge",
+      "path": "36-vercel-challenge.html",
+      "gate": true,
+      "expect_exit": 4,
+      "plan_section": "Access classification",
+      "exercises": [
+        "vercel-challenge-detection",
+        "challenge-script-suppression"
+      ],
+      "why": "Vercel's security checkpoint must be classified as an access challenge instead of being presented as a one-paragraph page.",
+      "assertions": [
+        {
+          "stage": "dom",
+          "selector": "#content",
+          "expect": "Enable JavaScript to continue"
+        },
+        {
+          "stage": "dom",
+          "selector": "#content",
+          "expect_absent": [
+            "CHALLENGE-SCRIPT-RAN"
+          ]
+        }
+      ]
     }
   ],
   "live": [
