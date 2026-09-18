@@ -972,6 +972,21 @@
         {
           "stage": "template",
           "expect": "/card"
+        },
+        {
+          "stage": "extract",
+          "path": "embedded_data.sources[0].kind",
+          "expect": "next-data"
+        },
+        {
+          "stage": "extract",
+          "path": "embedded_data.sources[0].mapped",
+          "expect": "true"
+        },
+        {
+          "stage": "extract",
+          "path": "embedded_data.sources[0].top_keys",
+          "expect": "props"
         }
       ]
     },
@@ -1129,6 +1144,72 @@
           "stage": "template",
           "expect_absent": [
             "/media/live.m3u8\">Download</a>"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "39-embedded-survey",
+      "path": "39-embedded-survey.html",
+      "gate": true,
+      "plan_section": "Phase 1 extraction breadth, embedded state survey",
+      "exercises": [
+        "assignment-blob",
+        "json-script",
+        "survey-observation",
+        "unmapped-state"
+      ],
+      "why": "The survey measures state blobs the reader does not use, which is the evidence a generic embedded-data mapper would be built on. Both shapes here are unmapped on purpose: an assignment-style blob the adapter path never sees, and a JSON-typed one it sees and cannot claim. The gate is that recording them changes nothing about what the reader shows.",
+      "assertions": [
+        {
+          "stage": "extract",
+          "path": "shape.kind",
+          "expect": "article"
+        },
+        {
+          "stage": "extract",
+          "path": "embedded_data.matched",
+          "expect": "false"
+        },
+        {
+          "stage": "extract",
+          "path": "embedded_data.sources",
+          "expect": "yt-initial-data"
+        },
+        {
+          "stage": "extract",
+          "path": "embedded_data.sources",
+          "expect": "json-script"
+        },
+        {
+          "stage": "extract",
+          "path": "embedded_data.sources",
+          "expect": "\"mapped\": false"
+        },
+        {
+          "stage": "extract",
+          "path": "embedded_data.sources",
+          "expect": "responseContext"
+        },
+        {
+          "stage": "extract",
+          "path": "embedded_data.sources",
+          "expect": "buildId"
+        },
+        {
+          "stage": "extract",
+          "path": "blocks",
+          "expect": "ships its content twice"
+        },
+        {
+          "stage": "template",
+          "expect": "ships its content twice"
+        },
+        {
+          "stage": "template",
+          "expect_absent": [
+            "responseContext",
+            "serviceTrackingParams"
           ]
         }
       ]

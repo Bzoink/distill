@@ -1,0 +1,33 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>State the reader does not read</title>
+<main>
+  <h1>State the reader does not read</h1>
+  <p>This page ships its content twice: once as an assignment-style state blob
+  that no adapter understands, and once as the prose you are reading. The
+  survey exists to record the first kind without pretending to use it.</p>
+  <p>The blob is written by script, so it cannot be seen before the page has
+  run, and it is an ordinary inline script rather than a JSON-typed one, which
+  is why the adapter path never looks at it at all.</p>
+</main>
+<script>
+  /* An assignment-style blob, the shape YouTube, Nuxt and Redux apps ship.
+     Nothing maps it. The survey must still record that it was here, how big
+     it was, and what its top-level keys were called. */
+  var payload = {
+    responseContext: {serviceTrackingParams: []},
+    contents: {sectionListRenderer: {contents: [{title: 'Recorded, not read'}]}},
+    header: {title: 'State the reader does not read'}
+  };
+  var carrier = document.createElement('script');
+  carrier.textContent = 'var ytInitialData = ' + JSON.stringify(payload) + ';';
+  document.body.appendChild(carrier);
+
+  /* A JSON-typed script the adapter path does consider and cannot claim: it
+     is neither Folksam's shape nor anything else we map. */
+  var typed = document.createElement('script');
+  typed.setAttribute('type', 'application/json');
+  typed.setAttribute('id', 'state');
+  typed.textContent = JSON.stringify({buildId: 'x1', page: '/survey', assets: []});
+  document.body.appendChild(typed);
+</script>

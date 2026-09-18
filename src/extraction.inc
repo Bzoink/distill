@@ -479,6 +479,9 @@ typedef struct {
     StringVec media_keys;
     StringVec navigation_keys;
     StringVec unknown;
+    /* Which script the adapter consumed, so the survey can tell a blob that
+       was used from one that was merely seen. */
+    char *matched_locator;
     bool first_block;
     bool first_link;
     bool first_media;
@@ -511,6 +514,7 @@ static void embedded_free(EmbeddedCandidate *candidate)
     dbuf_free(&candidate->blocks); dbuf_free(&candidate->links); dbuf_free(&candidate->media); dbuf_free(&candidate->navigation);
     string_vec_free(&candidate->block_keys); string_vec_free(&candidate->link_keys);
     string_vec_free(&candidate->media_keys); string_vec_free(&candidate->navigation_keys); string_vec_free(&candidate->unknown);
+    free(candidate->matched_locator);
     *candidate = (EmbeddedCandidate){0};
 }
 
@@ -886,6 +890,168 @@ static bool embedded_route_matches(Engine *engine, JSValueConst page_props)
     return matches;
 }
 
+/* The embedded-state survey.
+ *
+ * Detection above answers "can the Folksam adapter use this?". That is the
+ * wrong question to ask of the corpus, because the answer is no for every
+ * site but one, and the record kept of the refusal is empty: detected true,
+ * matched false, unknown_components [].
+ *
+ * This records what was actually on the page instead -- which state blobs a
+ * site ships, how big they are, and what their top-level keys are called --
+ * so the question "is a generic mapper worth building?" can be counted rather
+ * than argued. It observes only: no candidate here is ever mapped, and
+ * nothing it finds changes what the reader shows.
+ *
+ * Never record blob content, only its shape. These pages carry session state.
+ */
+#define DISTILL_SURVEY_KEYS 12u
+#define DISTILL_SURVEY_SOURCES 24u
+
+typedef struct {
+    DBuffer out;
+    bool first;
+    size_t count;
+} EmbeddedSurvey;
+
+/* The assignment-style blobs, which are ordinary inline script rather than
+   JSON and so never reach the adapter path at all. */
+static const char *const survey_markers[] = {
+    "ytInitialData",        "yt-initial-data",
+    "ytInitialPlayerResponse", "yt-initial-player",
+    "self.__next_f",        "next-flight",
+    "__NUXT__",             "nuxt",
+    "__INITIAL_STATE__",    "initial-state",
+    "__PRELOADED_STATE__",  "preloaded-state",
+    "__APOLLO_STATE__",     "apollo-state",
+    "__remixContext",       "remix",
+    "__sveltekit",          "sveltekit",
+    "__NEXT_REDUX_STORE__", "next-redux",
+    "__staticRouterHydrationData", "react-router",
+};
+
+/* The JSON object a `name = { ... }` assignment carries, without running it:
+   from the first brace after the marker to the last brace in the statement. */
+static char *survey_object_slice(const char *text, const char *marker)
+{
+    const char *at = strstr(text, marker);
+    if (!at) return NULL;
+    const char *open = strchr(at, '{');
+    if (!open) return NULL;
+    size_t depth = 0;
+    bool in_string = false, escaped = false;
+    for (const char *p = open; *p; ++p) {
+        if (in_string) {
+            if (escaped) escaped = false;
+            else if (*p == '\\') escaped = true;
+            else if (*p == '"') in_string = false;
+            continue;
+        }
+        if (*p == '"') in_string = true;
+        else if (*p == '{') ++depth;
+        else if (*p == '}' && --depth == 0)
+            return d_strndup(open, (size_t)(p - open) + 1);
+    }
+    return NULL;
+}
+
+static void survey_add(Engine *engine, EmbeddedSurvey *survey, const char *kind,
+                       const char *locator, const char *body, size_t bytes,
+                       bool considered, bool mapped)
+{
+    if (survey->count >= DISTILL_SURVEY_SOURCES) return;
+    ++survey->count;
+    if (!survey->first) dbuf_puts(&survey->out, ",");
+    survey->first = false;
+
+    /* Top-level key names are the whole point: recurring key sets across the
+       corpus are what a generic mapper would key off. */
+    DBuffer keys; dbuf_init(&keys); dbuf_puts(&keys, "[");
+    bool parsed_ok = false, first_key = true;
+    if (body && bytes && bytes <= DISTILL_EMBEDDED_JSON_BYTES) {
+        JSValue parsed = JS_ParseJSON(engine->context, body, strlen(body), "distill-survey.json");
+        if (JS_IsException(parsed)) {
+            JS_FreeValue(engine->context, JS_GetException(engine->context));
+        } else if (JS_IsObject(parsed) && !JS_IsArray(parsed)) {
+            parsed_ok = true;
+            JSPropertyEnum *properties = NULL;
+            uint32_t length = 0;
+            if (JS_GetOwnPropertyNames(engine->context, &properties, &length, parsed,
+                                       JS_GPN_STRING_MASK | JS_GPN_ENUM_ONLY) == 0) {
+                for (uint32_t i = 0; i < length && i < DISTILL_SURVEY_KEYS; ++i) {
+                    const char *name = JS_AtomToCString(engine->context, properties[i].atom);
+                    if (name) {
+                        if (!first_key) dbuf_puts(&keys, ",");
+                        first_key = false;
+                        char *quoted = json_quote(name); dbuf_puts(&keys, quoted); free(quoted);
+                        JS_FreeCString(engine->context, name);
+                    }
+                }
+                for (uint32_t i = 0; i < length; ++i)
+                    JS_FreeAtom(engine->context, properties[i].atom);
+                js_free(engine->context, properties);
+            }
+        } else if (JS_IsArray(parsed)) {
+            parsed_ok = true;
+        }
+        JS_FreeValue(engine->context, parsed);
+    }
+    dbuf_puts(&keys, "]");
+    char *key_json = dbuf_take(&keys);
+    char *qkind = json_quote(kind), *qlocator = json_quote(locator);
+    dbuf_printf(&survey->out,
+                "{\"kind\":%s,\"locator\":%s,\"bytes\":%zu,\"parsed\":%s,\"considered\":%s,\"mapped\":%s,\"top_keys\":%s}",
+                qkind, qlocator, bytes, parsed_ok ? "true" : "false",
+                considered ? "true" : "false", mapped ? "true" : "false", key_json);
+    free(qkind); free(qlocator); free(key_json);
+}
+
+/* Walks every script once. Cheap: a substring scan per marker, and a parse
+   only for blobs inside the existing byte budget. */
+static char *embedded_survey_json(Engine *engine, lxb_dom_node_t *root,
+                                  const char *mapped_locator)
+{
+    EmbeddedSurvey survey = {.first = true};
+    dbuf_init(&survey.out); dbuf_puts(&survey.out, "[");
+    NodeVec scripts = find_selector(root, "script");
+    for (size_t i = 0; i < scripts.length; ++i) {
+        lxb_dom_element_t *element = lxb_dom_interface_element(scripts.items[i]);
+        char *id = attr_value(element, "id");
+        char *type_raw = attr_value(element, "type");
+        char *type = d_lower(type_raw); free(type_raw);
+        char *text = node_text(scripts.items[i]);
+        size_t bytes = strlen(text);
+
+        if (d_eq(id, "__NEXT_DATA__")) {
+            char *body = d_trim(text);
+            survey_add(engine, &survey, "next-data", "script#__NEXT_DATA__", body, strlen(body), true,
+                       mapped_locator && d_eq(mapped_locator, "script#__NEXT_DATA__"));
+            free(body);
+        } else if (d_contains(type, "application/json") && bytes) {
+            char *body = d_trim(text);
+            char *locator = *id ? d_cat3("script#", id, "") : d_strdup("script[type=json]");
+            survey_add(engine, &survey, "json-script", locator, body, strlen(body), true,
+                       mapped_locator && d_eq(mapped_locator, locator));
+            free(locator); free(body);
+        } else if (!d_contains(type, "ld+json") && bytes) {
+            /* Ordinary inline script: the assignment-style blobs live here and
+               the adapter path never looks at them. */
+            for (size_t m = 0; m < sizeof(survey_markers) / sizeof(survey_markers[0]); m += 2) {
+                if (!strstr(text, survey_markers[m])) continue;
+                char *body = survey_object_slice(text, survey_markers[m]);
+                survey_add(engine, &survey, survey_markers[m + 1], survey_markers[m],
+                           body, body ? strlen(body) : bytes, false, false);
+                free(body);
+                break;
+            }
+        }
+        free(id); free(type); free(text);
+    }
+    free(scripts.items);
+    dbuf_puts(&survey.out, "]");
+    return dbuf_take(&survey.out);
+}
+
 static EmbeddedCandidate embedded_candidate(Engine *engine, lxb_dom_node_t *root,
                                              size_t *rejected)
 {
@@ -899,12 +1065,14 @@ static EmbeddedCandidate embedded_candidate(Engine *engine, lxb_dom_node_t *root
         char *type = d_lower(type_raw);
         free(type_raw);
         bool candidate_script = d_eq(id, "__NEXT_DATA__") || d_contains(type, "application/json");
+        char *locator = d_eq(id, "__NEXT_DATA__") ? d_strdup("script#__NEXT_DATA__")
+                        : (*id ? d_cat3("script#", id, "") : d_strdup("script[type=json]"));
         free(id); free(type);
-        if (!candidate_script) continue;
+        if (!candidate_script) { free(locator); continue; }
         char *text = node_text(scripts.items[i]);
-        if (strlen(text) > DISTILL_EMBEDDED_JSON_BYTES) { free(text); continue; }
+        if (strlen(text) > DISTILL_EMBEDDED_JSON_BYTES) { free(text); free(locator); continue; }
         char *body = d_trim(text); free(text);
-        if (!*body) { free(body); continue; }
+        if (!*body) { free(body); free(locator); continue; }
         candidate.detected = true;
         /* This adapter only understands the Folksam pageContent tree. Avoid
            handing every large application/json blob (for example a Contentful
@@ -913,12 +1081,14 @@ static EmbeddedCandidate embedded_candidate(Engine *engine, lxb_dom_node_t *root
            the parsed route and shape checks below remain authoritative. */
         if (!strstr(body, "\"pageProps\"") || !strstr(body, "\"pageContent\"")) {
             free(body);
+            free(locator);
             continue;
         }
         JSValue parsed = JS_ParseJSON(engine->context, body, strlen(body), "distill-embedded.json");
         free(body);
         if (JS_IsException(parsed)) {
             JS_FreeValue(engine->context, JS_GetException(engine->context));
+            free(locator);
             continue;
         }
         JSValue props = embedded_property(engine, parsed, "props");
@@ -928,6 +1098,7 @@ static EmbeddedCandidate embedded_candidate(Engine *engine, lxb_dom_node_t *root
         JSValue content = embedded_property(engine, data, "pageContent");
         if (JS_IsArray(content) && embedded_route_matches(engine, page_props)) {
             candidate.matched = true;
+            free(candidate.matched_locator); candidate.matched_locator = d_strdup(locator);
             free(candidate.adapter); candidate.adapter = d_strdup("folksam-page-content");
             free(candidate.version); candidate.version = d_strdup("1");
             JSValue meta = embedded_property(engine, page_data, "meta");
@@ -947,6 +1118,7 @@ static EmbeddedCandidate embedded_candidate(Engine *engine, lxb_dom_node_t *root
         JS_FreeValue(engine->context, content); JS_FreeValue(engine->context, data);
         JS_FreeValue(engine->context, page_data); JS_FreeValue(engine->context, page_props);
         JS_FreeValue(engine->context, props); JS_FreeValue(engine->context, parsed);
+        free(locator);
     }
     free(scripts.items);
     dbuf_puts(&candidate.blocks, "]");
@@ -2310,6 +2482,7 @@ static char *run_extraction(Engine *engine, const char *serialized, bool include
                        main_content_is_a_minority(root, &item));
     char *content = sanitize_content(readability.content); char *tables = table_json(root); char *search = search_json(engine, root, &rejected); char *forms = forms_json(engine, root, &rejected); char *videos = videos_json(engine, root, &rejected); char *audio = audio_json(engine, root, &rejected); char *media = media_json(engine, root, &rejected); char *links = links_json(engine, root, &rejected); char *structured = structured_data_json(engine, root);
     EmbeddedCandidate embedded = embedded_candidate(engine, root, &rejected);
+    char *embedded_sources = embedded_survey_json(engine, root, embedded.matched_locator);
     char *embedded_blocks = embedded_array_take(&embedded.blocks);
     char *embedded_links = embedded_array_take(&embedded.links);
     char *embedded_media = embedded_array_take(&embedded.media);
@@ -2346,6 +2519,6 @@ static char *run_extraction(Engine *engine, const char *serialized, bool include
         if (i) dbuf_puts(&out, ",");
         char *quoted = json_quote(embedded.unknown.items[i]); dbuf_puts(&out, quoted); free(quoted);
     }
-    dbuf_printf(&out, "],\"blocks\":%s,\"links\":%s,\"media\":%s,\"navigation\":%s},\"sanitization\":{\"allowed_schemes\":[\"http\",\"https\",\"mailto\",\"tel\"],\"rejected_uris\":%zu}}", embedded_blocks, embedded_links, embedded_media, embedded_navigation, rejected);
-    free(qembedded_adapter); free(qembedded_version); free(qembedded_title); free(qurl); free(qbase); free(qtitle); free(page_title); free(qkind); free(qevidence); free(qselected); free(content); free(tables); free(search); free(forms); free(videos); free(audio); free(media); free(links); free(structured); free(blocks); free(dom_blocks); free(embedded_blocks); free(embedded_links); free(embedded_media); free(embedded_navigation); free(shape.kind); free(shape.evidence); free(main_blocks_json); embedded_free(&embedded); free_main_content(&item); free_main_content_profile(&profile); free_readability(&readability); lxb_html_document_destroy(document); extraction_fast_visibility = previous_fast_visibility; return dbuf_take(&out);
+    dbuf_printf(&out, "],\"sources\":%s,\"blocks\":%s,\"links\":%s,\"media\":%s,\"navigation\":%s},\"sanitization\":{\"allowed_schemes\":[\"http\",\"https\",\"mailto\",\"tel\"],\"rejected_uris\":%zu}}", embedded_sources, embedded_blocks, embedded_links, embedded_media, embedded_navigation, rejected);
+    free(qembedded_adapter); free(qembedded_version); free(qembedded_title); free(qurl); free(qbase); free(qtitle); free(page_title); free(qkind); free(qevidence); free(qselected); free(content); free(tables); free(search); free(forms); free(videos); free(audio); free(media); free(links); free(structured); free(blocks); free(dom_blocks); free(embedded_sources); free(embedded_blocks); free(embedded_links); free(embedded_media); free(embedded_navigation); free(shape.kind); free(shape.evidence); free(main_blocks_json); embedded_free(&embedded); free_main_content(&item); free_main_content_profile(&profile); free_readability(&readability); lxb_html_document_destroy(document); extraction_fast_visibility = previous_fast_visibility; return dbuf_take(&out);
 }

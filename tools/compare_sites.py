@@ -6,6 +6,21 @@ semantic summaries, but it does not claim that a live site is a deterministic
 CI assertion. Use the generated report to decide whether a Distill change is
 needed, then rerun the same site and compare the saved artifacts.
 
+A whole-manifest run degrades partway through: from roughly the twelfth site
+onward Distill's fetches start returning "status 0" -- libcurl failing to
+connect at all -- while Chromium in the same run keeps succeeding, and the
+same site fetches perfectly when run on its own moments later. It is
+exhaustion somewhere below us (sockets, DNS, or a throttled resolver), not
+the sites. Until that is understood, capture in batches with a pause between
+them rather than trusting a single full run, and check exit codes before
+reading any corpus-wide tally: 28 of 39 sites failing this way looks exactly
+like 28 sites with no content.
+
+Each site is fetched TWICE, once for --dump-dom and once for --extract. The
+two can disagree -- a site that challenges intermittently will hand one run a
+real page and the other a challenge -- so compare the two exit codes before
+concluding anything from the DOM capture about what extraction saw.
+
 Examples:
 
     python3 tools/compare_sites.py --id 01-example-domain
@@ -519,6 +534,81 @@ def write_report(path, report):
     path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
+
+def embedded_tally(out_dir, site_ids):
+    """Count the state blobs the corpus ships, and what we do with them.
+
+    The per-site reports answer "did this page work?". This answers the
+    question behind a generic embedded-data mapper: which blob shapes recur,
+    how often a blob is found and then left unused, and which top-level key
+    sets they share. Reads the extraction JSON already on disk, so it costs
+    nothing beyond a run that has happened anyway.
+    """
+    from collections import Counter, defaultdict
+    kinds = Counter()
+    unused = Counter()
+    keysets = defaultdict(Counter)
+    sites_with_blob, sites_with_unused = set(), set()
+    considered_never_mapped = []
+    for site_id in site_ids:
+        path = out_dir / site_id / "distill.extract.json"
+        if not path.is_file():
+            continue
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except (ValueError, OSError):
+            continue
+        sources = (data.get("embedded_data") or {}).get("sources") or []
+        if not sources:
+            continue
+        sites_with_blob.add(site_id)
+        for source in sources:
+            kind = source.get("kind", "?")
+            kinds[kind] += 1
+            if source.get("top_keys"):
+                keysets[kind][", ".join(source["top_keys"][:6])] += 1
+            if not source.get("mapped"):
+                unused[kind] += 1
+                sites_with_unused.add(site_id)
+                if source.get("considered"):
+                    considered_never_mapped.append((site_id, kind))
+    if not kinds:
+        return None
+    lines = ["# Embedded state survey", ""]
+    lines.append(f"{len(sites_with_blob)} of {len(site_ids)} sites ship a state blob; "
+                 f"{len(sites_with_unused)} carry at least one nothing reads.")
+    lines += ["", "| blob | found | unused | sites |", "| --- | ---: | ---: | ---: |"]
+    for kind, count in kinds.most_common():
+        lines.append(f"| `{kind}` | {count} | {unused[kind]} | "
+                     f"{len({s for s in site_ids if _has_kind(out_dir, s, kind)})} |")
+    lines += ["", "## Recurring top-level key sets", "",
+              "A shape that repeats across sites is one a generic mapper could key off.", ""]
+    for kind, sets in sorted(keysets.items()):
+        lines.append(f"**{kind}**")
+        for keys, count in sets.most_common(6):
+            lines.append(f"- {count}x `{keys}`")
+        lines.append("")
+    if considered_never_mapped:
+        lines += ["## Considered by the adapter path and still unmapped", "",
+                  "These reached the adapter and no adapter claimed them.", ""]
+        for site_id, kind in considered_never_mapped:
+            lines.append(f"- {site_id}: `{kind}`")
+        lines.append("")
+    return "\n".join(lines)
+
+
+def _has_kind(out_dir, site_id, kind):
+    path = out_dir / site_id / "distill.extract.json"
+    if not path.is_file():
+        return False
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (ValueError, OSError):
+        return False
+    sources = (data.get("embedded_data") or {}).get("sources") or []
+    return any(source.get("kind") == kind for source in sources)
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("urls", nargs="*", help="live HTTP(S) URLs; omit to use the manifest")
@@ -581,6 +671,11 @@ def main():
         if any(status not in ("ok", "challenge") for status in statuses):
             failures += 1
         print(f"  report={args.out / site['id'] / 'report.md'}")
+    tally = embedded_tally(args.out, [site["id"] for site in sites])
+    if tally:
+        tally_path = args.out / "embedded-survey.md"
+        tally_path.write_text(tally + "\n", encoding="utf-8")
+        print(f"\nembedded state survey: {tally_path}")
     if args.strict and failures:
         return 1
     return 0
