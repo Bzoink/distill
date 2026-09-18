@@ -2468,6 +2468,307 @@ static char *structured_data_json(Engine *engine, lxb_dom_node_t *root)
     dbuf_puts(&out, "]"); return dbuf_take(&out);
 }
 
+/* Markdown export.
+ *
+ * The conversion reads the reader template rather than the extraction JSON,
+ * so what comes out is what the reader shows: the same shape decision, the
+ * same cards, the same order. A template change carries into the export
+ * without anything here being told about it, which is the point -- an export
+ * that drifts from the page it claims to be is worse than no export.
+ *
+ * Internal destinations do not survive: distill-play: and its siblings are
+ * things for the shell to do, meaningless in a file. The media URL is written
+ * as an ordinary link instead, which is what a reader of the exported
+ * document can actually use.
+ */
+typedef struct {
+    DBuffer out;
+    int list_depth;
+    bool ordered[8];
+    size_t counter[8];
+    bool at_line_start;
+    bool in_pre;
+} Markdown;
+
+static void md_text(Markdown *md, const char *text)
+{
+    if (!text || !*text) return;
+    dbuf_puts(&md->out, text);
+    md->at_line_start = false;
+}
+
+static void md_newline(Markdown *md)
+{
+    if (!md->at_line_start) { dbuf_puts(&md->out, "\n"); md->at_line_start = true; }
+}
+
+static void md_blank(Markdown *md)
+{
+    md_newline(md);
+    size_t length = md->out.length;
+    const char *data = md->out.data;
+    if (length >= 2 && data[length - 1] == '\n' && data[length - 2] == '\n') return;
+    if (length == 0) return;
+    dbuf_puts(&md->out, "\n");
+}
+
+/* Collapse runs of whitespace the way the reader lays text out, and keep
+   Markdown's own punctuation from being read as markup. */
+static void md_inline_text(Markdown *md, const char *text)
+{
+    bool space = md->at_line_start;
+    for (const char *at = text; *at; ++at) {
+        unsigned char ch = (unsigned char)*at;
+        if (ch == ' ' || ch == '\t' || ch == '\n' || ch == '\r') {
+            if (!space) { dbuf_puts(&md->out, " "); space = true; md->at_line_start = false; }
+            continue;
+        }
+        space = false;
+        if (!md->in_pre && strchr("\\`*_[]<>", ch)) dbuf_printf(&md->out, "\\%c", ch);
+        else dbuf_printf(&md->out, "%c", ch);
+        md->at_line_start = false;
+    }
+}
+
+static bool md_internal_scheme(const char *url)
+{
+    return d_starts(url, "distill-");
+}
+
+/* An internal action carries the media URL after its scheme; that is the part
+   worth keeping. A section jump or a close has nothing behind it. */
+static const char *md_external_part(const char *url)
+{
+    const char *schemes[] = {"distill-play:", "distill-download:", "distill-open:", "distill-media:"};
+    for (size_t i = 0; i < sizeof(schemes) / sizeof(schemes[0]); ++i)
+        if (d_starts(url, schemes[i])) return url + strlen(schemes[i]);
+    return NULL;
+}
+
+static void md_walk(Markdown *md, lxb_dom_node_t *node);
+
+static void md_children(Markdown *md, lxb_dom_node_t *node)
+{
+    for (lxb_dom_node_t *child = node->first_child; child; child = child->next)
+        md_walk(md, child);
+}
+
+static void md_list_item(Markdown *md)
+{
+    int depth = md->list_depth > 0 ? md->list_depth - 1 : 0;
+    for (int i = 0; i < depth; ++i) dbuf_puts(&md->out, "  ");
+    if (depth < 8 && md->ordered[depth])
+        dbuf_printf(&md->out, "%zu. ", ++md->counter[depth]);
+    else
+        dbuf_puts(&md->out, "- ");
+    md->at_line_start = false;
+}
+
+static void md_table(Markdown *md, lxb_dom_node_t *table)
+{
+    NodeVec rows = find_selector(table, "tr");
+    bool header_done = false;
+    for (size_t r = 0; r < rows.length; ++r) {
+        size_t columns = 0;
+        md_newline(md);
+        dbuf_puts(&md->out, "|");
+        for (lxb_dom_node_t *cell = rows.items[r]->first_child; cell; cell = cell->next) {
+            char *tag = node_tag(cell);
+            bool is_cell = d_eq(tag, "td") || d_eq(tag, "th");
+            free(tag);
+            if (!is_cell) continue;
+            char *text = compact_text(cell);
+            /* A pipe inside a cell would end the column early. */
+            for (char *at = text; *at; ++at) if (*at == '|') *at = '/';
+            dbuf_printf(&md->out, " %s |", text);
+            free(text);
+            ++columns;
+        }
+        md->at_line_start = false;
+        md_newline(md);
+        if (!header_done && columns) {
+            dbuf_puts(&md->out, "|");
+            for (size_t c = 0; c < columns; ++c) dbuf_puts(&md->out, " --- |");
+            md->at_line_start = false;
+            md_newline(md);
+            header_done = true;
+        }
+    }
+    free(rows.items);
+    md_blank(md);
+}
+
+static void md_walk(Markdown *md, lxb_dom_node_t *node)
+{
+    if (node->type == LXB_DOM_NODE_TYPE_TEXT) {
+        size_t length = 0;
+        const lxb_char_t *data = lxb_dom_node_text_content(node, &length);
+        if (!data || !length) return;
+        char *text = d_strndup((const char *)data, length);
+        if (md->in_pre) md_text(md, text);
+        else md_inline_text(md, text);
+        free(text);
+        return;
+    }
+    if (!is_element(node)) return;
+    char *tag = node_tag(node);
+    lxb_dom_element_t *element = lxb_dom_interface_element(node);
+
+    if (d_eq(tag, "script") || d_eq(tag, "style") || d_eq(tag, "head")) { free(tag); return; }
+    /* The section anchors are navigation for the shell, not content. */
+    if (d_eq(tag, "a")) {
+        char *class_name = attr_value(element, "class");
+        bool anchor = d_contains(class_name, "section-anchor");
+        free(class_name);
+        if (anchor) { free(tag); return; }
+    }
+
+    if (d_eq(tag, "h1") || d_eq(tag, "h2") || d_eq(tag, "h3") ||
+        d_eq(tag, "h4") || d_eq(tag, "h5") || d_eq(tag, "h6")) {
+        md_blank(md);
+        int level = tag[1] - '0';
+        for (int i = 0; i < level; ++i) dbuf_puts(&md->out, "#");
+        dbuf_puts(&md->out, " ");
+        md->at_line_start = false;
+        md_children(md, node);
+        md_blank(md);
+    } else if (d_eq(tag, "p") || d_eq(tag, "section") || d_eq(tag, "div") ||
+               d_eq(tag, "main") || d_eq(tag, "article") || d_eq(tag, "form")) {
+        md_blank(md);
+        md_children(md, node);
+        md_blank(md);
+    } else if (d_eq(tag, "br")) {
+        dbuf_puts(&md->out, "  ");
+        md_newline(md);
+    } else if (d_eq(tag, "hr")) {
+        md_blank(md);
+        dbuf_puts(&md->out, "---");
+        md->at_line_start = false;
+        md_blank(md);
+    } else if (d_eq(tag, "ul") || d_eq(tag, "ol")) {
+        md_blank(md);
+        if (md->list_depth < 8) {
+            md->ordered[md->list_depth] = d_eq(tag, "ol");
+            md->counter[md->list_depth] = 0;
+        }
+        ++md->list_depth;
+        md_children(md, node);
+        --md->list_depth;
+        md_blank(md);
+    } else if (d_eq(tag, "li")) {
+        md_newline(md);
+        md_list_item(md);
+        md_children(md, node);
+        md_newline(md);
+    } else if (d_eq(tag, "blockquote")) {
+        md_blank(md);
+        dbuf_puts(&md->out, "> ");
+        md->at_line_start = false;
+        md_children(md, node);
+        md_blank(md);
+    } else if (d_eq(tag, "pre")) {
+        md_blank(md);
+        dbuf_puts(&md->out, "```\n");
+        md->at_line_start = true;
+        md->in_pre = true;
+        md_children(md, node);
+        md->in_pre = false;
+        md_newline(md);
+        dbuf_puts(&md->out, "```");
+        md->at_line_start = false;
+        md_blank(md);
+    } else if (d_eq(tag, "code")) {
+        dbuf_puts(&md->out, "`");
+        bool was = md->in_pre; md->in_pre = true;
+        md_children(md, node);
+        md->in_pre = was;
+        dbuf_puts(&md->out, "`");
+        md->at_line_start = false;
+    } else if (d_eq(tag, "strong") || d_eq(tag, "b")) {
+        dbuf_puts(&md->out, "**"); md_children(md, node); dbuf_puts(&md->out, "**");
+        md->at_line_start = false;
+    } else if (d_eq(tag, "em") || d_eq(tag, "i")) {
+        dbuf_puts(&md->out, "*"); md_children(md, node); dbuf_puts(&md->out, "*");
+        md->at_line_start = false;
+    } else if (d_eq(tag, "img")) {
+        char *src = attr_value(element, "src");
+        char *alt = attr_value(element, "alt");
+        if (*src) dbuf_printf(&md->out, "![%s](%s)", alt, src);
+        free(src); free(alt);
+        md->at_line_start = false;
+    } else if (d_eq(tag, "a")) {
+        char *class_name = attr_value(element, "class");
+        bool is_button = d_contains(class_name, "button");
+        free(class_name);
+        char *href = attr_value(element, "href");
+        const char *target = href;
+        if (md_internal_scheme(href)) target = md_external_part(href);
+        if (!target || !*target) {
+            /* A destination only the shell understands: keep the words, drop
+               the link, because nothing outside Distill could follow it. */
+            md_children(md, node);
+        } else {
+            dbuf_puts(&md->out, "[");
+            md_children(md, node);
+            dbuf_printf(&md->out, "](%s)", target);
+        }
+        /* Actions sit side by side on the card; in a document they would run
+           into one another without a gap. */
+        if (is_button) dbuf_puts(&md->out, " ");
+        free(href);
+        md->at_line_start = false;
+    } else if (d_eq(tag, "table")) {
+        md_table(md, node);
+    } else if (d_eq(tag, "input") || d_eq(tag, "textarea") || d_eq(tag, "select") ||
+               d_eq(tag, "button")) {
+        /* A control cannot be exported as a control. Name it, so the document
+           still says the page asked for something here. */
+        char *kind = attr_value(element, "type");
+        if (d_ieq(kind, "hidden")) { free(kind); free(tag); return; }
+        char *label = attr_value(element, "placeholder");
+        if (!*label) { free(label); label = attr_value(element, "value"); }
+        if (!*label) { free(label); label = attr_value(element, "name"); }
+        md_newline(md);
+        dbuf_printf(&md->out, "`[%s%s%s]`", *kind ? kind : tag, *label ? ": " : "", label);
+        md->at_line_start = false;
+        md_newline(md);
+        free(kind); free(label);
+    } else {
+        md_children(md, node);
+    }
+    free(tag);
+}
+
+/* The reader page as Markdown. */
+static char *markdown_from_template(const char *template_html, const char *url)
+{
+    Markdown md = {0};
+    dbuf_init(&md.out);
+    md.at_line_start = true;
+    lxb_html_document_t *document = lxb_html_document_create();
+    if (!document ||
+        lxb_html_document_parse(document, (const lxb_char_t *)template_html,
+                                strlen(template_html)) != LXB_STATUS_OK) {
+        if (document) lxb_html_document_destroy(document);
+        return dbuf_take(&md.out);
+    }
+    lxb_dom_node_t *root = lxb_dom_interface_node(document);
+    NodeVec bodies = find_selector(root, "body");
+    if (bodies.length) md_walk(&md, bodies.items[0]);
+    free(bodies.items);
+    lxb_html_document_destroy(document);
+
+    /* Where it came from, recorded once at the end: an exported document that
+       cannot say what it is a reading of is hard to trust later. */
+    if (url && *url) {
+        md_blank(&md);
+        dbuf_puts(&md.out, "---\n\nSource: ");
+        dbuf_puts(&md.out, url);
+        dbuf_puts(&md.out, "\n");
+    }
+    return dbuf_take(&md.out);
+}
+
 static char *run_extraction(Engine *engine, const char *serialized, bool include_readability)
 {
     lxb_html_document_t *document = lxb_html_document_create();

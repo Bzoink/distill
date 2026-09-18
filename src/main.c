@@ -3215,15 +3215,18 @@ static char *reader_template(Engine *engine, const char *json, const char *theme
         if (json_blocks_outside_main(engine, blocks) > 0) {
             dbuf_puts(&output, "<p class=\"eyebrow main-rest\">Rest of the page</p>");
             append_json_blocks(engine, blocks, &output, true);
-            append_json_table(engine, tables, &output);
-            append_json_results(engine, results, &output);
-            append_json_media(engine, media, &output);
         }
-        /* A media reference is not a text block either, and a video inside
-           main is the ordinary case, not the exception -- leaving it to the
-           "rest of the page" branch meant a page with a <main> offered no
-           video action at all. Same reasoning as forms, below. */
+        /* None of these is a text block, and all of them are ordinarily
+           inside main rather than outside it. Leaving them to the "rest of
+           the page" branch meant a page whose <main> held the whole document
+           -- which is most pages that mark one up at all -- reached the
+           reader with its table, its results, its gallery and its video
+           actions silently dropped. A table page rendered as a heading and
+           nothing else. */
+        append_json_table(engine, tables, &output);
+        append_json_results(engine, results, &output);
         append_json_videos(engine, videos, &output);
+        append_json_media(engine, media, &output);
         /* Forms are separate interactive content, not text blocks. Keep them
            available even when the reader selected the whole page as main. */
         append_json_forms(engine, forms, &output);
@@ -3687,6 +3690,7 @@ static int run_page(const char *input, uint64_t cap_ms, uint64_t memory_mb,
                     const char *fetch_kind,
                     int render_width, int render_height,
                     const char *font_dir, const char *template_path,
+                    const char *markdown_path,
                     const char *theme, bool native_forms, int zoom,
                     const char *request_method,
                     const char *request_data, const char *session_file,
@@ -3857,7 +3861,7 @@ static int run_page(const char *input, uint64_t cap_ms, uint64_t memory_mb,
     }
     dbuf_free(&html);
     set_document_base(&engine);
-    bool needs_extraction = viewer_path || render_path || template_path || extract;
+    bool needs_extraction = viewer_path || render_path || template_path || markdown_path || extract;
     char *initial_json = NULL;
     report_progress(&engine, PROGRESS_FETCH_END, "scripts");
     bool scripts_failed = false;
@@ -3965,6 +3969,28 @@ static int run_page(const char *input, uint64_t cap_ms, uint64_t memory_mb,
         fprintf(stderr, "this build has no litehtml renderer\n");
         result = 2;
 #endif
+    } else if (markdown_path) {
+#ifdef DISTILL_RENDER
+        /* The export is a conversion of the reader page, not a second
+           rendering of the extraction: what it writes is what the reader
+           shows, and a change to the template carries into it untold. */
+        char *json = selected_json;
+        selected_json = NULL;
+        char *template = reader_template(&engine, json, theme, native_forms, zoom);
+        char *markdown = *template ? markdown_from_template(template, engine.source_url)
+                                   : d_strdup("");
+        if (!*markdown || !write_file_bytes(markdown_path, markdown, strlen(markdown))) {
+            fprintf(stderr, "unable to write markdown %s\n", markdown_path);
+            result = 3;
+        }
+        free(markdown);
+        free(template);
+        free(json);
+#else
+        (void)theme; (void)zoom;
+        fprintf(stderr, "this build has no litehtml renderer\n");
+        result = 2;
+#endif
     } else if (template_path) {
 #ifdef DISTILL_RENDER
         char *json = selected_json;
@@ -4060,6 +4086,8 @@ int main(int argc, char **argv)
     const char *render_path = NULL;
     const char *viewer_path = NULL;
     const char *template_path = NULL;
+    const char *markdown_path = NULL;
+    const char *markdown_from = NULL;
     const char *save_media_path = NULL;
     const char *fetch_media_path = NULL;
     const char *fetch_kind = "image";
@@ -4082,6 +4110,8 @@ int main(int argc, char **argv)
         else if (d_eq(argv[i], "--extract")) extract = true;
         else if (d_eq(argv[i], "--render") && i + 1 < argc) render_path = argv[++i];
         else if (d_eq(argv[i], "--template") && i + 1 < argc) template_path = argv[++i];
+        else if (d_eq(argv[i], "--markdown") && i + 1 < argc) markdown_path = argv[++i];
+        else if (d_eq(argv[i], "--markdown-from") && i + 1 < argc) markdown_from = argv[++i];
         else if (d_eq(argv[i], "--viewer") && i + 1 < argc) viewer_path = argv[++i];
         else if (d_eq(argv[i], "--media-index") && i + 1 < argc) media_index = (int)strtol(argv[++i], NULL, 10);
         else if (d_eq(argv[i], "--save-media") && i + 1 < argc) save_media_path = argv[++i];
@@ -4108,6 +4138,30 @@ int main(int argc, char **argv)
         fprintf(stderr, "use --request-data or --request-data-file, not both\n");
         return 2;
     }
+    /* Converting a reader page already on disk. No URL, no fetch, no scripts:
+       the exported document is the page the reader is showing, not a second
+       reading of the same address, which may since have changed or may not be
+       reachable again without the session that produced it. */
+    if (markdown_from) {
+#ifdef DISTILL_RENDER
+        if (!markdown_path) { usage(argv[0]); return 2; }
+        size_t length = 0;
+        char *template = d_read_file(markdown_from, &length);
+        if (!template) {
+            fprintf(stderr, "unable to read reader page %s\n", markdown_from);
+            return 2;
+        }
+        char *markdown = markdown_from_template(template, url);
+        bool ok = *markdown && write_file_bytes(markdown_path, markdown, strlen(markdown));
+        if (!ok) fprintf(stderr, "unable to write markdown %s\n", markdown_path);
+        free(markdown);
+        free(template);
+        return ok ? 0 : 3;
+#else
+        fprintf(stderr, "this build has no litehtml renderer\n");
+        return 2;
+#endif
+    }
     if (!url || !*url || (dump_dom && (extract || render_path || template_path || viewer_path)) ||
         (extract && (render_path || template_path || viewer_path)) ||
         (template_path && viewer_path) || (render_path && viewer_path) ||
@@ -4130,7 +4184,8 @@ int main(int argc, char **argv)
                           render_path, viewer_path, media_index, save_media_path,
                           fetch_media_path,
                           fetch_kind,
-                          render_width, render_height, font_dir, template_path, theme,
+                          render_width, render_height, font_dir, template_path,
+                          markdown_path, theme,
                           native_forms, zoom,
                           request_method, request_data, session_file, progress,
                           https_optional);

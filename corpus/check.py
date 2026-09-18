@@ -291,6 +291,33 @@ def render_page(engine, url, output_path, cap_ms, timeout_s, viewer=False, expec
         return None, f"renderer output unavailable: {exc}"
 
 
+def dump_markdown(engine, url, cap_ms, timeout_s):
+    """The reader page exported as Markdown.
+
+    The export is a conversion of the reader template, so this is the stage
+    that notices when the two drift apart -- an export that no longer says
+    what the page says is the one failure the other stages cannot see.
+    """
+    with tempfile.NamedTemporaryFile(suffix=".md", delete=False) as fh:
+        path = fh.name
+    cmd = [engine, "--url", url, "--markdown", path, "--script-cap-ms", str(cap_ms)]
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout_s)
+        if r.returncode != 0:
+            return None, f"markdown exit {r.returncode}: {r.stderr.strip()[:200]}"
+        with open(path, encoding="utf-8") as fh:
+            return fh.read(), None
+    except subprocess.TimeoutExpired:
+        return None, f"markdown timed out after {timeout_s}s"
+    except OSError as exc:
+        return None, f"markdown unavailable: {exc}"
+    finally:
+        try:
+            os.unlink(path)
+        except OSError:
+            pass
+
+
 def dump_template(engine, url, cap_ms, timeout_s):
     """The reader HTML the shell lays out.
 
@@ -438,11 +465,20 @@ def check_substrings(a, text, label):
     return results, failed
 
 
-def check_page(page, html=None, baseline=False, extraction=None, template=None):
+def check_page(page, html=None, baseline=False, extraction=None, template=None,
+               markdown=None):
     """(results, n_failed) for DOM, extraction or reader-template assertions."""
     results, failed = [], 0
     for a in page["assertions"]:
         stage = a.get("stage")
+        if stage == "markdown":
+            if markdown is None:
+                results.append(("pending", "markdown-stage, use --extract", ""))
+                continue
+            more, bad = check_substrings(a, markdown, "markdown")
+            results.extend(more)
+            failed += bad
+            continue
         if stage == "template":
             if template is None:
                 results.append(("pending", "template-stage, use --extract", ""))
@@ -640,6 +676,7 @@ def main():
             url = f"http://127.0.0.1:{port}/{page['path']}"
             t0 = time.time()
             template = None
+            markdown = None
             session_path = None
             session_error = None
             if page.get("session"):
@@ -676,6 +713,11 @@ def main():
                         engine, url, manifest.get("settle_cap_ms", 5000), args.timeout)
                     if template_error and not err:
                         err = template_error
+                if any(a.get("stage") == "markdown" for a in page["assertions"]):
+                    markdown, markdown_error = dump_markdown(
+                        engine, url, manifest.get("settle_cap_ms", 5000), args.timeout)
+                    if markdown_error and not err:
+                        err = markdown_error
             elif args.baseline:
                 html, err = dump_dom(browser, url, args.budget, args.timeout)
                 extraction = None
@@ -727,7 +769,8 @@ def main():
                     fh.write(json.dumps(extraction, ensure_ascii=False, indent=2) if args.extract else html)
 
             results, failed = check_page(page, html, baseline=args.baseline,
-                                         extraction=extraction, template=template)
+                                         extraction=extraction, template=template,
+                                         markdown=markdown)
             if args.extract:
                 golden_results, golden_failed = check_golden(page, extraction)
                 results.extend(golden_results)

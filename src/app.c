@@ -3270,6 +3270,96 @@ static void forward_clicked(GtkWidget *widget, gpointer opaque)
     if (d_app_history_forward(&app->history)) show_history_page(app);
 }
 
+/* Export the page the reader is showing.
+
+   The reader template is already a self-contained HTML document -- one inline
+   stylesheet, no scripts, no external references -- so exporting it is a copy
+   rather than a second rendering. Markdown is converted from that same file
+   by the engine, for the same reason: re-fetching the URL would export a
+   different reading of an address that may have changed since, or that needs
+   a session this export cannot reproduce. */
+static void export_page(App *app, bool as_markdown)
+{
+    const DAppPage *page = d_app_history_current(&app->history);
+    if (!page || !page->template_path) {
+        set_status(app, "There is no page to export yet");
+        return;
+    }
+    char *suggested = suggested_filename(page->url);
+    char *dot = suggested ? strrchr(suggested, '.') : NULL;
+    if (dot) *dot = '\0';
+    if (!suggested || !*suggested) { g_free(suggested); suggested = g_strdup("page"); }
+    char *name = g_strdup_printf("%s.%s", suggested, as_markdown ? "md" : "html");
+    g_free(suggested);
+
+    GtkWidget *chooser = gtk_file_chooser_dialog_new(as_markdown ? "Export as Markdown"
+                                                                 : "Export as HTML",
+                                                     GTK_WINDOW(app->window),
+                                                     GTK_FILE_CHOOSER_ACTION_SAVE,
+                                                     "Cancel", GTK_RESPONSE_CANCEL,
+                                                     "Export", GTK_RESPONSE_ACCEPT, NULL);
+    gtk_file_chooser_set_do_overwrite_confirmation(GTK_FILE_CHOOSER(chooser), TRUE);
+    gtk_file_chooser_set_current_name(GTK_FILE_CHOOSER(chooser), name);
+    g_free(name);
+    char *destination = NULL;
+    if (gtk_dialog_run(GTK_DIALOG(chooser)) == GTK_RESPONSE_ACCEPT)
+        destination = gtk_file_chooser_get_filename(GTK_FILE_CHOOSER(chooser));
+    gtk_widget_destroy(chooser);
+    if (!destination) return;
+
+    bool ok = false;
+    char *message = NULL;
+    if (!as_markdown) {
+        GError *error = NULL;
+        GFile *from = g_file_new_for_path(page->template_path);
+        GFile *to = g_file_new_for_path(destination);
+        ok = g_file_copy(from, to, G_FILE_COPY_OVERWRITE, NULL, NULL, NULL, &error);
+        if (!ok) message = g_strdup_printf("Could not export: %s",
+                                           error ? error->message : "unknown error");
+        if (error) g_error_free(error);
+        g_object_unref(from);
+        g_object_unref(to);
+    } else {
+        char *engine = engine_path();
+        GPtrArray *arguments = g_ptr_array_new_with_free_func(g_free);
+        add_arg(arguments, engine ? engine : "distill");
+        add_arg(arguments, "--markdown-from");
+        add_arg(arguments, page->template_path);
+        add_arg(arguments, "--markdown");
+        add_arg(arguments, destination);
+        add_arg(arguments, "--url");
+        add_arg(arguments, page->url);
+        g_ptr_array_add(arguments, NULL);
+        GError *error = NULL;
+        gint wait_status = 0;
+        gboolean spawned = g_spawn_sync(NULL, (char **)arguments->pdata, NULL,
+                                        G_SPAWN_SEARCH_PATH, NULL, NULL, NULL, NULL,
+                                        &wait_status, &error);
+        ok = spawned && g_spawn_check_wait_status(wait_status, &error);
+        if (!ok) message = g_strdup_printf("Could not export: %s",
+                                           error ? error->message : "the engine failed");
+        if (error) g_error_free(error);
+        g_ptr_array_free(arguments, TRUE);
+        g_free(engine);
+    }
+    if (ok) message = g_strdup_printf("Exported to %s", destination);
+    set_status(app, message ? message : "Exported");
+    g_free(message);
+    g_free(destination);
+}
+
+static void export_html_clicked(GtkWidget *widget, gpointer opaque)
+{
+    (void)widget;
+    export_page(opaque, false);
+}
+
+static void export_markdown_clicked(GtkWidget *widget, gpointer opaque)
+{
+    (void)widget;
+    export_page(opaque, true);
+}
+
 static void external_clicked(GtkWidget *widget, gpointer opaque)
 {
     (void)widget;
@@ -3402,6 +3492,17 @@ static GtkWidget *make_settings_button(App *app)
     GtkWidget *external = gtk_menu_item_new_with_label("Open externally");
     g_signal_connect(external, "activate", G_CALLBACK(external_clicked), app);
     gtk_menu_shell_append(GTK_MENU_SHELL(menu), external);
+
+    GtkWidget *export_item = gtk_menu_item_new_with_label("Export page");
+    GtkWidget *export_menu = gtk_menu_new();
+    GtkWidget *export_html = gtk_menu_item_new_with_label("As HTML\u2026");
+    g_signal_connect(export_html, "activate", G_CALLBACK(export_html_clicked), app);
+    gtk_menu_shell_append(GTK_MENU_SHELL(export_menu), export_html);
+    GtkWidget *export_markdown = gtk_menu_item_new_with_label("As Markdown\u2026");
+    g_signal_connect(export_markdown, "activate", G_CALLBACK(export_markdown_clicked), app);
+    gtk_menu_shell_append(GTK_MENU_SHELL(export_menu), export_markdown);
+    gtk_menu_item_set_submenu(GTK_MENU_ITEM(export_item), export_menu);
+    gtk_menu_shell_append(GTK_MENU_SHELL(menu), export_item);
 
     GtkWidget *theme_item = gtk_menu_item_new_with_label("Theme");
     GtkWidget *theme_menu = gtk_menu_new();

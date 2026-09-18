@@ -382,13 +382,37 @@
       "path": "09-article.html",
       "gate": true,
       "plan_section": "Phase 1 extraction breadth, article",
-      "exercises": ["post-JS-article", "readability", "structured-text"],
+      "exercises": [
+        "post-JS-article",
+        "readability",
+        "structured-text"
+      ],
       "why": "Article-shaped content is the primary Readability path and includes a post-load paragraph.",
       "golden": "golden/09-article.json",
       "assertions": [
-        {"stage": "extract", "path": "shape.kind", "expect": "article"},
-        {"stage": "extract", "path": "extractor", "expect": "readability"},
-        {"stage": "extract", "path": "readability.textContent", "expect": "added after the page loaded"}
+        {
+          "stage": "extract",
+          "path": "shape.kind",
+          "expect": "article"
+        },
+        {
+          "stage": "extract",
+          "path": "extractor",
+          "expect": "readability"
+        },
+        {
+          "stage": "extract",
+          "path": "readability.textContent",
+          "expect": "added after the page loaded"
+        },
+        {
+          "stage": "markdown",
+          "expect": "# A careful reader"
+        },
+        {
+          "stage": "markdown",
+          "expect": "Source: http"
+        }
       ]
     },
     {
@@ -410,13 +434,45 @@
       "path": "11-table.html",
       "gate": true,
       "plan_section": "Phase 1 extraction breadth, table",
-      "exercises": ["caption", "header-row", "table-cells"],
+      "exercises": [
+        "caption",
+        "header-row",
+        "table-cells"
+      ],
       "why": "Tables must be read as data before Readability can mistake them for layout.",
       "golden": "golden/11-table.json",
       "assertions": [
-        {"stage": "extract", "path": "shape.kind", "expect": "table"},
-        {"stage": "extract", "path": "tables", "expect": "Phase 1 extraction measurements"},
-        {"stage": "extract", "path": "tables", "expect": "14.4 MiB"}
+        {
+          "stage": "extract",
+          "path": "shape.kind",
+          "expect": "table"
+        },
+        {
+          "stage": "extract",
+          "path": "tables",
+          "expect": "Phase 1 extraction measurements"
+        },
+        {
+          "stage": "extract",
+          "path": "tables",
+          "expect": "14.4 MiB"
+        },
+        {
+          "stage": "template",
+          "expect": "<table"
+        },
+        {
+          "stage": "markdown",
+          "expect": "| Arm | RSS | Status |"
+        },
+        {
+          "stage": "markdown",
+          "expect": "| --- | --- | --- |"
+        },
+        {
+          "stage": "markdown",
+          "expect": "# Release comparison"
+        }
       ]
     },
     {
@@ -438,13 +494,36 @@
       "path": "13-form.html",
       "gate": true,
       "plan_section": "Phase 1 extraction breadth, form",
-      "exercises": ["method", "action", "labels", "hidden-inputs"],
+      "exercises": [
+        "method",
+        "action",
+        "labels",
+        "hidden-inputs"
+      ],
       "why": "Native form controls are extracted as data so the later reader can re-render them functionally.",
       "golden": "golden/13-form.json",
       "assertions": [
-        {"stage": "extract", "path": "shape.kind", "expect": "form"},
-        {"stage": "extract", "path": "forms[0].action", "expect": "/search"},
-        {"stage": "extract", "path": "forms[0].fields", "expect": "CSRF-PASSTHROUGH"}
+        {
+          "stage": "extract",
+          "path": "shape.kind",
+          "expect": "form"
+        },
+        {
+          "stage": "extract",
+          "path": "forms[0].action",
+          "expect": "/search"
+        },
+        {
+          "stage": "extract",
+          "path": "forms[0].fields",
+          "expect": "CSRF-PASSTHROUGH"
+        },
+        {
+          "stage": "markdown",
+          "expect_absent": [
+            "CSRF-PASSTHROUGH"
+          ]
+        }
       ]
     },
     {
@@ -1093,6 +1172,16 @@
           "stage": "template",
           "expect_absent": [
             "/media/bonus.opus\">Play</a>"
+          ]
+        },
+        {
+          "stage": "markdown",
+          "expect": "/media/episode-14.mp3)"
+        },
+        {
+          "stage": "markdown",
+          "expect_absent": [
+            "distill-play:"
           ]
         }
       ]
