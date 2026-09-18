@@ -15,6 +15,7 @@
    toolkit otherwise, which is not something to depend on. */
 #include <zlib.h>
 #include "cutil.h"
+#include "distill_version.h"
 #include "render.h"
 
 #include <cairo.h>
@@ -4208,7 +4209,10 @@ int main(int argc, char **argv)
         if (strcmp(argv[i], "--self-test") == 0) self_test = true;
         else if (strcmp(argv[i], "--url") == 0 && i + 1 < argc) initial_url = argv[++i];
         else if (strcmp(argv[i], "--help") == 0 || strcmp(argv[i], "-h") == 0) {
-            fprintf(stderr, "usage: %s [--url URL] [--self-test]\n", argv[0]);
+            fprintf(stderr, "usage: %s [--url URL] [--self-test] [--version]\n", argv[0]);
+            return 0;
+        } else if (strcmp(argv[i], "--version") == 0) {
+            puts("distill-gtk " DISTILL_VERSION);
             return 0;
         } else if (!initial_url && argv[i][0] != '-') {
             initial_url = argv[i];

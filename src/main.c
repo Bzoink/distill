@@ -2,6 +2,7 @@
 #define _XOPEN_SOURCE 700
 
 #include "cutil.h"
+#include "distill_version.h"
 #include "reader_cells.h"
 #include "reader_walk.h"
 
@@ -4098,7 +4099,7 @@ static int run_page(const char *input, uint64_t cap_ms, uint64_t memory_mb,
 
 static void usage(const char *program)
 {
-    fprintf(stderr, "usage: %s --url URL [--dump-dom|--extract|--render FILE|--template FILE|--markdown FILE|--dump-cells FILE|--viewer FILE|--fetch-media FILE] [--media-index N] [--save-media FILE] [--width N] [--height N|0] [--font-dir DIR] [--theme warm|night|paper] [--zoom PERCENT] [--native-forms] [--progress] [--https-optional] [--request-method GET|POST] [--request-data DATA|--request-data-file FILE|-] [--session-file FILE] [--script-cap-ms N] [--memory-limit-mb N] [--max-scripts N]\n", program);
+    fprintf(stderr, "usage: %s --url URL [--dump-dom|--extract|--render FILE|--template FILE|--markdown FILE|--dump-cells FILE|--viewer FILE|--fetch-media FILE] [--media-index N] [--save-media FILE] [--width N] [--height N|0] [--font-dir DIR] [--theme warm|night|paper] [--zoom PERCENT] [--native-forms] [--progress] [--https-optional] [--request-method GET|POST] [--request-data DATA|--request-data-file FILE|-] [--session-file FILE] [--script-cap-ms N] [--memory-limit-mb N] [--max-scripts N] [--version]\n", program);
     fprintf(stderr, "  --dump-cells FILE     lay the reader page out in character cells, as the terminal\n"
         "                        shows it, and write it as plain text. --columns N (default\n"
         "                        80) is the terminal width; --rows N (default 0, the whole\n"
@@ -4206,6 +4207,7 @@ int main(int argc, char **argv)
         else if (d_eq(argv[i], "--memory-limit-mb") && i + 1 < argc) memory_mb = strtoull(argv[++i], NULL, 10);
         else if (d_eq(argv[i], "--max-scripts") && i + 1 < argc) max_scripts = strtoull(argv[++i], NULL, 10);
         else if (d_eq(argv[i], "--help") || d_eq(argv[i], "-h")) { usage(argv[0]); return 0; }
+        else if (d_eq(argv[i], "--version")) { puts("distill " DISTILL_VERSION); return 0; }
     }
     if (request_data && request_data_file) {
         fprintf(stderr, "use --request-data or --request-data-file, not both\n");

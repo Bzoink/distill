@@ -1,5 +1,7 @@
 cmake_minimum_required(VERSION 3.20)
-project(distill LANGUAGES C CXX)
+# The release version. This is the only place it is set: every binary reads it
+# from the generated distill_version.h and reports it with --version.
+project(distill VERSION 1.0 LANGUAGES C CXX)
 
 include(GNUInstallDirs)
 
@@ -44,6 +46,10 @@ if(DISTILL_HAVE_RENDERER)
 endif()
 
 enable_testing()
+
+configure_file(src/distill_version.h.in "${CMAKE_BINARY_DIR}/generated/distill_version.h" @ONLY)
+add_library(distill-version INTERFACE)
+target_include_directories(distill-version INTERFACE "${CMAKE_BINARY_DIR}/generated")
 
 # The unit tests assert with assert(), and a Release build defines NDEBUG,
 # which compiles every one of them away: the binaries contained no
@@ -180,6 +186,7 @@ target_link_libraries(distill PRIVATE
     Threads::Threads
     distill-image
     distill-reader
+    distill-version
     ${CMAKE_DL_LIBS}
     m
 )
@@ -221,6 +228,7 @@ if(EXISTS "${DISTILL_TERMBOX_DIR}/termbox2.h")
         distill-shell
         distill-media-audio
         distill-termbox
+        distill-version
     )
     set_target_properties(distill-tui PROPERTIES
         BUILD_RPATH "${EXTERNAL_PREFIX}/lib"
@@ -253,6 +261,7 @@ if(DISTILL_HAVE_RENDERER AND DISTILL_GTK_FOUND)
         litehtml
         gumbo
         distill-render-core
+        distill-version
         PkgConfig::DISTILL_GTK
     )
     set_target_properties(distill-gtk PROPERTIES
@@ -268,7 +277,7 @@ add_executable(distill-arm-b src/main.c)
 target_compile_definitions(distill-arm-b PRIVATE DISTILL_NO_EXTRACT=1)
 target_include_directories(distill-arm-b PRIVATE "${EXTERNAL_PREFIX}/include" ${CURL_INCLUDE_DIRS})
 target_link_directories(distill-arm-b PRIVATE "${EXTERNAL_PREFIX}/lib")
-target_link_libraries(distill-arm-b PRIVATE qjs CURL::libcurl Threads::Threads ${CMAKE_DL_LIBS} m)
+target_link_libraries(distill-arm-b PRIVATE qjs CURL::libcurl distill-version Threads::Threads ${CMAKE_DL_LIBS} m)
 set_target_properties(distill-arm-b PROPERTIES
     BUILD_RPATH "${EXTERNAL_PREFIX}/lib"
     INSTALL_RPATH "${EXTERNAL_PREFIX}/lib"
@@ -280,7 +289,7 @@ if(DISTILL_HAVE_RENDERER)
     target_compile_definitions(distill-arm-b-pruned PRIVATE DISTILL_B_PRUNED=1 DISTILL_NO_EXTRACT=1)
     target_include_directories(distill-arm-b-pruned PRIVATE "${EXTERNAL_PREFIX}/include" ${CURL_INCLUDE_DIRS})
     target_link_directories(distill-arm-b-pruned PRIVATE "${EXTERNAL_PREFIX}/lib")
-    target_link_libraries(distill-arm-b-pruned PRIVATE qjs CURL::libcurl litehtml gumbo Threads::Threads PkgConfig::DISTILL_RENDER PkgConfig::DISTILL_UNIBREAK PkgConfig::DISTILL_IMAGE ${CMAKE_DL_LIBS} m)
+    target_link_libraries(distill-arm-b-pruned PRIVATE qjs CURL::libcurl distill-version litehtml gumbo Threads::Threads PkgConfig::DISTILL_RENDER PkgConfig::DISTILL_UNIBREAK PkgConfig::DISTILL_IMAGE ${CMAKE_DL_LIBS} m)
     set_target_properties(distill-arm-b-pruned PROPERTIES
         BUILD_RPATH "${EXTERNAL_PREFIX}/lib"
         INSTALL_RPATH "${EXTERNAL_PREFIX}/lib"

@@ -17,6 +17,7 @@
 #include "address.h"
 #include "app_state.h"
 #include "cutil.h"
+#include "distill_version.h"
 #include "form_submit.h"
 #include "image.h"
 #include "media_audio.h"
@@ -2211,7 +2212,7 @@ static void handle(const struct tb_event *event)
 
 static void usage(const char *program)
 {
-    fprintf(stderr, "usage: %s [URL]\n"
+    fprintf(stderr, "usage: %s [--version] [URL]\n"
             "  Distill in a terminal. With no URL, opens the start page from settings.\n"
             "  DISTILL_TUI_GRAPHICS=kitty|sixel|none overrides the image probe;\n"
             "  DISTILL_TUI_COLORS=16|256|true overrides colour detection.\n", program);
@@ -2222,6 +2223,7 @@ int main(int argc, char **argv)
     const char *url_argument = NULL;
     for (int i = 1; i < argc; ++i) {
         if (!strcmp(argv[i], "--help") || !strcmp(argv[i], "-h")) { usage(argv[0]); return 0; }
+        if (!strcmp(argv[i], "--version")) { puts("distill-tui " DISTILL_VERSION); return 0; }
         if (argv[i][0] == '-') { usage(argv[0]); return 2; }
         url_argument = argv[i];
     }
