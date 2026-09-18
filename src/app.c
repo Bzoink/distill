@@ -2,6 +2,7 @@
 
 #include "app_state.h"
 #include "media_audio.h"
+#include "app_icon.h"
 #include <glib/gstdio.h>
 #include <signal.h>
 #include "image.h"
@@ -3608,9 +3609,45 @@ static void app_destroy(GtkWidget *widget, gpointer opaque)
     app_unref(app);
 }
 
+/* The window's own icon, carried in the binary rather than installed beside
+   it. On X11 this is the whole story: the pixbufs become _NET_WM_ICON on
+   every window, and the task bar and alt-tab read them with no desktop entry
+   and no icon theme involved. A Wayland compositor ignores _NET_WM_ICON and
+   looks up a desktop entry by application id instead, so that case needs the
+   file share/branding/README.md describes -- this is not a substitute for it,
+   only the half that works without installing anything.
+
+   PNG rather than the SVG it was drawn from, because gdk-pixbuf has PNG built
+   in while SVG wants librsvg's loader; a missing loader would mean no icon
+   and no explanation. */
+static void install_window_icon(void)
+{
+    GList *icons = NULL;
+    for (size_t i = 0; i < sizeof distill_icon_pngs / sizeof distill_icon_pngs[0]; ++i) {
+        GdkPixbufLoader *loader = gdk_pixbuf_loader_new();
+        GError *error = NULL;
+        if (gdk_pixbuf_loader_write(loader, distill_icon_pngs[i].data,
+                                    distill_icon_pngs[i].length, &error) &&
+            gdk_pixbuf_loader_close(loader, &error)) {
+            GdkPixbuf *pixbuf = gdk_pixbuf_loader_get_pixbuf(loader);
+            if (pixbuf) icons = g_list_prepend(icons, g_object_ref(pixbuf));
+        } else {
+            /* One size failing is not a reason to go without an icon. */
+            if (error) g_warning("icon: %s", error->message);
+            gdk_pixbuf_loader_close(loader, NULL);
+        }
+        if (error) g_error_free(error);
+        g_object_unref(loader);
+    }
+    if (!icons) return;
+    gtk_window_set_default_icon_list(icons);
+    g_list_free_full(icons, g_object_unref);
+}
+
 static void app_activate(GtkApplication *application, gpointer opaque)
 {
     const char *initial_url = opaque;
+    install_window_icon();
     char *saved_theme = load_saved_theme();
     int saved_zoom = load_saved_zoom();
     App *app = g_new0(App, 1);
