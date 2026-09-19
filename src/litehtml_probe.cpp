@@ -1,7 +1,7 @@
 #include <litehtml/litehtml.h>
 
 #include "image.h"
-#include "render.h"
+#include "page.h"
 
 #include <cctype>
 #include <cstring>
@@ -261,7 +261,7 @@ struct Probe final : litehtml::document_container {
 
 }
 
-struct DLiteHtmlDocument {
+struct DPage {
     DRenderContext *renderer = nullptr;
     std::unique_ptr<Probe> probe;
     std::shared_ptr<litehtml::document> document;
@@ -277,13 +277,13 @@ extern "C" int distill_litehtml_probe(const char *html)
     return document ? 1 : 0;
 }
 
-extern "C" DLiteHtmlDocument *distill_litehtml_document_create(const char *html,
+extern "C" DPage *d_page_create(const char *html,
                                                                   int width,
                                                                   int surface_height,
                                                                   const char *font_dir)
 {
     if (!html || width <= 0 || surface_height <= 0) return nullptr;
-    std::unique_ptr<DLiteHtmlDocument> result(new DLiteHtmlDocument);
+    std::unique_ptr<DPage> result(new DPage);
     result->renderer = d_render_create(width, surface_height, font_dir);
     if (!result->renderer) return nullptr;
     result->width = width;
@@ -303,7 +303,7 @@ extern "C" DLiteHtmlDocument *distill_litehtml_document_create(const char *html,
     return result.release();
 }
 
-extern "C" void distill_litehtml_document_destroy(DLiteHtmlDocument *document)
+extern "C" void d_page_destroy(DPage *document)
 {
     if (!document) return;
     document->document.reset();
@@ -317,7 +317,7 @@ extern "C" void distill_litehtml_document_destroy(DLiteHtmlDocument *document)
    placement -- its text lives in one box per line -- so a link inside a
    sentence, or a headline link, has no rectangle to test against. litehtml
    knows, because it did the layout. */
-extern "C" int distill_litehtml_document_link_at(DLiteHtmlDocument *document,
+extern "C" int d_page_link_at(DPage *document,
                                                  int x, int y,
                                                  char *href_out, size_t href_capacity)
 {
@@ -355,7 +355,7 @@ static litehtml::element::const_ptr choice_input_in_label(const litehtml::elemen
     return nullptr;
 }
 
-extern "C" int distill_litehtml_document_choice_id_at(DLiteHtmlDocument *document,
+extern "C" int d_page_choice_id_at(DPage *document,
                                                         int x, int y,
                                                         char *id_out, size_t id_capacity)
 {
@@ -379,12 +379,12 @@ extern "C" int distill_litehtml_document_choice_id_at(DLiteHtmlDocument *documen
     return 0;
 }
 
-extern "C" int distill_litehtml_document_content_height(const DLiteHtmlDocument *document)
+extern "C" int d_page_height(const DPage *document)
 {
     return document ? document->content_height : 0;
 }
 
-extern "C" int distill_litehtml_document_render_region(DLiteHtmlDocument *document,
+extern "C" int d_page_paint(DPage *document,
                                                           int scroll_y)
 {
     if (!document || !document->document || !document->renderer) return 0;
@@ -396,25 +396,25 @@ extern "C" int distill_litehtml_document_render_region(DLiteHtmlDocument *docume
     return 1;
 }
 
-extern "C" void *distill_litehtml_document_surface(DLiteHtmlDocument *document)
+extern "C" bool d_page_pixels(DPage *document, DRenderPixels *pixels)
 {
-    return document ? d_render_surface(document->renderer) : nullptr;
+    return document && d_render_pixels(document->renderer, pixels);
 }
 
 /* How tall the document becomes at this width. A reader page is as long as
    its content, and rendering it into a fixed-height surface silently discards
    whatever falls past the bottom -- the page looks complete and simply stops. */
-extern "C" int distill_litehtml_content_height(const char *html, int width,
+extern "C" int d_page_measure_height(const char *html, int width,
                                                const char *font_dir)
 {
-    DLiteHtmlDocument *document = distill_litehtml_document_create(html, width, 1, font_dir);
+    DPage *document = d_page_create(html, width, 1, font_dir);
     if (!document) return 0;
-    int measured = distill_litehtml_document_content_height(document);
-    distill_litehtml_document_destroy(document);
+    int measured = d_page_height(document);
+    d_page_destroy(document);
     return measured;
 }
 
-extern "C" int distill_litehtml_render(const char *html, const char *output_path,
+extern "C" int d_page_render_png(const char *html, const char *output_path,
                                          int width, int height, const char *font_dir)
 {
     if (!html || !output_path || width <= 0) return 0;
@@ -422,28 +422,28 @@ extern "C" int distill_litehtml_render(const char *html, const char *output_path
         /* Fit the content, but stay bounded: the surface is width * height * 4
            bytes and a pathological page must not be allowed to ask for all of
            memory. A page longer than the cap is truncated, as before. */
-        height = distill_litehtml_content_height(html, width, font_dir);
+        height = d_page_measure_height(html, width, font_dir);
         if (height < 1) height = 1;
         if (height > DISTILL_MAX_RENDER_HEIGHT) height = DISTILL_MAX_RENDER_HEIGHT;
     }
-    DLiteHtmlDocument *document = distill_litehtml_document_create(html, width, height, font_dir);
+    DPage *document = d_page_create(html, width, height, font_dir);
     if (!document) return 0;
-    int result = distill_litehtml_document_render_region(document, 0) &&
+    int result = d_page_paint(document, 0) &&
                  d_render_write_png(document->renderer, output_path);
-    distill_litehtml_document_destroy(document);
+    d_page_destroy(document);
     return result;
 }
 
-extern "C" int distill_litehtml_render_region(const char *html, const char *output_path,
+extern "C" int d_page_render_region_png(const char *html, const char *output_path,
                                                 int width, int viewport, int scroll_y,
                                                 const char *font_dir)
 {
     if (!html || !output_path || width <= 0 || viewport <= 0) return 0;
-    DLiteHtmlDocument *document = distill_litehtml_document_create(html, width, viewport, font_dir);
+    DPage *document = d_page_create(html, width, viewport, font_dir);
     if (!document) return 0;
-    int result = distill_litehtml_document_render_region(document, scroll_y) &&
+    int result = d_page_paint(document, scroll_y) &&
                  d_render_write_png(document->renderer, output_path);
-    distill_litehtml_document_destroy(document);
+    d_page_destroy(document);
     return result;
 }
 
@@ -592,7 +592,7 @@ static void collect_link_boxes(const litehtml::element::ptr &element,
     for (const auto &child : element->children()) collect_link_boxes(child, output);
 }
 
-static size_t copy_form_boxes(const DLiteHtmlDocument *document, DFormBox *boxes,
+static size_t copy_form_boxes(const DPage *document, DFormBox *boxes,
                               size_t box_capacity)
 {
     if (!document || !document->document) return 0;
@@ -608,7 +608,7 @@ static size_t copy_form_boxes(const DLiteHtmlDocument *document, DFormBox *boxes
     return count;
 }
 
-static size_t copy_link_boxes(const DLiteHtmlDocument *document, DLinkBox *boxes,
+static size_t copy_link_boxes(const DPage *document, DLinkBox *boxes,
                               size_t box_capacity)
 {
     if (!document || !document->document) return 0;
@@ -624,7 +624,7 @@ static size_t copy_link_boxes(const DLiteHtmlDocument *document, DLinkBox *boxes
 
 }
 
-extern "C" size_t distill_litehtml_document_form_boxes(const DLiteHtmlDocument *document,
+extern "C" size_t d_page_form_boxes(const DPage *document,
                                                           DFormBox *boxes,
                                                           size_t box_capacity)
 {
@@ -671,7 +671,7 @@ static bool block_holds_run(const BlockBox &block, const DTextBox &box)
            y >= block.rect.y && y <= block.rect.y + block.rect.height;
 }
 
-static void assign_text_blocks(DLiteHtmlDocument *document)
+static void assign_text_blocks(DPage *document)
 {
     std::vector<BlockBox> blocks;
     collect_block_boxes(document->document->root(), blocks);
@@ -695,7 +695,7 @@ static void assign_text_blocks(DLiteHtmlDocument *document)
 /* Collected on demand rather than at layout: the command-line renderer lays
    out documents it only ever paints, and it should not pay for a pass it has
    no use for. */
-static void collect_text_runs(DLiteHtmlDocument *document)
+static void collect_text_runs(DPage *document)
 {
     if (!document || !document->document || !document->probe) return;
     if (document->probe->text_collected) return;
@@ -711,7 +711,7 @@ static void collect_text_runs(DLiteHtmlDocument *document)
     assign_text_blocks(document);
 }
 
-extern "C" size_t distill_litehtml_document_text_boxes(DLiteHtmlDocument *document,
+extern "C" size_t d_page_text_boxes(DPage *document,
                                                        DTextBox *boxes, size_t box_capacity)
 {
     if (!document || !document->probe) return 0;
@@ -725,7 +725,7 @@ extern "C" size_t distill_litehtml_document_text_boxes(DLiteHtmlDocument *docume
     return count;
 }
 
-extern "C" size_t distill_litehtml_document_text_offset_at(DLiteHtmlDocument *document,
+extern "C" size_t d_page_text_offset_at(DPage *document,
                                                            size_t index, int x)
 {
     if (!document || !document->probe) return 0;
@@ -735,7 +735,7 @@ extern "C" size_t distill_litehtml_document_text_offset_at(DLiteHtmlDocument *do
     return d_render_text_offset_at(runs[index].font, runs[index].box.text, x);
 }
 
-extern "C" int distill_litehtml_document_text_x_at(DLiteHtmlDocument *document,
+extern "C" int d_page_text_x_at(DPage *document,
                                                    size_t index, size_t offset)
 {
     if (!document || !document->probe) return 0;
@@ -745,14 +745,14 @@ extern "C" int distill_litehtml_document_text_x_at(DLiteHtmlDocument *document,
     return d_render_text_x_at(runs[index].font, runs[index].box.text, offset);
 }
 
-extern "C" size_t distill_litehtml_document_link_boxes(const DLiteHtmlDocument *document,
+extern "C" size_t d_page_link_boxes(const DPage *document,
                                                           DLinkBox *boxes,
                                                           size_t box_capacity)
 {
     return copy_link_boxes(document, boxes, box_capacity);
 }
 
-extern "C" size_t distill_litehtml_form_boxes(const char *html, int width, int height,
+extern "C" size_t d_page_measure_form_boxes(const char *html, int width, int height,
                                                const char *font_dir, DFormBox *boxes,
                                                size_t box_capacity)
 {
@@ -781,7 +781,7 @@ extern "C" size_t distill_litehtml_form_boxes(const char *html, int width, int h
     return count;
 }
 
-extern "C" size_t distill_litehtml_link_boxes(const char *html, int width, int height,
+extern "C" size_t d_page_measure_link_boxes(const char *html, int width, int height,
                                                const char *font_dir, DLinkBox *boxes,
                                                size_t box_capacity)
 {

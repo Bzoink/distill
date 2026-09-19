@@ -327,6 +327,15 @@ with both painters and the difference stays under a stated threshold (mean
 per-channel error and the largest differing region), and the stage has been
 shown to fail against a painter with a deliberate defect.
 
+*Done 2026-09-19, as muroxi_compat.md M3* (see its M3 result):
+- The painter is `src/paint_soft.c` behind `src/paint.h`.
+- `d_render_pixels` is the pixel-and-stride accessor.
+- The largest difference from Cairo on any page is a mean of 0.051 per
+  channel, and no pixel differs by more than 32.
+- Every shipped binary uses the software painter, the GTK shell included, so
+  "one painter everywhere" is settled for all but the window the GTK host
+  shows it in.
+
 ### B — the seam, the memory sink, a headless shell
 
 `d_display_*` with the memory sink, and a `distill-fb` that opens a reader

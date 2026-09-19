@@ -543,6 +543,137 @@ def check_transport(engine, port, cap_ms, timeout_s):
     return failures
 
 
+# How far the software painter may stray from Cairo (check.py --paint). The
+# painters round differently at the edges of glyphs and discs, which is noise
+# of a fraction of a level on average; a real defect -- a glyph a row out, an
+# image unscaled -- moves the mean by whole levels and shows as a region.
+PAINT_MEAN_LIMIT = 0.5          # mean absolute difference per channel, 0-255
+PAINT_DIFFERENT = 32            # a pixel differs when a channel is this far out
+PAINT_REGION_LIMIT = 16         # largest connected region of differing pixels
+
+
+def read_ppm(path):
+    with open(path, "rb") as fh:
+        data = fh.read()
+    magic, size, depth, pixels = data.split(b"\n", 3)
+    width, height = map(int, size.split())
+    return width, height, pixels
+
+
+def compare_paint(reference, candidate):
+    """(mean error per channel, largest differing region, size problem)."""
+    w1, h1, a = read_ppm(reference)
+    w2, h2, b = read_ppm(candidate)
+    if (w1, h1) != (w2, h2):
+        return None, None, f"{w2}x{h2} against {w1}x{h1}"
+    total = sum(abs(x - y) for x, y in zip(a, b))
+    different = set()
+    for i in range(0, len(a), 3):
+        if (abs(a[i] - b[i]) > PAINT_DIFFERENT or abs(a[i + 1] - b[i + 1]) > PAINT_DIFFERENT
+                or abs(a[i + 2] - b[i + 2]) > PAINT_DIFFERENT):
+            different.add(i // 3)
+    largest = 0
+    while different:
+        seed = different.pop()
+        stack, size = [seed], 1
+        while stack:
+            at = stack.pop()
+            x, y = at % w1, at // w1
+            for nx, ny in ((x - 1, y), (x + 1, y), (x, y - 1), (x, y + 1)):
+                if 0 <= nx < w1 and 0 <= ny < h1 and ny * w1 + nx in different:
+                    different.discard(ny * w1 + nx)
+                    stack.append(ny * w1 + nx)
+                    size += 1
+        largest = max(largest, size)
+    return total / max(1, len(a)), largest, None
+
+
+def run_paint_gate(engine, port, manifest, timeout_s):
+    """The software painter against Cairo (muroxi_compat.md M3).
+
+    Every gated page's reader page, and a page of every painter primitive
+    (corpus/paint/), painted by src/paint_soft.c and by the Cairo painter it
+    replaced (tests/paint_cairo.c), at the width --render uses. The render
+    gate only proves a PNG exists; this proves it is the right PNG. The
+    negative control paints with a deliberate defect and must fail.
+    """
+    build = os.path.join(os.path.dirname(HERE), "build")
+    tools = {name: os.path.join(build, f"distill-paint-{name}") for name in ("soft", "cairo", "defect")}
+    for name, path in tools.items():
+        if not os.access(path, os.X_OK):
+            sys.exit(f"no {path}; build it (the Cairo reference needs Cairo installed)")
+    fonts = os.path.join(build, "share", "distill", "fonts")
+    cap_ms = manifest.get("settle_cap_ms", 5000)
+    width = 760
+    failures, compared = [], 0
+    worst_mean, worst_region = 0.0, 0
+    with tempfile.TemporaryDirectory(prefix="distill-paint-") as scratch:
+        pages = []
+        for page in manifest["pages"]:
+            if not page.get("gate") or not page.get("path"):
+                continue
+            template = os.path.join(scratch, page["id"] + ".html")
+            r = subprocess.run([engine, "--url", f"http://127.0.0.1:{port}/{page['path']}",
+                                "--template", template, "--script-cap-ms", str(cap_ms)],
+                               capture_output=True, text=True, timeout=timeout_s)
+            if r.returncode not in (0, 4) or not os.path.exists(template):
+                failures.append(f"{page['id']}: no reader page (exit {r.returncode})")
+                continue
+            pages.append((page["id"], template, scratch))
+        paint_dir = os.path.join(HERE, "paint")
+        for name in sorted(os.listdir(paint_dir)):
+            if name.endswith(".html"):
+                pages.append((f"paint/{name}", os.path.join(paint_dir, name), paint_dir))
+
+        def paint(tool, page_id, template, cwd):
+            out = os.path.join(scratch, f"{page_id.replace('/', '_')}.{tool}.ppm")
+            r = subprocess.run([tools[tool], template, str(width), out, fonts], cwd=cwd,
+                               capture_output=True, text=True, timeout=timeout_s)
+            return out if r.returncode == 0 else None
+
+        for page_id, template, cwd in pages:
+            reference = paint("cairo", page_id, template, cwd)
+            candidate = paint("soft", page_id, template, cwd)
+            if not reference or not candidate:
+                failures.append(f"{page_id}: a painter failed")
+                continue
+            mean, region, problem = compare_paint(reference, candidate)
+            compared += 1
+            if problem:
+                failures.append(f"{page_id}: size {problem}")
+                continue
+            worst_mean, worst_region = max(worst_mean, mean), max(worst_region, region)
+            if mean > PAINT_MEAN_LIMIT or region > PAINT_REGION_LIMIT:
+                failures.append(f"{page_id}: mean {mean:.3f}, largest region {region} pixels")
+        print(f"  software painter against Cairo: {compared} pages, worst mean {worst_mean:.3f}"
+              f" per channel (limit {PAINT_MEAN_LIMIT}), worst region {worst_region} pixels"
+              f" (limit {PAINT_REGION_LIMIT})")
+
+        caught = 0
+        controls = [p for p in pages if p[0] in ("09-article", "paint/primitives.html")]
+        for page_id, template, cwd in controls:
+            reference = paint("cairo", page_id, template, cwd)
+            broken = paint("defect", page_id, template, cwd)
+            mean, region, problem = compare_paint(reference, broken)
+            if problem or mean > PAINT_MEAN_LIMIT or region > PAINT_REGION_LIMIT:
+                caught += 1
+                print(f"  negative control {page_id}: the defect painter differs "
+                      f"(mean {mean:.3f}, region {region})")
+            else:
+                failures.append(f"negative control {page_id}: the defect painter passed "
+                                f"(mean {mean:.3f}, region {region}), so the comparison sees nothing")
+        if not controls:
+            failures.append("negative control: its pages are missing")
+    print()
+    for failure in failures:
+        print(f"  {RED}FAIL{RESET}  {failure}")
+    if failures:
+        print(f"{RED}FAILED{RESET}  {len(failures)} paint check(s)")
+        return 1
+    print(f"{GREEN}OK{RESET}  the software painter matches Cairo on every page")
+    return 0
+
+
 def run_stack_gate(engine, port, manifest, timeout_s):
     """Muroxi's stacks, modelled on Linux (muroxi_compat.md, --stack).
 
@@ -947,6 +1078,8 @@ def main():
                     help="render the gallery fixture through the Phase 2 media viewer")
     ap.add_argument("--app", action="store_true",
                     help="run the Phase 3 desktop-shell model smoke test")
+    ap.add_argument("--paint", action="store_true",
+                    help="compare the software painter with Cairo, pixel by pixel")
     ap.add_argument("--stack", action="store_true",
                     help="model Muroxi's stacks: engine in 8 MiB, shell in 64 KiB")
     ap.add_argument("--in-process", action="store_true",
@@ -1037,6 +1170,9 @@ def main():
 
         if args.stack:
             return run_stack_gate(engine, port, manifest, args.timeout)
+
+        if args.paint:
+            return run_paint_gate(engine, port, manifest, args.timeout)
 
         if args.tui:
             import tui_suite

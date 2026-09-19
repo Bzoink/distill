@@ -534,7 +534,7 @@ The working plan is [muroxi_compat.md](muroxi_compat.md). Its phases M1–M5 nee
 1. **M0 — measure** peak memory, JS heap, native stack, fetch concurrency and startup per corpus page, and choose the Muroxi package's budgets from them. *Done 2026-09-19* ([result](muroxi_compat.md#m0-result-2026-09-19)): a 64 MiB JS heap and a 96 MiB engine quota; the shell fits 16 MiB and 20 KiB of stack. Measuring found and fixed three engine defects: extraction's quadratic stylesheet memory, the JS stack limit crash, and the settle cap overrun.
 2. **M1 — the platform seams** under `src/platform/`, with every OS call behind them and a gate that greps for OS headers elsewhere. *Done 2026-09-19* ([result](muroxi_compat.md#m1-result-2026-09-19)): `dclock`, `dfs`, `dproc`, `dterm` and `daudio` with Linux backends; the core built as strict ISO C with no feature-test macro; a fetch concurrency limit.
 3. **M2 — the engine as a library:** `d_engine_run`, requests by file or stdin, cookies in the session file, embedded bytecode JavaScript, the JS stack limit from the platform. *Done 2026-09-19* ([result](muroxi_compat.md#m2-result-2026-09-19)): the command is a thin wrapper; an in-process host passes the golden gates; no binary reads the source tree; `--stack` models Muroxi's stacks; an untrusted clock has its own status.
-4. **M3 — the software painter**, which is FRAMEBUFFER_PLAN.md phase A.
+4. **M3 — the software painter**, which is FRAMEBUFFER_PLAN.md phase A. *Done 2026-09-19* ([result](muroxi_compat.md#m3-result-2026-09-19)): every binary paints with `src/paint_soft.c`, within 0.051 per channel of Cairo on every page; only the GTK host links Cairo, to show the pixels.
 5. **M4 — `reader_layout`**, compared pixel for pixel with litehtml before litehtml, Gumbo and the C++ adapter are deleted.
 6. **M5 — the portable build:** a per-library source manifest that CMake and Muroxi's build both read, and the `--static-link` and `--symbols` gates.
 7. **M6–M8 on Muroxi:** the TUI, then the framebuffer shell through `libmxpresent`, then audio.
@@ -579,7 +579,7 @@ What this project is actually building, once the borrowed parts are set aside.
 - litehtml — box layout for our own template, **until `reader_layout` replaces it** (Phase 7)
 - HarfBuzz, FreeType, libunibreak — shaping, rasterization, break opportunities
 - SheenBidi, libhyphen — deferred until the corpus demands them
-- Cairo — desktop paint backend, **until the software painter replaces it** (Phase 7)
+- Cairo — **replaced by the software painter** (M3); only the GTK host links it, to put pixels in its window, and `tests/paint_cairo.c` keeps it as the reference `check.py --paint` compares against
 - GTK3 — desktop window shell; at most a thin host window once Phase 7 lands
 - miniaudio — audio decoding; device output only where the platform has no `daudio` backend of its own
 - termbox2 — terminal output for the TUI

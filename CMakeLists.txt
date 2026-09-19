@@ -31,23 +31,27 @@ pkg_check_modules(DISTILL_UNIBREAK REQUIRED IMPORTED_TARGET libunibreak)
 pkg_check_modules(DISTILL_IMAGE REQUIRED IMPORTED_TARGET libpng libjpeg libwebp)
 
 # The raster renderer -- litehtml laying out, FreeType and HarfBuzz shaping,
-# Cairo painting -- is what the desktop shell draws with, and nothing else
-# needs it. It is found rather than required: a machine without Cairo still
-# builds the engine, the reader page, the Markdown export and the terminal
-# front end. DISTILL_RENDERER=OFF asks for that build deliberately.
-option(DISTILL_RENDERER "Build the litehtml/Cairo renderer when its dependencies are present" ON)
+# our own software painter (src/paint_soft.c) filling pixels -- is what the
+# desktop shell and --render draw with. It is found rather than required: a
+# machine without FreeType or HarfBuzz still builds the engine, the reader
+# page, the Markdown export and the terminal front end. DISTILL_RENDERER=OFF
+# asks for that build deliberately. Cairo is not part of it: only a GTK host
+# links Cairo, to put the painter's pixels in a window, and the reference
+# painter `check.py --paint` compares against (tests/paint_cairo.c).
+option(DISTILL_RENDERER "Build the litehtml renderer when its dependencies are present" ON)
 set(DISTILL_HAVE_RENDERER OFF)
 if(DISTILL_RENDERER)
-    pkg_check_modules(DISTILL_RENDER IMPORTED_TARGET freetype2 harfbuzz cairo)
+    pkg_check_modules(DISTILL_RENDER IMPORTED_TARGET freetype2 harfbuzz)
     if(DISTILL_RENDER_FOUND AND EXISTS "${EXTERNAL_PREFIX}/lib/liblitehtml.a")
         set(DISTILL_HAVE_RENDERER ON)
     else()
-        message(STATUS "FreeType, HarfBuzz, Cairo or litehtml not found; building without the renderer")
+        message(STATUS "FreeType, HarfBuzz or litehtml not found; building without the renderer")
     endif()
 endif()
 message(STATUS "Distill renderer: ${DISTILL_HAVE_RENDERER}")
 if(DISTILL_HAVE_RENDERER)
     pkg_check_modules(DISTILL_GTK IMPORTED_TARGET gtk+-3.0)
+    pkg_check_modules(DISTILL_CAIRO IMPORTED_TARGET cairo)
 endif()
 
 enable_testing()
@@ -178,6 +182,7 @@ if(DISTILL_HAVE_RENDERER)
         litehtml
         gumbo
         distill-render-core
+        distill-paint
     )
     distill_enable_assertions(distill-litehtml-geometry-test)
     add_test(NAME distill-litehtml-geometry COMMAND distill-litehtml-geometry-test)
@@ -206,8 +211,39 @@ distill_enable_assertions(distill-media-audio-test)
 add_test(NAME distill-media-audio COMMAND distill-media-audio-test)
 
 if(DISTILL_HAVE_RENDERER)
+    # render.c paints through paint.h; the painter is linked beside it, so a
+    # target chooses by what it links: distill-paint everywhere that ships.
     add_library(distill-render-core STATIC src/render.c)
     target_link_libraries(distill-render-core PUBLIC PkgConfig::DISTILL_RENDER distill-shaper distill-image distill-platform)
+    add_library(distill-paint STATIC src/paint_soft.c)
+    target_link_libraries(distill-paint PUBLIC PkgConfig::DISTILL_IMAGE m)
+    target_include_directories(distill-paint PUBLIC src)
+
+    # check.py --paint: the same reader page painted by the software painter,
+    # by the Cairo painter it replaced, and by a software painter with a
+    # deliberate defect, which the comparison must catch.
+    function(distill_paint_tool name painter)
+        add_executable(${name} tests/paint_tool.c src/litehtml_probe.cpp)
+        target_include_directories(${name} PRIVATE src "${EXTERNAL_PREFIX}/include")
+        target_link_directories(${name} PRIVATE "${EXTERNAL_PREFIX}/lib")
+        target_link_libraries(${name} PRIVATE litehtml gumbo distill-render-core ${painter})
+    endfunction()
+    distill_paint_tool(distill-paint-soft distill-paint)
+
+    add_library(distill-paint-defect STATIC src/paint_soft.c)
+    target_compile_definitions(distill-paint-defect PRIVATE DISTILL_PAINT_DEFECT=1)
+    target_link_libraries(distill-paint-defect PUBLIC PkgConfig::DISTILL_IMAGE m)
+    target_include_directories(distill-paint-defect PUBLIC src)
+    distill_paint_tool(distill-paint-defect-tool distill-paint-defect)
+    set_target_properties(distill-paint-defect-tool PROPERTIES OUTPUT_NAME distill-paint-defect)
+    if(DISTILL_CAIRO_FOUND)
+        add_library(distill-paint-cairo STATIC tests/paint_cairo.c)
+        target_include_directories(distill-paint-cairo PUBLIC src)
+        target_link_libraries(distill-paint-cairo PUBLIC PkgConfig::DISTILL_CAIRO m)
+        distill_paint_tool(distill-paint-cairo-tool distill-paint-cairo)
+        set_target_properties(distill-paint-cairo-tool PROPERTIES OUTPUT_NAME distill-paint-cairo)
+    endif()
+
 endif()
 
 # The reader-page walker and the front ends that are not litehtml: the
@@ -282,7 +318,7 @@ target_link_libraries(distill-engine PUBLIC
 if(DISTILL_HAVE_RENDERER)
     target_sources(distill-engine PRIVATE src/litehtml_probe.cpp)
     target_compile_definitions(distill-engine PRIVATE DISTILL_RENDER=1)
-    target_link_libraries(distill-engine PUBLIC litehtml gumbo distill-render-core)
+    target_link_libraries(distill-engine PUBLIC litehtml gumbo distill-render-core distill-paint)
 endif()
 
 add_executable(distill src/distill.c)
@@ -356,6 +392,7 @@ if(DISTILL_HAVE_RENDERER AND DISTILL_GTK_FOUND)
         litehtml
         gumbo
         distill-render-core
+        distill-paint
         distill-version
         PkgConfig::DISTILL_GTK
     )
@@ -380,7 +417,7 @@ set_target_properties(distill-arm-b PROPERTIES
 install(TARGETS distill-arm-b RUNTIME DESTINATION bin)
 
 if(DISTILL_HAVE_RENDERER)
-    add_executable(distill-arm-b-pruned src/distill.c src/engine.c src/engine_args.c "${DISTILL_EMBEDDED_JS}" src/litehtml_probe.cpp src/render.c src/shaper.c src/image.c)
+    add_executable(distill-arm-b-pruned src/distill.c src/engine.c src/engine_args.c "${DISTILL_EMBEDDED_JS}" src/litehtml_probe.cpp src/render.c src/paint_soft.c src/shaper.c src/image.c)
     target_compile_definitions(distill-arm-b-pruned PRIVATE DISTILL_B_PRUNED=1 DISTILL_NO_EXTRACT=1)
     target_include_directories(distill-arm-b-pruned PRIVATE "${EXTERNAL_PREFIX}/include" ${CURL_INCLUDE_DIRS})
     target_link_directories(distill-arm-b-pruned PRIVATE "${EXTERNAL_PREFIX}/lib")

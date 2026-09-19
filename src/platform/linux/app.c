@@ -17,7 +17,7 @@
 #include "cutil.h"
 #include "datadir.h"
 #include "distill_version.h"
-#include "render.h"
+#include "page.h"
 
 #include <cairo.h>
 #include <gtk/gtk.h>
@@ -249,7 +249,7 @@ struct App {
     int page_height;
     guint relayout_source;
     cairo_surface_t *surface;
-    DLiteHtmlDocument *document;
+    DPage *document;
     int surface_top;
     DFormBox *form_boxes;
     size_t form_count;
@@ -1238,12 +1238,12 @@ static void ensure_text_boxes(App *app)
 {
     if (app->text_collected || !app->document) return;
     app->text_collected = true;
-    size_t count = distill_litehtml_document_text_boxes(app->document, NULL, 0);
+    size_t count = d_page_text_boxes(app->document, NULL, 0);
     if (count > MAX_TEXT_BOXES) count = MAX_TEXT_BOXES;
     if (!count) return;
     app->text_boxes = g_new0(DTextBox, count);
     app->text_count = count;
-    distill_litehtml_document_text_boxes(app->document, app->text_boxes, count);
+    d_page_text_boxes(app->document, app->text_boxes, count);
 }
 
 static void clear_selection(App *app)
@@ -1302,7 +1302,7 @@ static bool text_point_at(App *app, double x, double y, TextPoint *point)
     if (!app->text_count) return false;
     size_t best = nearest_text_run(app, x, y);
     point->run = best;
-    point->offset = distill_litehtml_document_text_offset_at(
+    point->offset = d_page_text_offset_at(
         app->document, best, (int)(x - app->text_boxes[best].x));
     return true;
 }
@@ -1433,9 +1433,9 @@ static void draw_selection(App *app, cairo_t *cairo)
         int from = 0;
         int to = box->width;
         if (i == start.run)
-            from = distill_litehtml_document_text_x_at(app->document, i, start.offset);
+            from = d_page_text_x_at(app->document, i, start.offset);
         if (i == end.run)
-            to = distill_litehtml_document_text_x_at(app->document, i, end.offset);
+            to = d_page_text_x_at(app->document, i, end.offset);
         if (to <= from) continue;
         cairo_rectangle(cairo, box->x + from, box->y, to - from, box->height);
     }
@@ -1471,16 +1471,36 @@ static int visible_scroll_y(const App *app)
     return value > 0.0 ? (int)value : 0;
 }
 
+/* The engine paints into its own pixels (render.h); GTK draws with Cairo, so
+   the shell wraps those pixels in a Cairo surface of its own. The pixels are
+   the document's: the wrapper is released before the document goes. */
+static void release_surface(App *app)
+{
+    if (app->surface) cairo_surface_destroy(app->surface);
+    app->surface = NULL;
+}
+
+static void wrap_document_pixels(App *app)
+{
+    release_surface(app);
+    DRenderPixels pixels;
+    if (!app->document || !d_page_pixels(app->document, &pixels)) return;
+    if (pixels.stride != cairo_format_stride_for_width(CAIRO_FORMAT_ARGB32, pixels.width)) return;
+    app->surface = cairo_image_surface_create_for_data((unsigned char *)pixels.data,
+                                                       CAIRO_FORMAT_ARGB32, pixels.width,
+                                                       pixels.height, pixels.stride);
+}
+
 static void render_visible_band(App *app)
 {
     if (!app || !app->document) return;
     int scroll_y = visible_scroll_y(app);
     int top = scroll_y - RENDER_OVERSCAN;
     if (top < 0) top = 0;
-    if (!distill_litehtml_document_render_region(app->document, top)) return;
+    if (!d_page_paint(app->document, top)) return;
     app->surface_top = top;
-    app->surface = (cairo_surface_t *)distill_litehtml_document_surface(app->document);
-    if (app->surface) cairo_surface_flush(app->surface);
+    if (!app->surface) wrap_document_pixels(app);
+    if (app->surface) cairo_surface_mark_dirty(app->surface);
     gtk_widget_queue_draw(app->drawing_area);
 }
 
@@ -1842,7 +1862,7 @@ static void open_link(App *app, const char *uri);
 static bool link_href_at(const App *app, double x, double y, char *href, size_t capacity)
 {
     if (!app || !app->document) return false;
-    return distill_litehtml_document_link_at(app->document, (int)x, (int)y,
+    return d_page_link_at(app->document, (int)x, (int)y,
                                              href, capacity) != 0;
 }
 
@@ -1869,7 +1889,7 @@ static double document_y(const App *app, GtkWidget *widget, double y)
 {
     if (!app || !widget) return y;
     int content = app->document
-                      ? distill_litehtml_document_content_height(app->document) : 0;
+                      ? d_page_height(app->document) : 0;
     GtkAllocation allocation;
     gtk_widget_get_allocation(widget, &allocation);
     return document_y_from(content, allocation.height, visible_scroll_y(app), y);
@@ -2522,7 +2542,7 @@ static bool activate_choice_at(App *app, int x, int y)
 {
     char id[64];
     if (!app || !app->document ||
-        !distill_litehtml_document_choice_id_at(app->document, x, y, id, sizeof(id))) return false;
+        !d_page_choice_id_at(app->document, x, y, id, sizeof(id))) return false;
     for (size_t i = 0; i < app->control_count; ++i) {
         FormControl *control = &app->controls[i];
         if (!form_control_is_choice(control) || control->box.disabled ||
@@ -2764,9 +2784,9 @@ static void form_submit(App *app, const FormControl *submit_control)
    way on a framebuffer with no window manager to open one in. */
 static void build_document(App *app, const char *template)
 {
-    if (app->document) distill_litehtml_document_destroy(app->document);
+    release_surface(app);
+    if (app->document) d_page_destroy(app->document);
     app->document = NULL;
-    app->surface = NULL;
     app->surface_top = 0;
     clear_controls(app);
     /* The runs belong to the document that is being replaced, and so does
@@ -2789,14 +2809,14 @@ static void build_document(App *app, const char *template)
         }
         int band_height = viewport + RENDER_OVERSCAN * 2;
         if (band_height < PAGE_HEIGHT) band_height = PAGE_HEIGHT;
-        app->document = distill_litehtml_document_create(template, page_width,
+        app->document = d_page_create(template, page_width,
                                                          band_height, font_dir);
         if (app->document) {
-            page_height = distill_litehtml_document_content_height(app->document);
+            page_height = d_page_height(app->document);
             if (page_height < 1) page_height = 1;
-            app->surface = (cairo_surface_t *)distill_litehtml_document_surface(app->document);
-            size_t form_count = distill_litehtml_document_form_boxes(app->document, NULL, 0);
-            size_t link_count = distill_litehtml_document_link_boxes(app->document, NULL, 0);
+            wrap_document_pixels(app);
+            size_t form_count = d_page_form_boxes(app->document, NULL, 0);
+            size_t link_count = d_page_link_boxes(app->document, NULL, 0);
             if (form_count > MAX_FORM_BOXES) form_count = MAX_FORM_BOXES;
             if (link_count > MAX_LINK_BOXES) link_count = MAX_LINK_BOXES;
             app->form_boxes = form_count ? g_new0(DFormBox, form_count) : NULL;
@@ -2804,9 +2824,9 @@ static void build_document(App *app, const char *template)
             app->form_count = form_count;
             app->link_count = link_count;
             if (form_count)
-                distill_litehtml_document_form_boxes(app->document, app->form_boxes, form_count);
+                d_page_form_boxes(app->document, app->form_boxes, form_count);
             if (link_count)
-                distill_litehtml_document_link_boxes(app->document, app->link_boxes, link_count);
+                d_page_link_boxes(app->document, app->link_boxes, link_count);
             if (form_count) {
                 app->controls = g_new0(FormControl, form_count);
                 app->control_count = form_count;
@@ -3345,9 +3365,9 @@ static void app_destroy(GtkWidget *widget, gpointer opaque)
     cancel_reader_scroll_restore(app);
     cancel_relayout(app);
     stop_load_feedback(app);
-    if (app->document) distill_litehtml_document_destroy(app->document);
+    release_surface(app);
+    if (app->document) d_page_destroy(app->document);
     app->document = NULL;
-    app->surface = NULL;
     clear_controls(app);
     g_free(app->text_boxes);
     app->text_boxes = NULL;
@@ -3882,7 +3902,7 @@ static bool run_media_self_test(void)
         if (write_solid_test_png(source, 600, 400)) {
             char *html = viewer_html(&probe, "https://example.test/photo.png", source, NULL);
             const char *font_dir = shell_font_dir();
-            int height = distill_litehtml_content_height(html, PAGE_WIDTH_DESIGN, font_dir);
+            int height = d_page_measure_height(html, PAGE_WIDTH_DESIGN, font_dir);
             checked = true;
             if (height < 400) {
                 fprintf(stderr, "viewer: a 600x400 image laid out %d tall\n", height);

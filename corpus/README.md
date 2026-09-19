@@ -503,6 +503,12 @@ one, so it catches the defect and not the machine.
   in an 8 MiB stack, and the terminal suite runs with the shell in 64 KiB.
   Two negative controls must fail: the deep-recursion page with the JS limit
   set to the whole stack, and the shell in 16 KiB.
+- `--paint` paints every gated page's reader page, and `paint/primitives.html`
+  (every painter operation on one hand-written page), with the software
+  painter and with the Cairo reference, and compares pixels: a mean
+  difference of at most 0.5 per channel, and no connected region over 16
+  pixels differing by more than 32. A painter with a deliberate defect must
+  fail it.
 - The default mode also checks that an engine run writes no temporary files,
   and that TLS refused under an untrusted clock (`DISTILL_TEST_UNTRUSTED_TIME=1`)
   exits 5.

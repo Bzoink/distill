@@ -770,6 +770,50 @@ FRAMEBUFFER_PLAN.md phase A, unchanged, including its `--paint` parity gate.
 **Done when** that phase's condition holds and Cairo is no longer linked by
 any target but a GTK host.
 
+#### M3 result (2026-09-19)
+
+Done.
+
+**The painter.**
+- `src/paint.h` is the interface render.c draws through. render.c keeps
+  fonts, shaping and measurement and no longer mentions Cairo.
+- `src/paint_soft.c` implements it in portable C, over a buffer of
+  premultiplied 32-bit pixels:
+  - "over" compositing with pixman's rounding;
+  - glyph masks placed at fractional positions by bilinear sampling, as
+    Cairo samples a translated mask;
+  - exact area coverage for text decoration;
+  - images box-filtered when shrunk and bilinear otherwise, transparent
+    outside the source (Cairo's GOOD filter);
+  - a 4×4-sampled disc, a clip stack, and PNG through libpng.
+- It keeps within the portability rules: no local buffer over 4 KiB and no
+  recursion.
+- `d_render_surface` became `d_render_pixels`, which gives the pixels with
+  their stride, so nothing outside render.c sees a Cairo type.
+
+**Who links Cairo.**
+- The engine, the TUI and `distill-host` link no Cairo (checked with `ldd`).
+- The GTK host paints with the software painter too, and wraps its pixels in
+  a Cairo surface only to put them in its window. A screenshot on Xvfb shows
+  the article drawn correctly.
+- Cairo's painter survives only as `tests/paint_cairo.c`, the reference.
+
+**The gate, `check.py --paint`.**
+- The painter is chosen at link time. One tool source
+  (`tests/paint_tool.c`) builds three render tools: the software painter,
+  the Cairo reference, and a software painter with a deliberate defect
+  (glyphs a row low).
+- The gate paints the reader page of all 47 gated corpus pages, and
+  `corpus/paint/primitives.html`, with the first two, and compares the
+  pixels. The primitives page has every painter operation, including images
+  shrunk 4× and enlarged 2×, translucent fills and borders, clipping, both
+  list markers and both decorations.
+- The limits are a mean difference of 0.5 per channel and a largest
+  connected region of 16 pixels differing by more than 32 in any channel.
+- Measured: a worst mean of 0.051 and no differing pixel on any page.
+- The defect painter fails on both control pages (mean 6.70 and 1.75;
+  regions of 115 and 96 pixels).
+
 ### M4 — our own layout
 
 `reader_layout` with cell and pixel measurers, the style table, the box list

@@ -1,5 +1,5 @@
 #include "image.h"
-#include "render.h"
+#include "page.h"
 
 #include <assert.h>
 #include <stdbool.h>
@@ -37,7 +37,7 @@ static void test_image_is_drawn_where_it_is_laid_out(void)
              "div.spacer{height:40px;}img{display:block;}"
              "</style></head><body><div class=\"spacer\"></div>"
              "<img src=\"%s\"></body></html>", source);
-    assert(distill_litehtml_render_region(html, output, 400, 200, 0, NULL));
+    assert(d_page_render_region_png(html, output, 400, 200, 0, NULL));
 
     DImage rendered;
     assert(d_image_load_file(output, &rendered));
@@ -80,7 +80,7 @@ static void test_wide_image_is_fitted_to_the_surface(void)
              source);
     /* 900 wide fitted into 300 is 100 tall, so the content is about that and
        certainly not the 300 it would be at natural size. */
-    int height = distill_litehtml_content_height(html, 300, NULL);
+    int height = d_page_measure_height(html, 300, NULL);
     assert(height > 0);
     assert(height < 200);
     assert(remove(source) == 0);
@@ -93,7 +93,7 @@ static void test_unreadable_image_takes_no_space(void)
     const char *html =
         "<!doctype html><html><head><style>html,body{margin:0;padding:0;}"
         "</style></head><body><img src=\"/tmp/distill-does-not-exist.png\"></body></html>";
-    int height = distill_litehtml_content_height(html, 400, NULL);
+    int height = d_page_measure_height(html, 400, NULL);
     assert(height >= 0 && height < 40);
 }
 
@@ -105,7 +105,7 @@ static void test_remote_sources_are_refused(void)
     const char *html =
         "<!doctype html><html><head><style>html,body{margin:0;padding:0;}"
         "</style></head><body><img src=\"https://example.test/photo.png\"></body></html>";
-    int height = distill_litehtml_content_height(html, 400, NULL);
+    int height = d_page_measure_height(html, 400, NULL);
     assert(height >= 0 && height < 40);
 }
 
@@ -140,10 +140,10 @@ int main(void)
         " name=\"q\" value=\"reader\">"
         "<input type=\"hidden\" name=\"token\" value=\"keep\">"
         "<button type=\"submit\" name=\"go\">Search</button></form></main>";
-    size_t count = distill_litehtml_form_boxes(html, 760, 800, NULL, NULL, 0);
+    size_t count = d_page_measure_form_boxes(html, 760, 800, NULL, NULL, 0);
     assert(count == 3);
     DFormBox boxes[3] = {0};
-    assert(distill_litehtml_form_boxes(html, 760, 800, NULL, boxes, 3) == 3);
+    assert(d_page_measure_form_boxes(html, 760, 800, NULL, boxes, 3) == 3);
     assert(strcmp(boxes[0].type, "search") == 0);
     assert(strcmp(boxes[0].name, "q") == 0);
     /* The reader gives every input the same explicit height as its GTK
@@ -175,7 +175,7 @@ int main(void)
         "<input type=\"checkbox\" name=\"topics\" value=\"tech\" data-distill-checked=\"1\">"
         "<input type=\"radio\" name=\"mode\" value=\"focus\" data-distill-required=\"1\"></form>";
     DFormBox native[4] = {0};
-    assert(distill_litehtml_form_boxes(native_controls, 760, 800, NULL, native, 4) == 4);
+    assert(d_page_measure_form_boxes(native_controls, 760, 800, NULL, native, 4) == 4);
     assert(strcmp(native[0].type, "textarea") == 0);
     assert(strcmp(native[0].value, "First line\nSecond line") == 0);
     assert(strcmp(native[0].placeholder, "Write here") == 0);
@@ -195,21 +195,21 @@ int main(void)
         " class=\"form-choice-input\" type=\"checkbox\"><span>Technology</span></label>"
         "<label class=\"form-choice\"><input id=\"choice-radio\""
         " class=\"form-choice-input\" type=\"radio\"><span>Focused</span></label></form>";
-    DLiteHtmlDocument *choice_document =
-        distill_litehtml_document_create(choice_page, 760, 300, NULL);
+    DPage *choice_document =
+        d_page_create(choice_page, 760, 300, NULL);
     assert(choice_document);
     bool found_checkbox = false, found_radio = false;
     for (int y = 0; y < 180 && !(found_checkbox && found_radio); y += 2) {
         for (int x = 0; x < 300; x += 2) {
             char id[64] = {0};
-            if (!distill_litehtml_document_choice_id_at(choice_document, x, y, id, sizeof(id)))
+            if (!d_page_choice_id_at(choice_document, x, y, id, sizeof(id)))
                 continue;
             if (!strcmp(id, "choice-checkbox")) found_checkbox = true;
             if (!strcmp(id, "choice-radio")) found_radio = true;
         }
     }
     assert(found_checkbox && found_radio);
-    distill_litehtml_document_destroy(choice_document);
+    d_page_destroy(choice_document);
 
     /* An input's explicit height must become part of the next field's layout;
        otherwise the GTK entry (which has a real allocation) covers the next
@@ -223,7 +223,7 @@ int main(void)
         "<label class=\"form-field-label\">Second</label>"
         "<input class=\"form-field-input\" name=\"second\"></form>";
     DFormBox stacked[2] = {0};
-    assert(distill_litehtml_form_boxes(stacked_fields, 760, 800, NULL, stacked, 2) == 2);
+    assert(d_page_measure_form_boxes(stacked_fields, 760, 800, NULL, stacked, 2) == 2);
     assert(stacked[0].height == 28 && stacked[1].height == 28);
     assert(stacked[0].x == 0 && stacked[1].x == 0);
     assert(stacked[1].y >= stacked[0].y + stacked[0].height + 20);
@@ -238,8 +238,8 @@ int main(void)
         "<main><h2><a href=\"https://example.test/story\">Story link</a></h2>"
         "<p>Prose before <a href=\"https://example.test/inline\">a link inside a "
         "sentence</a> and prose after.</p></main>";
-    DLiteHtmlDocument *link_document =
-        distill_litehtml_document_create(link_page, 760, 800, NULL);
+    DPage *link_document =
+        d_page_create(link_page, 760, 800, NULL);
     assert(link_document);
 
     /* Scan rather than hard-code pixel coordinates: the assertion is that the
@@ -249,7 +249,7 @@ int main(void)
     for (int y = 0; y < 400 && !(found_heading && found_inline); y += 3) {
         for (int x = 4; x < 700; x += 7) {
             char href[512] = {0};
-            if (!distill_litehtml_document_link_at(link_document, x, y, href, sizeof(href))) continue;
+            if (!d_page_link_at(link_document, x, y, href, sizeof(href))) continue;
             if (!strcmp(href, "https://example.test/story")) found_heading = true;
             if (!strcmp(href, "https://example.test/inline")) found_inline = true;
         }
@@ -260,10 +260,10 @@ int main(void)
     /* Somewhere in the page must not be a link, or the test proves nothing. */
     for (int y = 0; y < 400 && !found_gap; y += 3) {
         char href[512] = {0};
-        if (!distill_litehtml_document_link_at(link_document, 750, y, href, sizeof(href))) found_gap = true;
+        if (!d_page_link_at(link_document, 750, y, href, sizeof(href))) found_gap = true;
     }
     assert(found_gap);
-    distill_litehtml_document_destroy(link_document);
+    d_page_destroy(link_document);
 
     /* Text runs are what a selection is built from. The container is handed
        one per line with the box it filled, and nothing else in the boundary
@@ -276,16 +276,16 @@ int main(void)
         "up against the wall, waiting for the tide to turn at noon.</p>"
         "<ul><li>First item</li><li>Second item</li></ul>"
         "<p>Sm\xc3\xb6rg\xc3\xa5sbord</p></main>";
-    DLiteHtmlDocument *text_document =
-        distill_litehtml_document_create(text_page, 420, 800, DISTILL_TEST_FONT_DIR);
+    DPage *text_document =
+        d_page_create(text_page, 420, 800, DISTILL_TEST_FONT_DIR);
     assert(text_document);
-    size_t run_count = distill_litehtml_document_text_boxes(text_document, NULL, 0);
+    size_t run_count = d_page_text_boxes(text_document, NULL, 0);
     /* The first paragraph alone wraps, so anything that collected one run per
        block -- or only what fits the painted band -- fails here. */
     assert(run_count >= 5);
     DTextBox *runs = calloc(run_count, sizeof(*runs));
     assert(runs);
-    assert(distill_litehtml_document_text_boxes(text_document, runs, run_count) == run_count);
+    assert(d_page_text_boxes(text_document, runs, run_count) == run_count);
 
     bool saw_paragraph = false, saw_list_item = false, saw_swedish = false;
     unsigned int first_block = runs[0].block;
@@ -320,15 +320,15 @@ int main(void)
         size_t length = strlen(runs[i].text);
         for (size_t offset = 0; offset <= length; ++offset) {
             if (offset < length && (runs[i].text[offset] & 0xC0) == 0x80) continue;
-            int x = distill_litehtml_document_text_x_at(text_document, i, offset);
-            size_t back = distill_litehtml_document_text_offset_at(text_document, i, x);
+            int x = d_page_text_x_at(text_document, i, offset);
+            size_t back = d_page_text_offset_at(text_document, i, x);
             assert(back == offset);
         }
-        assert(distill_litehtml_document_text_offset_at(text_document, i, -5) == 0);
-        assert(distill_litehtml_document_text_offset_at(text_document, i, 100000) == length);
+        assert(d_page_text_offset_at(text_document, i, -5) == 0);
+        assert(d_page_text_offset_at(text_document, i, 100000) == length);
     }
     free(runs);
-    distill_litehtml_document_destroy(text_document);
+    d_page_destroy(text_document);
 
     /* Collecting the text must leave the document as it found it. Both passes
        ask litehtml what is under a point, and the collecting one asks it a
@@ -338,26 +338,26 @@ int main(void)
         "<!doctype html><style>body{font-size:18px}</style>"
         "<main><p>Prose before <a href=\"https://example.test/inline\">a link inside "
         "a sentence</a> and prose after.</p></main>";
-    DLiteHtmlDocument *mixed = distill_litehtml_document_create(mixed_page, 760, 800,
+    DPage *mixed = d_page_create(mixed_page, 760, 800,
                                                                DISTILL_TEST_FONT_DIR);
     assert(mixed);
     int hits_before = 0, hits_after = 0;
     for (int y = 0; y < 200; y += 3)
         for (int x = 4; x < 700; x += 7) {
             char href[512] = {0};
-            if (distill_litehtml_document_link_at(mixed, x, y, href, sizeof(href)))
+            if (d_page_link_at(mixed, x, y, href, sizeof(href)))
                 ++hits_before;
         }
     assert(hits_before > 0);
-    assert(distill_litehtml_document_text_boxes(mixed, NULL, 0) > 0);
+    assert(d_page_text_boxes(mixed, NULL, 0) > 0);
     for (int y = 0; y < 200; y += 3)
         for (int x = 4; x < 700; x += 7) {
             char href[512] = {0};
-            if (distill_litehtml_document_link_at(mixed, x, y, href, sizeof(href)))
+            if (d_page_link_at(mixed, x, y, href, sizeof(href)))
                 ++hits_after;
         }
     assert(hits_after == hits_before);
-    distill_litehtml_document_destroy(mixed);
+    d_page_destroy(mixed);
 
     /* Section markers are intentionally empty, but their one-pixel layout box
        is what lets the desktop shell locate the section without a second
@@ -368,30 +368,31 @@ int main(void)
         "<main><p style=\"height:100px\">intro</p>"
         "<a class=\"section-anchor\" href=\"distill-section:images\"></a>"
         "<section id=\"images\"><h2>Images</h2></section></main></body></html>";
-    DLiteHtmlDocument *marker_document =
-        distill_litehtml_document_create(marker_page, 760, 800, NULL);
+    DPage *marker_document =
+        d_page_create(marker_page, 760, 800, NULL);
     assert(marker_document);
     size_t marker_count =
-        distill_litehtml_document_link_boxes(marker_document, NULL, 0);
+        d_page_link_boxes(marker_document, NULL, 0);
     assert(marker_count == 1);
     DLinkBox marker_box = {0};
-    assert(distill_litehtml_document_link_boxes(marker_document, &marker_box, 1) == 1);
+    assert(d_page_link_boxes(marker_document, &marker_box, 1) == 1);
     assert(strcmp(marker_box.href, "distill-section:images") == 0);
     assert(marker_box.width == 1 && marker_box.height == 1);
     assert(marker_box.y > 0);
-    distill_litehtml_document_destroy(marker_document);
+    d_page_destroy(marker_document);
 
     const char *long_page =
         "<!doctype html><style>body{font-size:18px}p{margin:0 0 120px}</style>"
         "<main><p>top</p><p>middle</p><p>bottom</p></main>";
-    DLiteHtmlDocument *document = distill_litehtml_document_create(long_page, 760, 240, NULL);
+    DPage *document = d_page_create(long_page, 760, 240, NULL);
     assert(document);
-    assert(distill_litehtml_document_content_height(document) > 240);
-    assert(distill_litehtml_document_surface(document) != NULL);
-    assert(distill_litehtml_document_render_region(document, 0));
-    assert(distill_litehtml_document_render_region(document, 180));
-    distill_litehtml_document_destroy(document);
-    assert(distill_litehtml_render_region(long_page, "/tmp/distill-region-test.png",
+    assert(d_page_height(document) > 240);
+    DRenderPixels pixels;
+    assert(d_page_pixels(document, &pixels) && pixels.data && pixels.stride >= pixels.width * 4);
+    assert(d_page_paint(document, 0));
+    assert(d_page_paint(document, 180));
+    d_page_destroy(document);
+    assert(d_page_render_region_png(long_page, "/tmp/distill-region-test.png",
                                           760, 240, 180, NULL));
     assert(remove("/tmp/distill-region-test.png") == 0);
 

@@ -1,0 +1,42 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>Painter primitives</title>
+<!-- Not a corpus page: a reader page written by hand so that every operation
+     the painter has (src/paint.h) appears on it at least once, including the
+     ones the corpus's reader pages rarely reach -- images shrunk and enlarged,
+     translucent fills and borders, clipping, both list markers and both text
+     decorations. check.py --paint paints it with the software painter and
+     with Cairo and compares. Image paths are relative to this directory. -->
+<style>
+body { margin: 12px; font-family: serif; color: #222222; background: #f4f1ea; }
+h1 { font-family: sans-serif; }
+.box { border: 3px solid rgba(20, 60, 120, 0.6); padding: 6px; margin: 8px 0;
+       background: rgba(200, 80, 40, 0.25); }
+.thin { border: 1px solid #333333; }
+.under { text-decoration: underline; }
+.strike { text-decoration: line-through; }
+.up { width: 480px; height: 320px; background-image: url(../local/images/shore.png);
+      background-size: 480px 320px; background-repeat: no-repeat; }
+.down { width: 60px; height: 40px; background-image: url(../local/images/harbour.jpg);
+        background-size: 60px 40px; background-repeat: no-repeat; }
+.clip { width: 120px; height: 30px; overflow: hidden; background-image: url(../local/images/boat.jpg);
+        background-repeat: no-repeat; }
+</style>
+</head>
+<body>
+<h1>Painter primitives</h1>
+<p>Plain text, <b>bold</b>, <i>italic</i>, <span class="under">underlined text</span>
+and <span class="strike">struck-through text</span>, at more than one size:
+<small>small type</small> and <big>larger type</big>.</p>
+<ul><li>A disc for the first item</li><li>and for the second</li></ul>
+<ol><li>A numbered item</li><li>and another</li></ol>
+<div class="box">A translucent fill inside a translucent border.</div>
+<div class="box thin">A one-pixel border.</div>
+<div class="up"></div>
+<div class="down"></div>
+<div class="clip"></div>
+<p><img src="../local/images/boat.jpg" alt="A boat"></p>
+</body>
+</html>

@@ -1,10 +1,11 @@
 #include "render.h"
 
+#include "paint.h"
+
 #include "cutil.h"
 #include "dfs.h"
 #include "shaper.h"
 
-#include <cairo/cairo.h>
 #include <ctype.h>
 #include <errno.h>
 #include <ft2build.h>
@@ -18,9 +19,6 @@
 #include <stdlib.h>
 #include <string.h>
 
-#ifndef M_PI
-#define M_PI 3.14159265358979323846
-#endif
 
 typedef struct {
     char *path;
@@ -34,8 +32,7 @@ typedef struct {
 struct DRenderContext {
     int width;
     int height;
-    cairo_surface_t *surface;
-    cairo_t *cairo;
+    DPaint *paint;
     FT_Library freetype;
     DFontFile *files;
     size_t file_count;
@@ -264,12 +261,6 @@ static const DFontFile *select_font_file(DRenderContext *context, const char *re
     return best;
 }
 
-static void set_color(cairo_t *cairo, DRenderColor color)
-{
-    cairo_set_source_rgba(cairo, color.red / 255.0, color.green / 255.0,
-                          color.blue / 255.0, color.alpha / 255.0);
-}
-
 DRenderContext *d_render_create(int width, int height, const char *font_dir)
 {
     if (width <= 0 || height <= 0) return NULL;
@@ -277,15 +268,11 @@ DRenderContext *d_render_create(int width, int height, const char *font_dir)
     if (!context) return NULL;
     context->width = width;
     context->height = height;
-    context->surface = cairo_image_surface_create(CAIRO_FORMAT_ARGB32, width, height);
-    context->cairo = cairo_create(context->surface);
-    if (cairo_status(context->cairo) != CAIRO_STATUS_SUCCESS ||
-        FT_Init_FreeType(&context->freetype) != 0) {
+    context->paint = d_paint_create(width, height);
+    if (!context->paint || FT_Init_FreeType(&context->freetype) != 0) {
         d_render_destroy(context);
         return NULL;
     }
-    cairo_set_source_rgb(context->cairo, 0.96, 0.95, 0.92);
-    cairo_paint(context->cairo);
     load_fonts(context, font_dir);
     return context;
 }
@@ -300,31 +287,25 @@ void d_render_destroy(DRenderContext *context)
     }
     free(context->files);
     if (context->freetype) FT_Done_FreeType(context->freetype);
-    if (context->cairo) cairo_destroy(context->cairo);
-    if (context->surface) cairo_surface_destroy(context->surface);
+    d_paint_destroy(context->paint);
     free(context);
 }
 
 int d_render_write_png(DRenderContext *context, const char *path)
 {
     if (!context || !path) return 0;
-    cairo_surface_flush(context->surface);
-    return cairo_surface_write_to_png(context->surface, path) == CAIRO_STATUS_SUCCESS;
+    return d_paint_write_png(context->paint, path);
 }
 
 void d_render_clear(DRenderContext *context)
 {
     if (!context) return;
-    cairo_save(context->cairo);
-    cairo_set_source_rgb(context->cairo, 0.96, 0.95, 0.92);
-    cairo_set_operator(context->cairo, CAIRO_OPERATOR_SOURCE);
-    cairo_paint(context->cairo);
-    cairo_restore(context->cairo);
+    d_paint_clear(context->paint);
 }
 
-void *d_render_surface(DRenderContext *context)
+bool d_render_pixels(DRenderContext *context, DRenderPixels *pixels)
 {
-    return context ? context->surface : NULL;
+    return context && d_paint_pixels(context->paint, pixels);
 }
 
 DRenderFont *d_render_font_create(DRenderContext *context, const char *face_name,
@@ -502,22 +483,10 @@ static void draw_glyph(DRenderContext *context, DRenderFont *font, unsigned int 
     if (FT_Load_Glyph(font->face, glyph, FT_LOAD_DEFAULT) != 0) return;
     if (FT_Render_Glyph(font->face->glyph, FT_RENDER_MODE_NORMAL) != 0) return;
     FT_GlyphSlot slot = font->face->glyph;
-    if (slot->bitmap.width == 0 || slot->bitmap.rows == 0) return;
-    cairo_surface_t *mask = cairo_image_surface_create(CAIRO_FORMAT_A8,
-                                                        slot->bitmap.width, slot->bitmap.rows);
-    if (cairo_surface_status(mask) != CAIRO_STATUS_SUCCESS) return;
-    unsigned char *target = cairo_image_surface_get_data(mask);
-    int stride = cairo_image_surface_get_stride(mask);
-    for (unsigned int row = 0; row < slot->bitmap.rows; ++row) {
-        const unsigned char *source = slot->bitmap.buffer + row * slot->bitmap.pitch;
-        memcpy(target + row * stride, source, slot->bitmap.width);
-    }
-    cairo_surface_mark_dirty(mask);
-    set_color(context->cairo, color);
-    cairo_mask_surface(context->cairo, mask,
-                       x + slot->bitmap_left,
-                       baseline - slot->bitmap_top);
-    cairo_surface_destroy(mask);
+    if (slot->bitmap.width == 0 || slot->bitmap.rows == 0 || slot->bitmap.pitch <= 0) return;
+    d_paint_mask(context->paint, slot->bitmap.buffer, (int)slot->bitmap.width,
+                 (int)slot->bitmap.rows, slot->bitmap.pitch,
+                 x + slot->bitmap_left, baseline - slot->bitmap_top, color);
 }
 
 void d_render_draw_text(DRenderContext *context, const char *text, DRenderFont *font,
@@ -530,28 +499,16 @@ void d_render_draw_text(DRenderContext *context, const char *text, DRenderFont *
     if (!infos) return;
     double pen_x = position.x;
     double baseline = position.y + position.height - font->descent;
-    cairo_save(context->cairo);
     for (unsigned int i = 0; i < count; ++i) {
         double x = pen_x + positions[i].x_offset / 64.0;
         double y = baseline - positions[i].y_offset / 64.0;
         draw_glyph(context, font, infos[i].codepoint, x, y, color);
         pen_x += positions[i].x_advance / 64.0;
     }
-    if (font->decoration & 0x01u) {
-        set_color(context->cairo, color);
-        cairo_set_line_width(context->cairo, 1.0);
-        cairo_move_to(context->cairo, position.x, baseline + 1.0);
-        cairo_line_to(context->cairo, pen_x, baseline + 1.0);
-        cairo_stroke(context->cairo);
-    }
-    if (font->decoration & 0x02u) {
-        set_color(context->cairo, color);
-        cairo_set_line_width(context->cairo, 1.0);
-        cairo_move_to(context->cairo, position.x, baseline - font->size * 0.35);
-        cairo_line_to(context->cairo, pen_x, baseline - font->size * 0.35);
-        cairo_stroke(context->cairo);
-    }
-    cairo_restore(context->cairo);
+    if (font->decoration & 0x01u)
+        d_paint_rule(context->paint, position.x, pen_x, baseline + 1.0, 1.0, color);
+    if (font->decoration & 0x02u)
+        d_paint_rule(context->paint, position.x, pen_x, baseline - font->size * 0.35, 1.0, color);
     free(infos);
     free(positions);
 }
@@ -559,71 +516,24 @@ void d_render_draw_text(DRenderContext *context, const char *text, DRenderFont *
 void d_render_fill(DRenderContext *context, DRenderRect rect, DRenderColor color)
 {
     if (!context || !color.alpha) return;
-    cairo_save(context->cairo);
-    set_color(context->cairo, color);
-    cairo_rectangle(context->cairo, rect.x, rect.y, rect.width, rect.height);
-    cairo_fill(context->cairo);
-    cairo_restore(context->cairo);
+    d_paint_fill(context->paint, rect, color);
 }
 
-/* Cairo reads the caller's buffer directly rather than taking a copy, so the
-   surface is finished before this returns and the caller's pixels are free to
-   go. Scaling happens on the pattern rather than by resampling the source,
-   which keeps the decoder ignorant of how large the image will be shown. */
+/* The caller keeps its pixels: the painter reads them and is done with them
+   before this returns. Scaling happens here rather than in the decoder,
+   which stays ignorant of how large the image will be shown. */
 void d_render_draw_image(DRenderContext *context, DRenderRect rect,
                          const uint32_t *pixels, int width, int height)
 {
     if (!context || !pixels || width <= 0 || height <= 0) return;
-    if (rect.width <= 0 || rect.height <= 0) return;
-    int stride = cairo_format_stride_for_width(CAIRO_FORMAT_ARGB32, width);
-    if (stride < 0) return;
-    cairo_surface_t *image = NULL;
-    unsigned char *packed = NULL;
-    if (stride == width * 4) {
-        image = cairo_image_surface_create_for_data((unsigned char *)pixels,
-                                                    CAIRO_FORMAT_ARGB32,
-                                                    width, height, stride);
-    } else {
-        /* Cairo rows are padded to its own alignment, which a tightly packed
-           decode does not match at every width. */
-        packed = malloc((size_t)stride * (size_t)height);
-        if (!packed) return;
-        for (int y = 0; y < height; ++y)
-            memcpy(packed + (size_t)y * (size_t)stride, pixels + (size_t)y * (size_t)width,
-                   (size_t)width * 4);
-        image = cairo_image_surface_create_for_data(packed, CAIRO_FORMAT_ARGB32,
-                                                    width, height, stride);
-    }
-    if (!image || cairo_surface_status(image) != CAIRO_STATUS_SUCCESS) {
-        if (image) cairo_surface_destroy(image);
-        free(packed);
-        return;
-    }
-    cairo_save(context->cairo);
-    cairo_rectangle(context->cairo, rect.x, rect.y, rect.width, rect.height);
-    cairo_clip(context->cairo);
-    cairo_translate(context->cairo, rect.x, rect.y);
-    cairo_scale(context->cairo, (double)rect.width / width, (double)rect.height / height);
-    cairo_set_source_surface(context->cairo, image, 0, 0);
-    cairo_pattern_set_filter(cairo_get_source(context->cairo), CAIRO_FILTER_GOOD);
-    cairo_paint(context->cairo);
-    cairo_restore(context->cairo);
-    cairo_surface_finish(image);
-    cairo_surface_destroy(image);
-    free(packed);
+    d_paint_image(context->paint, rect, pixels, width, height);
 }
 
 void d_render_stroke(DRenderContext *context, DRenderRect rect, int width,
                      DRenderColor color)
 {
     if (!context || width <= 0 || !color.alpha) return;
-    cairo_save(context->cairo);
-    set_color(context->cairo, color);
-    cairo_set_line_width(context->cairo, width);
-    cairo_rectangle(context->cairo, rect.x + width / 2.0, rect.y + width / 2.0,
-                    rect.width - width, rect.height - width);
-    cairo_stroke(context->cairo);
-    cairo_restore(context->cairo);
+    d_paint_stroke(context->paint, rect, width, color);
 }
 
 void d_render_draw_marker(DRenderContext *context, DRenderRect rect,
@@ -641,26 +551,20 @@ void d_render_draw_marker(DRenderContext *context, DRenderRect rect,
         }
         return;
     }
-    cairo_save(context->cairo);
-    set_color(context->cairo, color);
-    cairo_arc(context->cairo, rect.x + rect.width / 2.0, rect.y + rect.height / 2.0,
-              rect.width > 3 ? rect.width / 4.0 : 2.0, 0, 2 * M_PI);
-    cairo_fill(context->cairo);
-    cairo_restore(context->cairo);
+    d_paint_disc(context->paint, rect.x + rect.width / 2.0, rect.y + rect.height / 2.0,
+                 rect.width > 3 ? rect.width / 4.0 : 2.0, color);
 }
 
 void d_render_set_clip(DRenderContext *context, DRenderRect rect)
 {
     if (!context) return;
-    cairo_save(context->cairo);
-    cairo_rectangle(context->cairo, rect.x, rect.y, rect.width, rect.height);
-    cairo_clip(context->cairo);
+    d_paint_clip_push(context->paint, rect);
     ++context->clip_depth;
 }
 
 void d_render_del_clip(DRenderContext *context)
 {
     if (!context || !context->clip_depth) return;
-    cairo_restore(context->cairo);
+    d_paint_clip_pop(context->paint);
     --context->clip_depth;
 }

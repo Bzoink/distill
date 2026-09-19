@@ -11,7 +11,6 @@ extern "C" {
 
 typedef struct DRenderContext DRenderContext;
 typedef struct DRenderFont DRenderFont;
-typedef struct DLiteHtmlDocument DLiteHtmlDocument;
 
 typedef struct {
     uint8_t red;
@@ -26,6 +25,17 @@ typedef struct {
     int width;
     int height;
 } DRenderRect;
+
+/* Pixels a context has drawn: 32-bit words, 0xAARRGGBB with colour
+   multiplied by alpha -- Cairo's ARGB32, a framebuffer's XRGB8888 -- and
+   `stride` bytes from one row to the next, which callers must not assume is
+   width * 4. The context owns them. */
+typedef struct {
+    uint32_t *data;
+    int width;
+    int height;
+    int stride;
+} DRenderPixels;
 
 typedef struct {
     int height;
@@ -96,7 +106,7 @@ DRenderContext *d_render_create(int width, int height, const char *font_dir);
 void d_render_destroy(DRenderContext *context);
 int d_render_write_png(DRenderContext *context, const char *path);
 void d_render_clear(DRenderContext *context);
-void *d_render_surface(DRenderContext *context);
+bool d_render_pixels(DRenderContext *context, DRenderPixels *pixels);
 
 DRenderFont *d_render_font_create(DRenderContext *context, const char *face_name,
                                   int size, int weight, bool italic,
@@ -129,62 +139,6 @@ void d_render_draw_marker(DRenderContext *context, DRenderRect rect,
                           DRenderColor color, bool ordered, int index);
 void d_render_set_clip(DRenderContext *context, DRenderRect rect);
 void d_render_del_clip(DRenderContext *context);
-
-/* Upper bound on an auto-sized reader surface, in pixels. */
-#define DISTILL_MAX_RENDER_HEIGHT 20000
-
-/* Laid-out height of the document at this width, or 0 if it cannot be laid
-   out. Passing height <= 0 to distill_litehtml_render uses this, bounded. */
-int distill_litehtml_content_height(const char *html, int width, const char *font_dir);
-
-/* A laid-out reader document and the fixed-size paint surface used to draw
-   visible bands from it. The document owns the returned surface. */
-DLiteHtmlDocument *distill_litehtml_document_create(const char *html, int width,
-                                                     int surface_height,
-                                                     const char *font_dir);
-void distill_litehtml_document_destroy(DLiteHtmlDocument *document);
-int distill_litehtml_document_content_height(const DLiteHtmlDocument *document);
-int distill_litehtml_document_render_region(DLiteHtmlDocument *document, int scroll_y);
-void *distill_litehtml_document_surface(DLiteHtmlDocument *document);
-size_t distill_litehtml_document_form_boxes(const DLiteHtmlDocument *document,
-                                            DFormBox *boxes, size_t box_capacity);
-/* Anchor URL under a document-space point, written to href_out; non-zero when
-   the point is over a link. Answers for inline anchors, which have no box. */
-int distill_litehtml_document_link_at(DLiteHtmlDocument *document, int x, int y,
-                                      char *href_out, size_t href_capacity);
-/* Returns the native input ID when a point belongs to a checkbox/radio label.
-   The GTK shell uses this to give the rendered label its normal click target. */
-int distill_litehtml_document_choice_id_at(DLiteHtmlDocument *document, int x, int y,
-                                           char *id_out, size_t id_capacity);
-
-size_t distill_litehtml_document_link_boxes(const DLiteHtmlDocument *document,
-                                            DLinkBox *boxes, size_t box_capacity);
-
-/* The text runs of the whole document, in the order they were drawn, which
-   for a reader page in normal flow is reading order. Collected once when the
-   document is laid out: the shell paints in bands, and a selection that could
-   only reach painted text would stop at the edge of the screen. */
-size_t distill_litehtml_document_text_boxes(DLiteHtmlDocument *document,
-                                            DTextBox *boxes, size_t box_capacity);
-/* Byte offset in run `index` for a point `x` pixels into its box. */
-size_t distill_litehtml_document_text_offset_at(DLiteHtmlDocument *document,
-                                                size_t index, int x);
-/* The x offset, within run `index`'s box, of the boundary at byte `offset`. */
-int distill_litehtml_document_text_x_at(DLiteHtmlDocument *document,
-                                        size_t index, size_t offset);
-
-/* One-shot region rendering for callers that do not need to retain a
-   document between paints. */
-int distill_litehtml_render_region(const char *html, const char *output_path,
-                                   int width, int viewport, int scroll_y,
-                                   const char *font_dir);
-
-size_t distill_litehtml_form_boxes(const char *html, int width, int height,
-                                   const char *font_dir, DFormBox *boxes,
-                                   size_t box_capacity);
-size_t distill_litehtml_link_boxes(const char *html, int width, int height,
-                                   const char *font_dir, DLinkBox *boxes,
-                                   size_t box_capacity);
 
 #ifdef __cplusplus
 }

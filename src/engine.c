@@ -2400,12 +2400,7 @@ static char *select_extraction(Engine *engine, const char *initial_json,
 }
 
 #ifdef DISTILL_RENDER
-extern int distill_litehtml_render(const char *html, const char *output_path,
-                                   int width, int height, const char *font_dir);
-/* Laid-out height of the reader page at a given width; see render.h. */
-extern int distill_litehtml_content_height(const char *html, int width,
-                                           const char *font_dir);
-#define DISTILL_MAX_RENDER_HEIGHT 20000
+#include "page.h"
 #endif
 
 #ifdef DISTILL_READER
@@ -4232,7 +4227,7 @@ static int run_page(const DEngineRequest *request)
         bool saved = !save_media_path || save_media_file(&engine, json, media_index, save_media_path);
         char *template = viewer_template(&engine, json, media_index,
                                          saved ? save_media_path : NULL);
-        if (!saved || !*template || !distill_litehtml_render(template, viewer_path,
+        if (!saved || !*template || !d_page_render_png(template, viewer_path,
                                                                render_width, render_height, font_dir)) {
             note("unable to render media viewer %s\n", viewer_path);
             result = 3;
@@ -4258,11 +4253,11 @@ static int run_page(const DEngineRequest *request)
            desktop shell sizes its scroll area from this. */
         int used_height = render_height;
         if (used_height <= 0 && *template) {
-            used_height = distill_litehtml_content_height(template, render_width, font_dir);
+            used_height = d_page_measure_height(template, render_width, font_dir);
             if (used_height < 1) used_height = 1;
             if (used_height > DISTILL_MAX_RENDER_HEIGHT) used_height = DISTILL_MAX_RENDER_HEIGHT;
         }
-        if (!template_ok || !*template || !distill_litehtml_render(template, render_path,
+        if (!template_ok || !*template || !d_page_render_png(template, render_path,
                                                                      render_width, used_height, font_dir)) {
             note("unable to render %s\n", render_path);
             result = 3;
