@@ -1,0 +1,26 @@
+# Distill's portable production source manifest.
+#
+# target|sources (comma-separated)|defines (comma-separated)|include directories (comma-separated)
+# {platform} is the selected src/platform backend. Paths are relative to the
+# repository root. The same deliberately plain format is readable by CMake,
+# host tooling and the Muroxi build without making either build system parse
+# the other's project files.
+distill-platform|src/platform/{platform}/clock.c,src/platform/{platform}/fs.c,src/platform/{platform}/proc.c,src/platform/{platform}/term.c,src/platform/{platform}/thread.c,src/datadir.c|DISTILL_INSTALL_DATADIR|src/platform,src
+distill-shaper|src/shaper.c||src
+distill-image|src/image.c||src
+distill-measure|src/measure.c||src
+distill-shell|src/form_submit.c,src/address.c,src/settings.c,src/media_transfer.c,src/engine_request.c||src
+distill-media-audio|src/media_audio.c,src/platform/{platform}/audio.c||src,external/src/miniaudio
+distill-reader|src/reader_walk.c,src/reader_markdown.c,src/reader_cells.c||src,external/install/include
+distill-render-core|src/render.c||src,external/install/include
+distill-paint|src/paint_soft.c||src
+distill-layout|src/reader_layout.c||src,external/install/include
+distill-engine|src/engine.c,src/engine_args.c,src/engine_host.c|DISTILL_READER=1|src,external/install/include
+distill-command|src/distill.c||src
+distill-host|src/distill_host.c||src
+distill-jsc|tools/distill_jsc.c||src,external/install/include
+distill-tui-core|src/tui_screen.c,src/term_image.c||src
+distill-termbox|src/termbox_impl.c||src,external/src/termbox2
+distill-tui|src/tui.c,src/app_state.c||src,external/src/termbox2,external/src/miniaudio
+distill-gtk|src/platform/linux/app.c,src/app_state.c||src,external/install/include
+distill-arm-b|src/distill.c,src/engine.c,src/engine_args.c||src,external/install/include

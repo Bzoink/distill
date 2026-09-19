@@ -3,6 +3,7 @@
 /external/src
 /external/install
 /build/
+/build-*/
 __pycache__/
 *.py[cod]
 reports/site-comparison/

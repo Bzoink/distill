@@ -11,6 +11,10 @@ Starts serve.py, drives the Phase 0 engine over each page, and checks the
     ./check.py --viewer DIR    Phase 2 media-viewer smoke render
     ./check.py --app           Phase 3 desktop-shell model smoke test
     ./check.py --tui           Phase 6 terminal shell, driven through a pty
+    ./check.py --static-link [BINARY]
+                                static artifact gate
+    ./check.py --symbols OBJECT...
+                                Muroxi symbol gate
     ./check.py --id 03-settle  one page
     ./check.py --live          also record the live rungs (never gates)
     ./check.py --keep-dom DIR  save each dumped DOM for inspection
@@ -1079,6 +1083,10 @@ def main():
                     help="run the Phase 3 desktop-shell model smoke test")
     ap.add_argument("--paint", action="store_true",
                     help="compare the software painter with Cairo, pixel by pixel")
+    ap.add_argument("--static-link", nargs="?", const="", metavar="BINARY",
+                    help="prove a static production binary has no loader or dlopen")
+    ap.add_argument("--symbols", nargs="+", metavar="OBJECT",
+                    help="check object/archive undefined symbols against Muroxi's allowlist")
     ap.add_argument("--stack", action="store_true",
                     help="model Muroxi's stacks: engine in 8 MiB, shell in 64 KiB")
     ap.add_argument("--in-process", action="store_true",
@@ -1094,8 +1102,20 @@ def main():
     ap.add_argument("--timeout", type=int, default=45, help="real-time cap per page, s")
     args = ap.parse_args()
 
+    if args.static_link is not None or args.symbols:
+        gate = os.path.join(os.path.dirname(HERE), "tools", "portable_gate.py")
+        command = [sys.executable, gate]
+        if args.static_link is not None:
+            command.append("--static-link")
+            if args.static_link:
+                command.append(args.static_link)
+        if args.symbols:
+            command += ["--symbols"] + args.symbols
+        result = subprocess.run(command)
+        return result.returncode
+
     if args.app:
-        incompatible = args.id or args.live or args.baseline or args.extract or args.render or args.viewer or args.paint or args.bundles or args.keep_dom or args.tui
+        incompatible = args.id or args.live or args.baseline or args.extract or args.render or args.viewer or args.paint or args.static_link is not None or args.symbols or args.bundles or args.keep_dom or args.tui
         if incompatible:
             ap.error("--app is a standalone Phase 3 shell smoke test")
         app = find_app()

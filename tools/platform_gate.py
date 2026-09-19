@@ -44,8 +44,8 @@ CXX_STANDARD = {
 }
 
 # Libraries the core may use. Each is portable C (or HarfBuzz-style C++ with
-# no runtime) that Muroxi already builds or can build -- or is on its way out
-# (litehtml, Cairo: muroxi_compat.md M3, M4).
+# no runtime) that Muroxi already builds or can build. Cairo remains only in
+# the host-side parity reference, outside this source gate.
 LIBRARIES = (
     "quickjs.h",        # QuickJS-ng
     "curl/",            # libcurl, on every platform
@@ -54,7 +54,6 @@ LIBRARIES = (
     "graphemebreak.h",  # libunibreak
     "png.h", "jpeglib.h", "webp/",      # image decoders
     "ft2build.h", "harfbuzz/",          # FreeType, HarfBuzz
-    "cairo/", "litehtml/",              # to be removed (M3, M4)
 )
 
 # Single-header libraries vendored under external/src, included by name.

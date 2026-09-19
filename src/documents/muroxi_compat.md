@@ -858,6 +858,28 @@ only the gaps listed in
 list in [What Distill uses, measured](#what-distill-uses-measured) is the
 gate's first expected output; the Distill-side rows in it are gone by then.
 
+#### M5 slice result (2026-09-19)
+
+The host-side portability slice is implemented:
+
+- `portability/sources.manifest` contains the 19 production targets and is
+  consumed by CMake and `tools/portable_manifest.py`; Muroxi can consume the
+  same plain format.
+- `DISTILL_STATIC_LINK=ON` selects static archives and adds a no-undefined
+  static link, with no shared-library fallback.
+- `tools/portable_gate.py` and `corpus/check.py` provide the `--static-link`
+  and `--symbols` gates, using the measured Muroxi symbol allowlist.
+- `tools/data_gate.py` checks the staged or installed data directory required
+  by the portable package.
+- The normal build and all 16 CTest tests pass, including the manifest and
+  data self-tests.
+
+The final static-musl corpus run is still pending: this Linux checkout does
+not have static archives for libcurl and the remaining font, image and text
+dependencies. The ordinary `build/distill` artifact is intentionally rejected
+by the static gate as dynamically linked. Completing M5 requires the static
+dependency profile supplied by the Muroxi build.
+
 ### M6 — the terminal on Muroxi
 
 The Muroxi backends for `dfs`, `dclock`, `dproc` and `dfetch`. Ports of
