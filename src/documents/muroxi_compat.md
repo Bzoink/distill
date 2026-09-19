@@ -4,6 +4,9 @@ Status: planned. Written 2026-09-18 against Distill `95a87cc` and Muroxi
 `b5c796ae0`. The stack facts were updated for Muroxi `eb15e557d`, which
 landed demand-grown stacks. The libc and curl facts were measured on
 2026-09-18 by comparing symbols; see [What Distill uses, measured](#what-distill-uses-measured).
+Updated 2026-09-19: M0 to M4 are done, M5's host side is built, and the
+framebuffer shell (FRAMEBUFFER_PLAN.md) exists on Linux, so M7 is now only the
+`libmxpresent` sink. Each phase below has its result.
 It sits beside [PLAN.md](PLAN.md) and
 [FRAMEBUFFER_PLAN.md](FRAMEBUFFER_PLAN.md). Where it changes something either
 of them decided, it says so and why; see
@@ -20,7 +23,10 @@ instead of the Linux ones.
 Most of the work is removal. Most of what makes Distill hard to port today
 is dependencies it does not need: litehtml (C++), Gumbo, Cairo, pixman,
 fontconfig, GTK and GLib. What stays is plain C that Muroxi either already
-builds or can build.
+builds or can build. *(2026-09-19: litehtml and Gumbo are gone (M4). Cairo is
+linked only by the `--paint` reference and the GTK host's window (M3). GTK and
+GLib remain only in `distill-gtk`. Distributions' HarfBuzz still brings GLib
+in, and a static dependency profile removes that (M5).)*
 
 **Muroxi can grow to meet Distill.** Muroxi is developed alongside Distill,
 and its side has offered to add what Distill needs, curl features included.
@@ -94,8 +100,11 @@ What that means for Distill:
   of throwing. M0 found this crashing on Linux too, and it is fixed: the limit
   is now the stack limit less 1 MiB. See
   [The engine as a library](#the-engine-as-a-library).
-- litehtml, QuickJS's parser, regexp engine and JSON code, and Readability's
-  tree walks are all recursive. The deepest recursion depends on the page.
+- QuickJS's parser, regexp engine and JSON code, and Readability's tree
+  walks are all recursive. The deepest recursion depends on the page. That
+  is engine code, which may go deeper than 64 KiB. The shells' layout,
+  `reader_layout`, recurses only to 48 levels of nesting
+  (`LAYOUT_DEPTH_MAX`). Deeper content is refused, not laid out.
 
 ### Memory, processes and files
 
@@ -119,13 +128,20 @@ What that means for Distill:
   `termios`, `TIOCGWINSZ`, pthreads with futex-backed mutexes and condition
   variables.
 - **Missing (measured):** `posix_spawnp`,
-  `posix_spawn_file_actions_addopen` and `pipe2`. Distill's
-  [media_transfer.c](../media_transfer.c) and [tui.c](../tui.c) use all three.
+  `posix_spawn_file_actions_addopen` and `pipe2`. Since M1 they are called
+  only in the Linux `dproc` backend
+  ([proc.c](../platform/linux/proc.c)). Both shells and media transfers use
+  them through it, and Muroxi's `dproc` backend needs them the same way.
   Muroxi adds them.
 - **Signals:** only HUP, INT, QUIT, KILL, TERM, CHLD, TSTP, CONT, TTIN, TTOU
   and WINCH. There is no SIGPIPE, SIGSEGV, SIGBUS, SIGFPE, SIGILL or SIGABRT
-  handling. [tui.c](../tui.c) installs handlers for several of these; on Muroxi
-  that must fail harmlessly rather than abort startup.
+  handling.
+  - Both shells install their crash restore through `d_proc_on_fatal_signal`,
+    which reports how many handlers took, and they run either way. On Muroxi
+    that fails harmlessly for the missing signals.
+  - The Linux console sink also needs SIGUSR1 and SIGUSR2 for VT switching,
+    and refuses to start without them. That is Linux only: on Muroxi the
+    console owns switching, and there is nothing to install.
 
 ### libc gaps that affect Distill's dependencies (measured)
 
@@ -202,6 +218,14 @@ int mx_present_client_close(struct mx_present_client *client);
   That is exactly the plan's `D_EVENT_SUSPEND`/`D_EVENT_RESUME`.
 - **There is no VT switching, `KD_GRAPHICS` or console restore to write.**
   Muroxi's console owns that.
+- **How the framebuffer shell maps onto it** (2026-09-19):
+  - `d_display_present` passes pixels, their stride and damage rectangles.
+    The shell sends the whole screen as one rectangle each frame, within the
+    32-rectangle limit; smaller damage is a later optimisation.
+  - Every sink copies through `d_display_copy`, which honours both strides.
+    The gate's memory sink pads its rows so a copy that does not is caught.
+  - The shell already handles `D_EVENT_SUSPEND` and `D_EVENT_RESUME`, and the
+    gate checks them.
 - **Template:** NetSurf's Muroxi adapter is the working example, in the Muroxi
   tree:
   - `sysroot/netsurf/muroxi_surface.c` (551 lines): presentation, raw
@@ -222,7 +246,13 @@ int mx_present_client_close(struct mx_present_client *client);
   would need a Muroxi change (see
   [What Muroxi adds for Distill](#what-muroxi-adds-for-distill)).
 - **There is no evdev.** FRAMEBUFFER_PLAN.md's raw-evdev pointer code does
-  not port.
+  not port. It lives only in the Linux console sink
+  ([display_console.c](../platform/linux/display_console.c)).
+- **The decoder exists** (2026-09-19): [input_decode.c](../input_decode.c)
+  in `distill-shell`, shared by both shells. It decodes keys, the Linux
+  console's function keys and SGR reports. It puts a cell click at the
+  centre of the cell in pixels, from the cell size it is given. `check.py
+  --fb` clicks and scrolls through it in cell coordinates, as Muroxi will.
 
 ### Audio
 
@@ -276,11 +306,11 @@ int mx_present_client_close(struct mx_present_client *client);
 | FreeType | Keep; **load faces from memory** (`FT_New_Memory_Face`) | Avoids relying on FreeType's file stream; NetSurf on Muroxi does the same |
 | HarfBuzz | Keep, optional; build the single-file amalgamation with `-fno-exceptions -fno-rtti`, no standard library | Builds without a C++ runtime. Without it, text falls back to unshaped advances |
 | libpng, libjpeg-turbo, libwebp, zlib | Keep behind [image.c](../image.c) | Muroxi has all four pinned |
-| libcurl + Mbed TLS | Keep behind the fetch interface | Muroxi has it. Mbed TLS on every platform gives one TLS behaviour everywhere; optional |
-| miniaudio | Keep for **decoding only** (`MA_NO_DEVICE_IO`); output through the audio interface | Its device backends need `dlopen` |
-| termbox2 | Keep for the TUI | Needs only `termios`, `poll` and ANSI |
-| litehtml, Gumbo | **Remove** | Replaced by our own layout; see below |
-| Cairo, pixman, fontconfig | **Remove** | Replaced by the software painter (FRAMEBUFFER_PLAN.md phase A) |
+| libcurl + Mbed TLS | Keep in the engine (not a `dfetch` seam; see the M1 result) | Muroxi has it. Mbed TLS on every platform gives one TLS behaviour everywhere; optional |
+| miniaudio | Keep for **decoding only** (`MA_NO_DEVICE_IO`); output through the audio interface | Its device backends need `dlopen`. *Done in M1:* the core decodes only, and devices are in the Linux `daudio` backend |
+| termbox2 | Keep for the TUI | Needs only `termios`, `poll` and ANSI. The framebuffer shell does not use it |
+| litehtml, Gumbo | **Removed** (M4) | Replaced by `reader_layout`; see below |
+| Cairo, pixman, fontconfig | **Removed** (M3) | Replaced by the software painter. Cairo survives only as the `--paint` reference and the GTK host's window surface |
 | GTK, GLib | **Remove from everything but a desktop host window**, if one is kept | See [The desktop](#the-desktop) |
 
 The result is all C, apart from HarfBuzz compiled as C++ with no C++ runtime.
@@ -292,8 +322,14 @@ site's page. That template is a closed vocabulary:
 - the reader walk's 7 block kinds ([reader_walk.h](../reader_walk.h));
 - 3 inline styles, plus links and images;
 - tables, cards and form controls;
-- about 60 fixed CSS rules, generated in `reader_template` in
-  [main.c](../main.c).
+- about 60 fixed CSS rules, generated in `reader_template`, now in
+  [engine.c](../engine.c).
+
+*(Done in M4, 2026-09-19; see the [M4 result](#m4-result-2026-09-19).
+`reader_layout` still reads the template's CSS itself. The C style table
+proposed below was not built. That parser has to read numbers without the
+locale: see the locale rule in
+[Portability rules for all code](#portability-rules-for-all-code).)*
 
 Several of those rules exist only to work around litehtml:
 - `<main>` lays out as an inline box, so the measure moved to `<body>`;
@@ -351,16 +387,21 @@ reaches the platform through these interfaces, one header each under
 | `dclock` | monotonic time, sleeping | `clock_gettime` | `clock_gettime` |
 | `dproc` | children and their output, waiting on several handles, fatal signals, stack limit, peak RSS, hand-off to the system's URI handler | `posix_spawn` + pipes + `poll` | `posix_spawn` + pipes + `poll` |
 | `dterm` | the controlling terminal: open, size in pixels, direct queries, restore from a signal handler | `/dev/tty` + termios | console tty + termios |
-| `ddisplay` + input | FRAMEBUFFER_PLAN.md's `DDisplay` | memory buffer, X11/Wayland window, fbdev + tty + evdev | memory buffer, `libmxpresent` console or compositor + stdin |
+| `ddisplay` + input | FRAMEBUFFER_PLAN.md's `DDisplay` | memory buffer (core code), X11 window (`distill-fb-x11` only), fbdev + tty + evdev | memory buffer, `libmxpresent` console or compositor + stdin |
 | `daudio` | PCM output | miniaudio device | `mx_sio_*` |
+| `dthread` | a thread with a set stack size, for the in-process engine (added in M2) | `pthread_attr_setstacksize` | the same |
 
-*(M1, 2026-09-19.)* All but two exist, in `src/platform/*.h` with backends
-in `src/platform/linux/`:
+*(M1, M2 and the framebuffer shell, 2026-09-19.)* All but `dfetch` exist, in
+`src/platform/*.h` with backends in `src/platform/linux/`:
 - **`dterm` was added.** The terminal shell's own terminal handling (the
   crash restore, the pixel size, capability queries) was OS code the table
   had no row for.
-- **`ddisplay` waits for the framebuffer shell** (FRAMEBUFFER_PLAN.md phase
-  B). No front end draws pixels to a screen without GTK yet.
+- **`ddisplay` came with the framebuffer shell** (2026-09-19,
+  FRAMEBUFFER_PLAN.md phase B). `src/platform/ddisplay.h` is chosen at run
+  time; the memory sink and the blitter are core code, and Linux has the
+  console (fbdev, tty, evdev) and, in `distill-fb-x11` only, a window. The
+  ANSI and SGR decoder is `src/input_decode.c`, in `distill-shell`. Muroxi's
+  backend is a `libmxpresent` sink beside them (M7).
 - **`dfetch` is not a seam, and stays libcurl in the engine.** libcurl is
   what both platforms use, so a per-OS interface around it would have one
   implementation, twice. What M1 needed from it was the concurrency limit,
@@ -439,7 +480,10 @@ Rules for the platform layer:
 ### The desktop
 
 Once the painter and layout are ours, the framebuffer shell runs in a desktop
-window as easily as on a console. The GTK shell then becomes either:
+window as easily as on a console. *(2026-09-19: it does. `distill-fb-x11` is
+the same shell in an X11 window, with input methods through XIM. It is
+built for development, not shipped, and has no clipboard, file chooser or
+accessibility.)* The GTK shell then becomes either:
 
 - **retired:** the framebuffer shell in an X11 or Wayland window; or
 - **a thin host:** a GTK window whose drawing area is one more display
@@ -457,7 +501,13 @@ either way.
 - **Types:** fixed-width types wherever a size crosses an interface; `size_t`
   for sizes, with checked multiplication.
 - **No locale-dependent calls.** `wcwidth` is already avoided; keep it that
-  way.
+  way. This includes `strtod`/`strtof` and `<ctype.h>`: use `d_strtod`,
+  `d_isspace` and the other helpers in `cutil.h`.
+  - Linux can hide this, because the engine never calls `setlocale`. GTK
+    does, and so does the X11 sink (for `LC_CTYPE`). Under a comma-decimal
+    locale such as sv_SE, `strtof` dropped every fractional CSS length in
+    the GTK window (fixed 2026-09-19, with a test run under that locale).
+  - Muroxi has no locales, so it hides the defect entirely.
 - **Stack:** no local buffer over 4 KiB. Large or long-lived buffers go on
   the heap or are `static`. No recursion without a stated depth bound. The
   shells stay within 64 KiB of stack; only the engine may go deeper.
@@ -483,19 +533,30 @@ least once, against a deliberately broken build, before it is trusted.
   The negative control is a fixture with deliberately deep script recursion,
   run with the JS limit raised to the whole 8 MiB: it must crash instead of
   throwing.
+
+  *Built in M2.* Since 2026-09-19 it runs both shells' suites, the terminal's
+  and the framebuffer's, in 64 KiB, and both must fail in 16 KiB. The limit
+  is set with `setrlimit` on the soft limit only. `ulimit -s` in a shell also
+  lowers the hard limit, so the engines the shell starts could not get their
+  8 MiB back.
 - **`--static-link`.** Link a fully static build against musl with
   `-Wl,--no-undefined` and no `dlopen`. This models "static, not glibc, no
-  loader".
+  loader". *Built in M5 (host side), with `--symbols`. Neither can pass yet:
+  there is no static dependency profile to link against.*
 - **`--symbols`.** Compare `nm -u` of the static link's Distill objects
   against a checked-in list of `libmxc.a`'s exported symbols, regenerated from
   Muroxi with `llvm-nm`. Any symbol outside the list is a named porting task,
   found on Linux.
 - **`--budget`.** Record peak memory, JS heap, fetch count and startup time for
   each corpus page. Fail when a page exceeds the budget the Muroxi package will
-  declare.
+  declare. *Not built as a separate gate.* Pages declare `max_rss_mib`,
+  `max_run_ms` and `max_fetches_at_once` in the manifest, and `--extract`
+  checks them. `tools/measure_budgets.py` is the measurement, and it is a
+  diagnostic.
 - **`--fb`** (FRAMEBUFFER_PLAN.md phase B), driven by a script of ANSI and SGR
   bytes: the byte stream the Muroxi console produces, cell coordinates
-  included.
+  included. *Built 2026-09-19* (`corpus/fb_suite.py`); its stride check is
+  shown to fail `distill-fb-defect`, and `--stack` runs it in 64 KiB.
 
 ## Delivery phases
 
@@ -561,6 +622,28 @@ Done. Measured on Linux against Distill with the fixes below applied.
 **The terminal shell** peaked at 20 KiB of stack and 7.4 MiB RSS across the
 TUI suite's 10 shell runs.
 
+**The framebuffer shell** was measured on 2026-09-19, once it existed. It
+used the same `DISTILL_STATS` line, and the memory display ran a script
+over `09-article` and `15-gallery`.
+
+| Screen | Reading | Image viewer open |
+|---|---|---|
+| no page, 64×64 (the process floor) | 8.6 MiB | — |
+| 1280×800 | 23 MiB | 28 MiB |
+| 1920×1080 | 35 MiB | 43 MiB |
+
+- Its stack peaked at 40 KiB at both sizes. `--stack` runs the whole
+  framebuffer suite in 64 KiB.
+- Memory grows with the screen, because the shell holds full-screen pixel
+  buffers:
+  - the composited screen;
+  - the page layer, cached so scrolling does not relayout;
+  - the viewer layer, while the viewer is open;
+  - the memory display's own device buffer, which on Muroxi is
+    `libmxpresent`'s.
+- The floor includes Linux's shared libraries, among them GLib, which
+  arrives through the distribution's HarfBuzz.
+
 **Startup with JavaScript parsed from source:**
 - compiling linkedom takes 6–7 ms per navigation;
 - compiling Readability takes 2–5 ms, and it happens twice on 6 of the 44
@@ -589,7 +672,8 @@ is a named refusal when exceeded, never a truncation.
 | Engine JS heap (`JS_SetMemoryLimit`) | 64 MiB | Covers 31 of the 33 usable live pages. The two above it are YouTube (86 MiB) and the Chart.js gallery (129 MiB, already at today's 128 MiB limit), and both are refused with the limit named |
 | Engine process memory (package quota) | 96 MiB | The largest RSS of a page within the heap budget is 73 MiB (Target). The Linux process floor is 17 MiB of mostly shared libraries, which a static Muroxi binary does not map the same way, so the margin is deliberate |
 | Terminal shell memory | 16 MiB | Measured 7.4 MiB. Fits Muroxi's declared 16 MiB default quota as it is |
-| Shell stack | within the guaranteed 64 KiB | Measured 20 KiB |
+| Framebuffer shell memory (package quota) | 48 MiB, for screens up to 1920×1080 | Measured 43 MiB at 1920×1080 with the viewer open, and 28 MiB at 1280×800. Muroxi's 16 MiB default does not fit even the process floor plus one 1080p frame. Proposed 2026-09-19; M7 re-measures on the target |
+| Shell stack | within the guaranteed 64 KiB | Measured 20 KiB (terminal) and 40 KiB (framebuffer) |
 | Engine stack | Muroxi's 8 MiB main-stack reservation, unchanged | The deepest real page used 345 KiB, so the per-package reservation item is not needed |
 | JS stack limit | the stack limit less 1 MiB: 7 MiB on Muroxi | See [The engine as a library](#the-engine-as-a-library) |
 | Fetches at once | Muroxi's stated cap (at least 4 asked), passed as `--max-fetches` | Median 1, 90th percentile 6, max 46 (figures above 1 may be one low; see the M1 result). The engine queues above the cap since M1 |
@@ -880,6 +964,20 @@ dependencies. The ordinary `build/distill` artifact is intentionally rejected
 by the static gate as dynamically linked. Completing M5 requires the static
 dependency profile supplied by the Muroxi build.
 
+*(2026-09-19.)* The framebuffer shell brought:
+- a 20th manifest target, `distill-fb`. Its Linux display backends come in
+  through `src/platform/{platform}/`;
+- a 17th CTest test, `distill-shell-input`.
+
+Its objects were measured against `libmxc`. The only new need is four
+math functions, listed in
+[What Muroxi adds for Distill](#what-muroxi-adds-for-distill).
+
+The same static profile also closes FRAMEBUFFER_PLAN.md phase H. Today GLib
+reaches `distill-fb` only through the distribution's HarfBuzz, which Arch's
+FreeType links too. A static HarfBuzz from the amalgamation, with FreeType,
+libpng, zlib, libjpeg, libwebp and libunibreak, removes it.
+
 ### M6 — the terminal on Muroxi
 
 The Muroxi backends for `dfs`, `dclock`, `dproc` and `dfetch`. Ports of
@@ -892,9 +990,17 @@ submits. This is gated by a Muroxi scenario, not by hand.
 
 ### M7 — the framebuffer on Muroxi
 
-The `libmxpresent` display backend for both providers, generation changes
-mapped to suspend and resume, and pointer events from the shared decoder
-converted from cells to pixels.
+*The shell exists (FRAMEBUFFER_PLAN.md, 2026-09-19); what is left here is the
+sink.* `src/platform/muroxi/display.c` and a `libmxpresent` sink implementing
+`display_sink.h`'s table, with the keyboard and SGR pointer on standard input
+through `src/input_decode.c`, as NetSurf's adapter does. The memory sink and
+`check.py --fb` need nothing from Muroxi.
+
+The `libmxpresent` display backend for both providers, and generation changes
+mapped to suspend and resume. The shell already handles those events, and the
+decoder already converts cells to pixels. The sink passes the cell size from
+`TIOCGWINSZ`, as the memory sink's `cell=` option does in the gate. The
+package declares the framebuffer shell's memory budget (see the M0 result).
 
 **Done when** on Muroxi a corpus article reads by keyboard and by mouse
 through the console provider and the compositor provider. The screen is
@@ -920,9 +1026,9 @@ work without it.
 |---|---|---|
 | `sinh cosh tanh asinh acosh atanh expm1 log1p hypot round lrint scalbn` in `libmxc`, with accuracy tests | QuickJS-ng (`Math`, number formatting) | The msun sources in the imported NetBSD tree are candidates. Check the accuracy of the existing functions too: JavaScript's `Math` results are visible to pages |
 | `pthread_cond_timedwait` and `pthread_condattr_setclock` (at least `CLOCK_MONOTONIC`) | QuickJS-ng's `cutils.h` (`Atomics.wait`) | Condition variables are already futex-backed, so this is the timed wait on top. The alternative is building QuickJS with `JS_HAVE_THREADS` 0, which is a Distill-side change for a POSIX gap |
-| `posix_spawnp`, `posix_spawn_file_actions_addopen` | [media_transfer.c](../media_transfer.c), [tui.c](../tui.c) | Launching helpers and redirecting their output to a file |
-| `pipe2` with `O_CLOEXEC` and `O_NONBLOCK` | [media_transfer.c](../media_transfer.c), [tui.c](../tui.c) | The engine's progress pipe must not leak into other children |
-| `realpath` | [main.c](../main.c) | Resolving a local file argument to a `file:` URL |
+| `posix_spawnp`, `posix_spawn_file_actions_addopen` | the `dproc` backend ([proc.c](../platform/linux/proc.c) on Linux), used by both shells and media transfers | Launching helpers and redirecting their output to a file |
+| `pipe2` with `O_CLOEXEC` and `O_NONBLOCK` | the `dproc` backend, as above | The engine's progress pipe must not leak into other children |
+| `realpath` | the `dfs` backend ([fs.c](../platform/linux/fs.c) on Linux) | Resolving a local file argument to a `file:` URL |
 | `strerror_r` (XSI form) | termbox2 | Terminal error messages |
 | `pthread_attr_setstacksize` in the shipped `libmxc.a` | M2's in-process engine | In source at Muroxi `eb15e557d`; the `artifacts/iso/libmxc.a` measured here predates it |
 | `poll` over all 32 descriptors, not only 0–15 | every Distill process | The engine holds stdio, the session file and a socket per transfer; the shell holds stdio, the engine pipes, transfers and audio. 16 is too tight to hold as a rule. Extending `poll` removes a limit that is lower than the descriptor table itself |
@@ -934,7 +1040,10 @@ work without it.
 
 | Item | Needed by | Note |
 |---|---|---|
+| `fmaxf fminf lround nearbyintf` in `libmxc` | `reader_layout.c`, `paint_soft.c` (M3, M4) | Found measuring `distill-fb` (2026-09-19); every other symbol its objects need is in `libmxc` or already listed here |
+| A HarfBuzz port, from the amalgamation with `-fno-exceptions -fno-rtti` and no C++ standard library | the framebuffer shell's shaping | Muroxi has FreeType (for NetSurf) but no HarfBuzz; without it text falls back to unshaped advances (see Dependencies) |
 | A per-process memory budget for the Distill engine: 96 MiB, with a 64 MiB JS heap inside it | M6 | M0 measured a median of 44 MiB and a 90th percentile of 69 MiB on live pages. The terminal shell fits the 16 MiB default as it is (7.4 MiB) |
+| A per-process memory budget for the framebuffer shell: 48 MiB | M7 | Measured 43 MiB at 1920×1080 with the image viewer open (2026-09-19; see the M0 result). The shell holds several full-screen buffers, so the need scales with the screen |
 
 ### Optional
 
@@ -978,18 +1087,34 @@ Measured 2026-09-18. The method was the `--symbols` gate done by hand:
 |---|---|---|
 | `sinh cosh tanh asinh acosh atanh expm1 log1p hypot round lrint scalbn` | QuickJS-ng | Muroxi adds |
 | `pthread_cond_timedwait`, `pthread_condattr_setclock` | QuickJS-ng `cutils.h` | Muroxi adds |
-| `posix_spawnp`, `posix_spawn_file_actions_addopen`, `pipe2` | `media_transfer.c`, `tui.c` | Muroxi adds |
-| `realpath` | `main.c` | Muroxi adds |
+| `posix_spawnp`, `posix_spawn_file_actions_addopen`, `pipe2` | `media_transfer.c`, `tui.c` (since M1, the `dproc` backend) | Muroxi adds |
+| `realpath` | `main.c` (since M1, the `dfs` backend) | Muroxi adds |
 | `strerror_r` | termbox2 | Muroxi adds |
 | `pthread_attr_setstacksize` | `media_audio.c` (miniaudio) | Muroxi has it in source; the archive is older |
-| `dlopen dlsym dlclose eventfd wcsrtombs sched_getscheduler sched_get_priority_min/max pthread_attr_setsched* pthread_attr_setinheritsched` | `media_audio.c`: miniaudio's device backends | **Distill:** build miniaudio with `MA_NO_DEVICE_IO` and `MA_NO_RUNTIME_LINKING`; PCM goes out through `daudio` |
-| `malloc_usable_size` | QuickJS-ng | None: `cutils.h` returns 0 on platforms it does not know, which only affects memory accounting |
-| libstdc++ and C++ ABI symbols (`__cxa_*`, `std::` containers and streams) | litehtml and its adapter | **Distill:** removed with litehtml in M4 |
+| `dlopen dlsym dlclose eventfd wcsrtombs sched_getscheduler sched_get_priority_min/max pthread_attr_setsched* pthread_attr_setinheritsched` | `media_audio.c`: miniaudio's device backends | **Distill, done in M1:** the audio core builds miniaudio with `MA_NO_DEVICE_IO`; devices live only in the Linux `daudio` backend, and PCM goes out through `daudio` |
+| `malloc_usable_size` | QuickJS-ng | None: `cutils.h` returns 0 on platforms it does not know. M0's sized allocator counts the heap without it |
+| libstdc++ and C++ ABI symbols (`__cxa_*`, `std::` containers and streams) | litehtml and its adapter | **Distill, done:** removed with litehtml in M4 |
 | `__isoc23_strtol` and similar, `__errno_location`, `_setjmp`, `__libc_single_threaded` | glibc's headers, not the source | None: compiled against `libmxc`'s headers these are `strtol`, `errno` and `setjmp`, all present |
 
 The curl side was measured the same way against `libcurl_https.a`: every
 curl function Distill calls is present, and so is the cookie engine. The only
 curl change is the profile and date parsing, above.
+
+### The framebuffer shell, measured 2026-09-19
+
+The same method was applied to `distill-fb`'s objects: the shell, the
+display sinks, `distill-shell`, the layout, render core, painter, image and
+audio libraries. Its Linux display backends were left out, since Muroxi
+replaces them. Beyond the rows above, `libmxc` lacks only four functions:
+
+| Undefined on Muroxi | Who needs it | Resolution |
+|---|---|---|
+| `fmaxf fminf lround nearbyintf` | `reader_layout.c`, `paint_soft.c` | Muroxi adds (Required later, above) |
+
+The measurement also found two needs of the shell's own that were removed in
+Distill rather than asked of Muroxi:
+- an `fmin`, now a comparison;
+- `__ctype_b_loc`, which is glibc's `isspace` in render.c, now `d_isspace`.
 
 ## Changes to other plans
 
@@ -1001,12 +1126,16 @@ marked where it was made.
 - **FRAMEBUFFER_PLAN.md, the page model.** That plan builds the framebuffer
   shell on the GTK shell's page model: `DLinkBox`, `DFormBox` and litehtml's
   render bands. This plan replaces that model with `reader_layout`'s box list
-  (M4), because litehtml cannot be built on Muroxi.
+  (M4), because litehtml cannot be built on Muroxi. *Done:* `distill-fb`
+  draws `DPage`, `reader_layout`'s page. It was fixed on the way to report
+  links inside paragraphs, which `d_page_link_boxes` had left out.
 - **FRAMEBUFFER_PLAN.md, input.** The tty and ANSI key decoder becomes shared
   core code with SGR mouse decoding added, because Muroxi delivers the pointer
   on the same stream. The evdev pointer stays a Linux-only input source.
+  *Done:* [input_decode.c](../input_decode.c), shared with the TUI.
 - **FRAMEBUFFER_PLAN.md, phase H.** "`ldd` shows no GLib" becomes "the static
   link passes `--symbols`", which is stronger and also covers Muroxi.
+  *Open:* that link waits on M5's static dependency profile.
 - **PLAN.md, language boundary.** The deliberate C++17 adapter at the
   rendering boundary goes away with litehtml. The only C++ left is HarfBuzz,
   built without a C++ runtime.
@@ -1015,6 +1144,7 @@ marked where it was made.
 
 - **The desktop host.** Retire the GTK shell, or keep it as a host window for
   the file chooser, clipboard, input methods and accessibility.
+  `distill-fb-x11` now shows what retiring it would look like.
 - **TLS everywhere.** Use Mbed TLS on Linux too, for identical TLS behaviour,
   or keep the distribution's curl.
 - **Shaping without C++.** Stay with HarfBuzz, or evaluate a C shaper such as

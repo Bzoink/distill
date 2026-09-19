@@ -24,11 +24,13 @@
 #include "engine_request.h"
 #include "form_submit.h"
 #include "image.h"
+#include "line_edit.h"
 #include "media_audio.h"
 #include "measure.h"
 #include "media_transfer.h"
 #include "reader_cells.h"
 #include "settings.h"
+#include "shell_nav.h"
 #include "term_image.h"
 #include "tui_screen.h"
 
@@ -76,27 +78,12 @@ typedef enum { PROMPT_NONE, PROMPT_ADDRESS, PROMPT_FIELD, PROMPT_SAVE_AS } Promp
 typedef struct {
     PromptKind kind;
     char label[160];
-    DBuffer text;
-    size_t cursor;           /* byte offset */
+    DLineEdit edit;
     bool secret;
     size_t control;
     char *url;
 } Prompt;
 
-typedef enum { NAV_NEW, NAV_RELOAD } NavKind;
-typedef struct {
-    DProc *engine;
-    DBuffer pending;
-    DBuffer diagnostics;
-    char *url;
-    char *template_path;
-    char *body_path;
-    char *request_path;
-    char *location;
-    int percent;
-    char phase[16];
-    NavKind kind;
-} Navigation;
 
 typedef enum { GRAPHICS_NONE, GRAPHICS_KITTY, GRAPHICS_SIXEL } Graphics;
 
@@ -136,8 +123,7 @@ typedef struct {
     char *engine;
     char *session_file;
 
-    Navigation nav;
-    bool loading;
+    DShellNav nav;
     Prompt prompt;
     bool popup_open;
     Popup popup;
@@ -557,89 +543,24 @@ static void dispose_history_page(DAppPage *page)
     if (page->template_path) d_fs_remove(page->template_path);
 }
 
-static void nav_cleanup(void)
-{
-    d_proc_free(tui.nav.engine);
-    if (tui.nav.body_path) { d_fs_remove(tui.nav.body_path); free(tui.nav.body_path); }
-    if (tui.nav.request_path) { d_fs_remove(tui.nav.request_path); free(tui.nav.request_path); }
-    dbuf_free(&tui.nav.pending);
-    dbuf_free(&tui.nav.diagnostics);
-    free(tui.nav.url);
-    free(tui.nav.template_path);
-    free(tui.nav.location);
-    tui.nav = (Navigation){0};
-    tui.loading = false;
-}
-
 static void nav_cancel(void)
 {
-    if (!tui.loading) return;
-    d_proc_terminate(tui.nav.engine);
-    if (tui.nav.template_path) d_fs_remove(tui.nav.template_path);
-    nav_cleanup();
+    if (!tui.nav.active) return;
+    d_nav_cancel(&tui.nav);
     set_status("Stopped");
 }
 
-/* A request body may hold a password: it goes to the engine in a private
-   file, never on its command line, where the process table can read it. */
-static char *write_private_body(const char *data)
-{
-    char *path = private_temp("distill-body");
-    if (!path) return NULL;
-    if (!d_fs_overwrite(path, data, strlen(data))) { d_fs_remove(path); free(path); return NULL; }
-    return path;
-}
-
 static void start_navigation(const char *url, const char *method, const char *body,
-                             bool https_guessed, NavKind kind)
+                             bool https_guessed, DNavKind kind)
 {
-    if (tui.loading) nav_cancel();
-    char *template_path = private_temp("distill-template");
-    if (!template_path) { set_status("Unable to create a temporary file"); return; }
-    char *body_path = NULL;
-    if (body && *body) {
-        body_path = write_private_body(body);
-        if (!body_path) {
-            d_fs_remove(template_path);
-            free(template_path);
-            set_status("Unable to stage the request body");
-            return;
-        }
-    }
-    char zoom[16];
-    snprintf(zoom, sizeof(zoom), "%d", tui.zoom);
-    DRequestFile request;
-    d_request_file_init(&request);
-    d_request_file_add(&request, "url", url);
-    d_request_file_add(&request, "template", template_path);
-    d_request_file_add(&request, "theme", tui.theme);
-    d_request_file_add(&request, "zoom", zoom);
-    d_request_file_add(&request, "progress", NULL);
-    if (https_guessed) d_request_file_add(&request, "https-optional", NULL);
-    if (method && *method) d_request_file_add(&request, "request-method", method);
-    if (body_path) d_request_file_add(&request, "request-data-file", body_path);
-    if (tui.session_file) d_request_file_add(&request, "session-file", tui.session_file);
-    d_request_file_add(&request, "script-cap-ms", "5000");
-    char *request_path = d_request_file_write(&request);
+    DNavOptions options = {.engine = tui.engine, .theme = tui.theme, .zoom = tui.zoom,
+                           .session_file = tui.session_file};
     char *error = NULL;
-    const char *argv[] = {tui.engine, "--request", request_path, NULL};
-    DProc *engine = request_path ? d_proc_spawn(argv, D_PROC_PIPE, D_PROC_PIPE, &error) : NULL;
-    if (!engine) {
-        set_status("Unable to start the engine %s", error ? error : request_path ? tui.engine
-                                                                 : "(no request file)");
+    if (!d_nav_start(&tui.nav, &options, url, method, body, https_guessed, kind, &error)) {
+        set_status("%s", error);
         free(error);
-        d_fs_remove(template_path); free(template_path);
-        if (body_path) { d_fs_remove(body_path); free(body_path); }
-        if (request_path) { d_fs_remove(request_path); free(request_path); }
         return;
     }
-    tui.nav = (Navigation){.engine = engine, .url = d_strdup(url),
-                           .template_path = template_path, .body_path = body_path,
-                           .request_path = request_path, .kind = kind};
-    dbuf_init(&tui.nav.pending);
-    dbuf_init(&tui.nav.diagnostics);
-    snprintf(tui.nav.phase, sizeof(tui.nav.phase), "fetch");
-    tui.loading = true;
     set_status("Loading %s", url);
 }
 
@@ -649,87 +570,24 @@ static void navigate(const char *url, const char *method, const char *body, bool
         set_status("Blocked: not an address a page can be loaded from");
         return;
     }
-    start_navigation(url, method, body, https_guessed, NAV_NEW);
+    start_navigation(url, method, body, https_guessed, D_NAV_NEW);
 }
 
-/* One record per line: "progress PERCENT PHASE" while the page loads,
-   "location URL" once the engine knows where the page really came from. */
-static void consume_progress(void)
+static void nav_service(void)
 {
-    char *start = tui.nav.pending.data;
-    if (!start) return;
-    char *newline;
-    while ((newline = memchr(start, '\n', (size_t)(tui.nav.pending.data + tui.nav.pending.length - start)))) {
-        *newline = '\0';
-        int percent = 0;
-        char phase[16] = "";
-        if (sscanf(start, "progress %d %15s", &percent, phase) == 2) {
-            tui.nav.percent = percent;
-            snprintf(tui.nav.phase, sizeof(tui.nav.phase), "%s", phase);
-        } else if (!strncmp(start, "location ", 9) && start[9]) {
-            free(tui.nav.location);
-            tui.nav.location = d_strdup(start + 9);
-        }
-        start = newline + 1;
-    }
-    size_t rest = (size_t)(tui.nav.pending.data + tui.nav.pending.length - start);
-    memmove(tui.nav.pending.data, start, rest);
-    tui.nav.pending.length = rest;
-}
-
-/* Read what one of the engine's streams has said. False once it has ended,
-   and the stream is then closed. */
-static bool drain(bool errors, DBuffer *into)
-{
-    int handle = errors ? d_proc_errors(tui.nav.engine) : d_proc_output(tui.nav.engine);
-    char buffer[4096];
-    for (;;) {
-        long got = d_handle_read(handle, buffer, sizeof(buffer));
-        if (got > 0) {
-            if (into->length < 256 * 1024) dbuf_append(into, buffer, (size_t)got);
-            continue;
-        }
-        if (got == D_READ_EMPTY) return true;
-        if (errors) d_proc_close_errors(tui.nav.engine);
-        else d_proc_close_output(tui.nav.engine);
-        return false;
-    }
-}
-
-static char *last_line(const DBuffer *text)
-{
-    if (!text->length) return d_strdup("the engine failed");
-    size_t end = text->length;
-    while (end && (text->data[end - 1] == '\n' || text->data[end - 1] == '\r')) --end;
-    size_t start = end;
-    while (start && text->data[start - 1] != '\n') --start;
-    /* The run's summary line says nothing to a reader. */
-    while (start && (!strncmp(text->data + start, "phase", 5) || end == start)) {
-        end = start ? start - 1 : 0;
-        while (end && (text->data[end - 1] == '\n')) --end;
-        start = end;
-        while (start && text->data[start - 1] != '\n') --start;
-    }
-    return end > start ? d_strndup(text->data + start, end - start) : d_strdup("the engine failed");
-}
-
-static void nav_finished(void)
-{
-    DProcStatus status = d_proc_wait(tui.nav.engine);
-    int code = status.exited ? status.code : -1;
-    const char *final_url = tui.nav.location && d_page_uri_allowed(tui.nav.location)
-                          ? tui.nav.location : tui.nav.url;
-    if (code == 0 || code == 4) {
-        char *url = d_strdup(final_url);
-        char *template_path = tui.nav.template_path;
-        tui.nav.template_path = NULL;
-        bool ok = tui.nav.kind == NAV_RELOAD
+    if (!tui.nav.active) return;
+    DNavOutcome outcome = d_nav_service(&tui.nav);
+    if (outcome == D_NAV_RUNNING) return;
+    if (outcome == D_NAV_LOADED || outcome == D_NAV_CHALLENGE) {
+        char *url = d_strdup(d_nav_final_url(&tui.nav));
+        char *template_path = d_nav_take_template(&tui.nav);
+        bool ok = tui.nav.kind == D_NAV_RELOAD
             ? d_app_history_replace_current(&tui.history, url, template_path, tui.theme, tui.zoom,
                                             dispose_history_page)
             : d_app_history_push(&tui.history, url, template_path, tui.theme, tui.zoom,
                                  dispose_history_page);
         if (ok && show_page_file(url, template_path)) {
-            if (code == 4)
+            if (outcome == D_NAV_CHALLENGE)
                 set_status("This site answered with a bot challenge; Distill shows what it sent and does not solve those");
             else
                 set_status("%s", tui.page.layout->title[0] ? tui.page.layout->title : "Ready");
@@ -739,23 +597,11 @@ static void nav_finished(void)
         free(template_path);
         free(url);
     } else {
-        char *why = last_line(&tui.nav.diagnostics);
+        char *why = d_nav_failure(&tui.nav);
         set_status("Could not load %s: %s", tui.nav.url, why);
         free(why);
-        if (tui.nav.template_path) d_fs_remove(tui.nav.template_path);
     }
-    nav_cleanup();
-}
-
-static void nav_service(void)
-{
-    if (!tui.loading) return;
-    if (d_proc_output(tui.nav.engine) >= 0) {
-        drain(false, &tui.nav.pending);
-        consume_progress();
-    }
-    if (d_proc_errors(tui.nav.engine) >= 0) drain(true, &tui.nav.diagnostics);
-    if (d_proc_output(tui.nav.engine) < 0 && d_proc_errors(tui.nav.engine) < 0) nav_finished();
+    d_nav_cleanup(&tui.nav);
 }
 
 static void show_history_current(void)
@@ -910,17 +756,15 @@ static void prompt_open(PromptKind kind, const char *label, const char *initial,
 {
     tui.prompt.kind = kind;
     snprintf(tui.prompt.label, sizeof(tui.prompt.label), "%s", label);
-    dbuf_free(&tui.prompt.text);
-    dbuf_init(&tui.prompt.text);
-    dbuf_puts(&tui.prompt.text, initial ? initial : "");
-    tui.prompt.cursor = tui.prompt.text.length;
+    d_line_edit_free(&tui.prompt.edit);
+    d_line_edit_init(&tui.prompt.edit, initial);
     tui.prompt.secret = secret;
 }
 
 static void prompt_close(void)
 {
     tui.prompt.kind = PROMPT_NONE;
-    dbuf_free(&tui.prompt.text);
+    d_line_edit_free(&tui.prompt.edit);
     free(tui.prompt.url);
     tui.prompt.url = NULL;
     tb_hide_cursor();
@@ -1409,8 +1253,8 @@ static void draw_prompt(int y)
     int x = d_screen_text(&tui.screen, 1, y, tui.width, tui.prompt.label, bar.fg, bar.bg, bar.attrs | D_SCREEN_BOLD);
     DBuffer shown;
     dbuf_init(&shown);
-    const char *text = tui.prompt.text.data ? tui.prompt.text.data : "";
-    size_t cursor = tui.prompt.cursor;
+    const char *text = d_line_edit_text(&tui.prompt.edit);
+    size_t cursor = tui.prompt.edit.cursor;
     if (tui.prompt.secret) {
         int before = reader_text_cells(text, cursor);
         int all = reader_text_cells(text, strlen(text));
@@ -1443,7 +1287,7 @@ static void draw_status(void)
     Look bar = bar_look();
     d_screen_fill(&tui.screen, 0, y, tui.width, bar.fg, bar.bg, bar.attrs);
     char text[1100];
-    if (tui.loading)
+    if (tui.nav.active)
         snprintf(text, sizeof(text), "Loading %d%% %s \xe2\x80\x94 Esc stops", tui.nav.percent, tui.nav.phase);
     else if (tui.transfer)
         snprintf(text, sizeof(text), "%s \xe2\x80\x94 Esc cancels",
@@ -1747,50 +1591,9 @@ static void render(void)
 
 /* ---- input --------------------------------------------------------------- */
 
-static void prompt_insert(uint32_t ch)
-{
-    char bytes[8];
-    int n = tb_utf8_unicode_to_char(bytes, ch);
-    if (n <= 0) return;
-    DBuffer *text = &tui.prompt.text;
-    size_t at = tui.prompt.cursor;
-    dbuf_reserve(text, (size_t)n);
-    memmove(text->data + at + n, text->data + at, text->length - at);
-    memcpy(text->data + at, bytes, (size_t)n);
-    text->length += (size_t)n;
-    text->data[text->length] = '\0';
-    tui.prompt.cursor += (size_t)n;
-}
-
-static size_t previous_char(const char *text, size_t at)
-{
-    if (!at) return 0;
-    --at;
-    while (at && ((unsigned char)text[at] & 0xc0) == 0x80) --at;
-    return at;
-}
-
-static size_t next_char(const char *text, size_t length, size_t at)
-{
-    if (at >= length) return length;
-    ++at;
-    while (at < length && ((unsigned char)text[at] & 0xc0) == 0x80) ++at;
-    return at;
-}
-
-static void prompt_delete(size_t from, size_t to)
-{
-    DBuffer *text = &tui.prompt.text;
-    if (to <= from) return;
-    memmove(text->data + from, text->data + to, text->length - to);
-    text->length -= to - from;
-    text->data[text->length] = '\0';
-    tui.prompt.cursor = from;
-}
-
 static void prompt_commit(bool submit, bool advance)
 {
-    const char *text = tui.prompt.text.data ? tui.prompt.text.data : "";
+    const char *text = d_line_edit_text(&tui.prompt.edit);
     PromptKind kind = tui.prompt.kind;
     if (kind == PROMPT_ADDRESS) {
         bool guessed = false;
@@ -1826,36 +1629,25 @@ static void prompt_commit(bool submit, bool advance)
 
 static void prompt_key(const struct tb_event *event)
 {
-    DBuffer *text = &tui.prompt.text;
-    const char *data = text->data ? text->data : "";
+    DLineEdit *edit = &tui.prompt.edit;
     switch (event->key) {
     case TB_KEY_ESC: prompt_close(); return;
     case TB_KEY_ENTER: prompt_commit(true, false); return;
     case TB_KEY_TAB: prompt_commit(false, true); return;
     case TB_KEY_BACKSPACE:
-    case TB_KEY_BACKSPACE2:
-        prompt_delete(previous_char(data, tui.prompt.cursor), tui.prompt.cursor);
-        return;
-    case TB_KEY_DELETE:
-        prompt_delete(tui.prompt.cursor, next_char(data, text->length, tui.prompt.cursor));
-        return;
-    case TB_KEY_ARROW_LEFT: tui.prompt.cursor = previous_char(data, tui.prompt.cursor); return;
-    case TB_KEY_ARROW_RIGHT: tui.prompt.cursor = next_char(data, text->length, tui.prompt.cursor); return;
+    case TB_KEY_BACKSPACE2: d_line_edit_backspace(edit); return;
+    case TB_KEY_DELETE: d_line_edit_delete(edit); return;
+    case TB_KEY_ARROW_LEFT: d_line_edit_left(edit); return;
+    case TB_KEY_ARROW_RIGHT: d_line_edit_right(edit); return;
     case TB_KEY_HOME:
-    case TB_KEY_CTRL_A: tui.prompt.cursor = 0; return;
+    case TB_KEY_CTRL_A: d_line_edit_home(edit); return;
     case TB_KEY_END:
-    case TB_KEY_CTRL_E: tui.prompt.cursor = text->length; return;
-    case TB_KEY_CTRL_U: prompt_delete(0, tui.prompt.cursor); return;
-    case TB_KEY_CTRL_W: {
-        size_t at = tui.prompt.cursor;
-        while (at && data[at - 1] == ' ') --at;
-        while (at && data[at - 1] != ' ') --at;
-        prompt_delete(at, tui.prompt.cursor);
-        return;
-    }
+    case TB_KEY_CTRL_E: d_line_edit_end(edit); return;
+    case TB_KEY_CTRL_U: d_line_edit_kill_before(edit); return;
+    case TB_KEY_CTRL_W: d_line_edit_delete_word(edit); return;
     default: break;
     }
-    if (event->ch) prompt_insert(event->ch);
+    if (event->ch) d_line_edit_insert_codepoint(edit, event->ch);
 }
 
 static void popup_key(const struct tb_event *event)
@@ -1935,7 +1727,7 @@ static void scroll_table(int direction)
 static void reload(void)
 {
     const DAppPage *page = d_app_history_current(&tui.history);
-    if (page) start_navigation(page->url, NULL, NULL, false, NAV_RELOAD);
+    if (page) start_navigation(page->url, NULL, NULL, false, D_NAV_RELOAD);
 }
 
 static void page_key(const struct tb_event *event)
@@ -1977,7 +1769,7 @@ static void page_key(const struct tb_event *event)
         return;
     case TB_KEY_F5: reload(); return;
     case TB_KEY_ESC:
-        if (tui.loading) nav_cancel();
+        if (tui.nav.active) nav_cancel();
         else if (tui.transfer) transfer_cancel();
         else tui.page.focus = -1;
         return;
@@ -2135,7 +1927,7 @@ int main(int argc, char **argv)
     }
     tui.transport_row = -1;
     tui.page.focus = -1;
-    tui.nav = (Navigation){0};
+    tui.nav = (DShellNav){0};
     d_app_history_init(&tui.history);
     char *start = NULL;
     load_settings(&start);
@@ -2178,15 +1970,11 @@ int main(int argc, char **argv)
         size_t count = 0;
         items[count++] = (DPollItem){tty_fd, false};
         items[count++] = (DPollItem){resize_fd, false};
-        int nav_out = -1, nav_err = -1, transfer = -1;
-        if (tui.loading && d_proc_output(tui.nav.engine) >= 0) {
-            nav_out = (int)count;
-            items[count++] = (DPollItem){d_proc_output(tui.nav.engine), false};
-        }
-        if (tui.loading && d_proc_errors(tui.nav.engine) >= 0) {
-            nav_err = (int)count;
-            items[count++] = (DPollItem){d_proc_errors(tui.nav.engine), false};
-        }
+        int transfer = -1;
+        size_t nav_first = count;
+        int nav_handles[2];
+        size_t nav_count = d_nav_handles(&tui.nav, nav_handles, 2);
+        for (size_t i = 0; i < nav_count; ++i) items[count++] = (DPollItem){nav_handles[i], false};
         if (tui.transfer) {
             transfer = (int)count;
             items[count++] = (DPollItem){d_media_transfer_fd(tui.transfer), false};
@@ -2195,7 +1983,9 @@ int main(int argc, char **argv)
         media_audio_snapshot(&state);
         int timeout = state.phase == MEDIA_AUDIO_PLAYING ? 250 : tui.external_count ? 1000 : -1;
         if (d_poll(items, count, timeout) < 0) break;
-        if ((nav_out >= 0 && items[nav_out].ready) || (nav_err >= 0 && items[nav_err].ready)) nav_service();
+        bool nav_ready = false;
+        for (size_t i = 0; i < nav_count; ++i) nav_ready |= items[nav_first + i].ready;
+        if (nav_ready) nav_service();
         if (transfer >= 0 && items[transfer].ready) transfer_service();
         if (items[0].ready || items[1].ready) {
             /* A terminal sends Alt+key as Escape and the key in one write, and
@@ -2215,7 +2005,7 @@ int main(int argc, char **argv)
         reap_externals();
     }
 
-    if (tui.loading) nav_cancel();
+    if (tui.nav.active) nav_cancel();
     if (tui.transfer) transfer_cancel();
     audio_release();
     viewer_free_image();

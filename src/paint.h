@@ -50,6 +50,12 @@ void d_paint_image(DPaint *paint, DRenderRect rect, const uint32_t *pixels,
 
 void d_paint_disc(DPaint *paint, double cx, double cy, double radius, DRenderColor color);
 
+/* Opaque pixels copied as they are, their top-left at (x, y): one layer
+   composited onto another, as a shell puts a painted page under its chrome.
+   `stride` is the source's bytes per row. Honours the clip. */
+void d_paint_blit(DPaint *paint, int x, int y, const uint32_t *pixels, int width, int height,
+                  int stride);
+
 /* Clips nest: each narrows the last, and pop restores the one before. */
 void d_paint_clip_push(DPaint *paint, DRenderRect rect);
 void d_paint_clip_pop(DPaint *paint);

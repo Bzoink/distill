@@ -239,6 +239,11 @@ target_link_libraries(distill-form-submit-test PRIVATE distill-shell)
 distill_enable_assertions(distill-form-submit-test)
 add_test(NAME distill-form-submit COMMAND distill-form-submit-test)
 
+add_executable(distill-shell-input-test tests/shell_input_test.c)
+target_link_libraries(distill-shell-input-test PRIVATE distill-shell)
+distill_enable_assertions(distill-shell-input-test)
+add_test(NAME distill-shell-input COMMAND distill-shell-input-test)
+
 add_executable(distill-settings-test tests/settings_test.c)
 target_link_libraries(distill-settings-test PRIVATE distill-shell)
 # The reader's agreement with GKeyFile is checked against GKeyFile itself
@@ -485,6 +490,58 @@ if(EXISTS "${DISTILL_TERMBOX_DIR}/termbox2.h")
 else()
     message(STATUS "termbox2 not found under external/src/termbox2; skipping distill-tui")
 endif()
+# The framebuffer shell (FRAMEBUFFER_PLAN.md). distill-fb is the target: the
+# console sink, the memory sink the gates drive, and nothing that links GLib,
+# Cairo or X11. distill-fb-x11 is the development build, the same sources
+# with a window sink. distill-fb-defect is the stride gate's negative control:
+# its blit ignores both strides, and check.py --fb must see it.
+if(DISTILL_HAVE_RENDERER)
+    distill_manifest_sources(distill-fb DISTILL_FB_SOURCES)
+    distill_manifest_includes(distill-fb DISTILL_FB_INCLUDES)
+    set(DISTILL_FB_LIBRARIES
+        distill-shell
+        distill-layout
+        distill-render-core
+        distill-paint
+        distill-image
+        distill-media-audio
+        distill-measure
+        distill-version
+        m
+    )
+    add_executable(distill-fb ${DISTILL_FB_SOURCES})
+    target_include_directories(distill-fb PRIVATE ${DISTILL_FB_INCLUDES})
+    target_link_libraries(distill-fb PRIVATE ${DISTILL_FB_LIBRARIES})
+    set_target_properties(distill-fb PROPERTIES
+        BUILD_RPATH "${EXTERNAL_PREFIX}/lib"
+        INSTALL_RPATH "${EXTERNAL_PREFIX}/lib"
+    )
+    install(TARGETS distill-fb RUNTIME DESTINATION bin)
+
+    add_executable(distill-fb-defect ${DISTILL_FB_SOURCES})
+    target_include_directories(distill-fb-defect PRIVATE ${DISTILL_FB_INCLUDES})
+    target_compile_definitions(distill-fb-defect PRIVATE DISTILL_DISPLAY_DEFECT=1)
+    target_link_libraries(distill-fb-defect PRIVATE ${DISTILL_FB_LIBRARIES})
+    set_target_properties(distill-fb-defect PROPERTIES BUILD_RPATH "${EXTERNAL_PREFIX}/lib")
+
+    pkg_check_modules(DISTILL_X11 IMPORTED_TARGET x11 xext)
+    if(DISTILL_X11_FOUND)
+        add_executable(distill-fb-x11 ${DISTILL_FB_SOURCES}
+            src/platform/${DISTILL_PLATFORM}/display_x11.c)
+        target_include_directories(distill-fb-x11 PRIVATE ${DISTILL_FB_INCLUDES})
+        target_compile_definitions(distill-fb-x11 PRIVATE DISTILL_DISPLAY_X11=1)
+        target_compile_options(distill-fb-x11 PRIVATE $<$<COMPILE_LANGUAGE:C>:-Wno-pedantic>)
+        target_link_libraries(distill-fb-x11 PRIVATE ${DISTILL_FB_LIBRARIES} PkgConfig::DISTILL_X11)
+        set_target_properties(distill-fb-x11 PROPERTIES
+            BUILD_RPATH "${EXTERNAL_PREFIX}/lib"
+            INSTALL_RPATH "${EXTERNAL_PREFIX}/lib"
+        )
+        install(TARGETS distill-fb-x11 RUNTIME DESTINATION bin)
+    else()
+        message(STATUS "libX11 or libXext not found; skipping the distill-fb-x11 development build")
+    endif()
+endif()
+
 install(DIRECTORY profiles/ DESTINATION ${CMAKE_INSTALL_DATADIR}/distill/profiles
         FILES_MATCHING PATTERN "*.json")
 install(FILES share/welcome.html DESTINATION ${CMAKE_INSTALL_DATADIR}/distill)

@@ -2593,6 +2593,33 @@ bool d_page_pixels(DPage *page, DRenderPixels *pixels)
     return page && d_render_pixels(page->renderer, pixels);
 }
 
+DRenderContext *d_page_context(DPage *page)
+{
+    return page ? page->renderer : NULL;
+}
+
+static int anchor_y(const Box *box, const char *id, int depth)
+{
+    if (depth >= LAYOUT_DEPTH_MAX) return -1;
+    if (box->kind == BOX_ELEMENT && box->element) {
+        const char *own = element_attr(box->element, "id");
+        if (own && !strcmp(own, id))
+            return box->style->display == DISPLAY_INLINE && box->fragment_count
+                 ? box->fragments[0].y : border_box(box).y;
+    }
+    for (const Box *child = box->first; child; child = child->next) {
+        int y = anchor_y(child, id, depth + 1);
+        if (y >= 0) return y;
+    }
+    return -1;
+}
+
+int d_page_anchor_y(const DPage *page, const char *id)
+{
+    if (!page || !page->layout.root || !id || !*id) return -1;
+    return anchor_y(page->layout.root, id, 0);
+}
+
 static void collect_runs(DPage *page)
 {
     if (page->runs_collected || !page->layout.root) return;
@@ -2771,11 +2798,26 @@ static void collect_links(const Box *box, LinkCollect *out, int depth)
     if (depth >= LAYOUT_DEPTH_MAX) return;
     if (box->kind == BOX_ELEMENT && !strcmp(box->tag, "a")) {
         const char *href = element_attr(box->element, "href");
-        if (href && *href && box->width > 0 && box->height > 0) {
+        /* An inline link has no box of its own, only one per line it spans:
+           report what they cover together. */
+        Rect r = {box->x, box->y, box->width, box->height};
+        if (box->style->display == DISPLAY_INLINE && box->fragment_count) {
+            int x0 = INT_MAX, y0 = INT_MAX, x1 = INT_MIN, y1 = INT_MIN;
+            for (int i = 0; i < box->fragment_count; ++i) {
+                Rect f = box->fragments[i];
+                if (f.width <= 0 || f.height <= 0) continue;
+                if (f.x < x0) x0 = f.x;
+                if (f.y < y0) y0 = f.y;
+                if (f.x + f.width > x1) x1 = f.x + f.width;
+                if (f.y + f.height > y1) y1 = f.y + f.height;
+            }
+            if (x1 > x0 && y1 > y0) r = (Rect){x0, y0, x1 - x0, y1 - y0};
+        }
+        if (href && *href && r.width > 0 && r.height > 0) {
             if (out->count < out->capacity) {
                 DLinkBox *l = &out->boxes[out->count];
                 memset(l, 0, sizeof(*l));
-                *l = (DLinkBox){.x = box->x, .y = box->y, .width = box->width, .height = box->height};
+                *l = (DLinkBox){.x = r.x, .y = r.y, .width = r.width, .height = r.height};
                 copy_field(l->href, sizeof(l->href), href);
             }
             ++out->count;

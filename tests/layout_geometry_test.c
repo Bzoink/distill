@@ -158,6 +158,27 @@ static void test_heading_hierarchy(void)
    comma a strtof-based CSS parser read "2.5em" as 2 and junk and dropped the
    declaration: headings at body size, no paragraph margins, and every gate
    green because the engine never leaves the C locale. */
+/* Links inside a paragraph are inline and have no box of their own, only one
+   per line; the shells still need somewhere to focus and a list of the
+   page's media. Every one was missing, which no gate saw: the desktop found
+   clicks by point, and the only link with a box was the 1px section marker. */
+static void test_inline_links_have_boxes(void)
+{
+    const char *html =
+        "<!doctype html><html><body><p>Before <a href=\"distill-media:one\">the first</a> and "
+        "<a href=\"distill-media:two\">the second</a>.</p></body></html>";
+    DPage *page = d_page_create(html, 600, 400, DISTILL_TEST_FONT_DIR);
+    assert(page);
+    static DLinkBox boxes[4];
+    assert(d_page_link_boxes(page, boxes, 4) == 2);
+    assert(!strcmp(boxes[0].href, "distill-media:one") && !strcmp(boxes[1].href, "distill-media:two"));
+    assert(boxes[0].width > 10 && boxes[0].height > 5 && boxes[1].x > boxes[0].x + boxes[0].width);
+    char href[64];
+    assert(d_page_link_at(page, boxes[1].x + 2, boxes[1].y + boxes[1].height / 2, href, sizeof(href)));
+    assert(!strcmp(href, "distill-media:two"));
+    d_page_destroy(page);
+}
+
 static void test_heading_hierarchy_in_comma_locale(void)
 {
     static const char *const locales[] = {"sv_SE.UTF-8", "de_DE.UTF-8", "fr_FR.UTF-8", "nl_NL.UTF-8"};
@@ -454,6 +475,7 @@ int main(void)
     test_bundled_font_roles_are_available();
     test_heading_hierarchy();
     test_heading_hierarchy_in_comma_locale();
+    test_inline_links_have_boxes();
 
     puts("reader-layout-geometry: ok");
     return 0;

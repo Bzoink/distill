@@ -1,6 +1,9 @@
 # Framebuffer plan
 
-Status: planned. Phase 5 of [PLAN.md](PLAN.md). Where this plan changes
+Status: built (2026-09-19). Phases A to G are done and gated; the console
+sink (D) is written and waits on the hand check on a VT that no gate can
+make; H is measured and waits on the static dependency profile. Phase 5 of
+[PLAN.md](PLAN.md). Where this plan changes
 something PLAN.md decided, it says so and says why; see
 [Changes to PLAN.md](#changes-to-planmd).
 
@@ -246,6 +249,25 @@ layout uses: address bar, status line, progress, the audio transport and menus f
 theme and zoom. Nothing here is a widget toolkit. It is a handful of
 fixed-shape controls drawn at known places.
 
+*(2026-09-19.)* The toolbar and its menus are the desktop's, item for item:
+- The toolbar has back, forward, reload or stop, the address field, a
+  sections menu and a settings menu.
+- **Sections:** Top and Alt+0 to Alt+6. Only the sections the page has are
+  enabled. Top goes to the top of the page, as on the desktop.
+- **Settings:**
+  - Open externally;
+  - Export page, as HTML or Markdown, to a name typed at a prompt;
+  - Theme;
+  - Zoom, at the desktop's eight levels, so both shells agree on
+    `settings.ini`;
+  - Start page.
+- **Keys:** F10 opens the settings menu. The arrows, Right, Enter and Esc
+  move through the menus. Every earlier key still works.
+- **Pointer:** resting on an item opens its submenu. A click outside closes
+  the menu and does nothing else.
+- **Help:** the ? button is now the status bar's "? keys".
+- `check.py --fb` drives the menus both ways.
+
 Forms are the real new work, as PLAN.md said. The GTK shell places native
 widgets over each `DFormBox`. Here the shell draws them itself, in the control
 boxes `reader_layout` records, and so does every other shell once that layout
@@ -345,12 +367,42 @@ scrolling and link focus and asserts on the state and the screenshots,
 headless, and the stride padding has been shown to catch a flat `memcpy`
 blit.
 
+*Done 2026-09-19.* `src/platform/ddisplay.h` is the interface, chosen at
+run time from a spec (`memory:WxH`, `console`, `x11:WxH`); `src/display_sink.c`
+is the dispatch and the one blitter, row by row at both strides. The memory
+sink (`src/display_memory.c`) runs a script -- console bytes through the
+shared decoder, pixel clicks, `wait` for the shell to go idle, `screenshot`,
+`state` -- and its device rows are padded by 52 bytes. `check.py --fb`
+(`corpus/fb_suite.py`) is the gate: 56 checks over scripted runs, asserting on
+the shell's state line and on screenshots. `distill-fb-defect` is built with
+the flat `memcpy` blit, and the gate fails it: the frame shears and the
+device's last rows are never written.
+
+The shell is `src/fb.c`, portable C23 over `DPage`, the render calls and the
+display. It caches the painted page band and repaints it only when the page,
+the scroll, a control or the focus changes; chrome and overlays are drawn per
+frame. Building it found and fixed two defects no gate had seen:
+`d_page_link_boxes` reported no inline link at all (every link in a
+paragraph), which also left the desktop viewer's image list empty; and the
+reader CSS parser read numbers through the locale (`strtof`), which dropped
+every fractional length under a comma locale in any shell that calls
+`setlocale`.
+
 ### C — the window
 
 The X11 sink and `distill-fb-x11`. From here on this is the daily loop.
 
 **Done when** a corpus article reads end to end in a 1920×1080 window by
 keyboard and by mouse, and in a resized one.
+
+*Done 2026-09-19.* `distill-fb-x11`, the same sources plus
+`src/platform/linux/display_x11.c`: Xlib, MIT-SHM where the server has it,
+`XPutImage` where it does not, keys through an input method
+(`Xutf8LookupString`) and the keysym otherwise. The image is 16 pixels wider
+than the window, so the stride is padded here too. Checked on Xvfb by hand:
+a page reads, a field takes å, ä and ö and submits them as UTF-8, a click on
+an image link opens the viewer, a resize relays the page out, Ctrl+Q closes
+the window. It is not a gate; the memory sink is.
 
 ### D — the console
 
@@ -364,6 +416,19 @@ by mouse; switching to VT7 and back redraws correctly and the shell reads no
 input while away; `SIGTERM` and `SIGSEGV` both leave a usable text console;
 and starting from a terminal inside X refuses with the message.
 
+*Written 2026-09-19; the hand check is the owner's.*
+`src/platform/linux/display_console.c`: fbdev with the XRGB8888 check,
+`mmap`, `KD_GRAPHICS`, `VT_PROCESS` with SIGUSR1 and SIGUSR2, the tty in raw
+mode through the shared decoder, relative mice from `/dev/input/event*` by
+capability, and a pointer drawn on the device only. Restore is in
+`d_display_emergency_restore`, which the shell's fatal-signal handler calls.
+The VT signal handlers are the one place a handler is not optional: without
+them a VT switch would leave the shell drawing over the console switched to,
+so the sink refuses to start instead. Gated: outside a virtual console the
+shell refuses and names `distill-fb-x11`. Not gated, and to be checked on
+VT3 against the list above: VT switching both ways, `SIGTERM` and `SIGSEGV`
+leaving a usable console, and the mouse.
+
 ### E — shared plumbing, navigation
 
 Move the TUI's engine run, progress reading, transfer servicing and line
@@ -375,6 +440,15 @@ link activation, section jumps, reload, zoom and theme from them.
 framebuffer session can type an address, follow links, go back and forward
 and change theme, gated through the memory sink.
 
+*Done 2026-09-19.* `src/shell_nav.c` (the engine run, its progress and its
+outcome), `src/line_edit.c` (the UTF-8 line editor, with textarea lines) and
+`src/input_decode.c` (ANSI keys and SGR mouse reports) are in
+`distill-shell`, host-tested by `distill-shell-input-test`. The terminal
+shell runs on the first two, and `check.py --tui` passes unchanged. The
+framebuffer shell has history, the address line, link activation, the
+desktop's Alt+0 to Alt+6 sections, reload, type size and theme, all gated
+through the memory sink.
+
 ### F — forms and text entry
 
 The drawn controls, focus order across links and controls, the shared line
@@ -384,12 +458,28 @@ editor, textarea, select popups, and submission through `form_submit.c`.
 to a result in the memory sink, and the requests they send are identical to
 the GTK shell's for the same input.
 
+*Done 2026-09-19.* Controls are drawn over the boxes the layout reports in
+native-forms mode: text fields edited in place with a caret, a password as
+bullets on screen and in the state line, a textarea over several lines,
+checkboxes, radios, buttons (over their padding), and a select that opens a
+list. Space presses what has focus; Enter in a field submits with the field
+as the submitter. The gate asserts the GET and POST requests byte for byte
+against the ones the terminal suite asserts, including a POST login that
+carries its session cookie.
+
 ### G — media and viewer mode
 
 Viewer mode, zoom, the audio transport, downloads through the save-as prompt.
 
 **Done when** a page's audio plays and its image opens in the viewer on the
 console, and the same is gated through the memory sink with
+`DISTILL_AUDIO_BACKEND=null`.
+
+*Done 2026-09-19.* The viewer is a state of the surface: the image drawn
+once into a layer, zoom and pan, the page's images in order, and a caption
+bar with Previous, Next, Save and Close for the mouse. The audio transport
+sits above the status line: play and pause, a position bar to press or drag,
+volume, title, close. Downloads use the save-as line. All gated with
 `DISTILL_AUDIO_BACKEND=null`.
 
 ### H — build, permissions, budget
@@ -407,6 +497,33 @@ under the same reading the TUI's record used.
 *(Revised 2026-09-18. This condition was "`ldd distill-fb` shows no GLib".
 The static-link check is stronger — `ldd` cannot see a statically linked
 dependency — and it covers Muroxi too.)*
+
+*Measured 2026-09-19; the static link waits on its dependencies.*
+- **Symbols.** `nm -u` over distill-fb's own objects and the libraries it
+  links, minus what they define, against `libmxc`: nothing the framebuffer
+  shell added. What remains is the platform interface (Muroxi's own
+  backend), glibc header artefacts, miniaudio's device backends (already
+  listed in muroxi_compat.md), and `fmaxf fminf lround nearbyintf` from the
+  layout and painter, now listed there too. `render.c`'s `isspace` was the
+  one locale-dependent call left in the core and is gone.
+- **Links.** No Cairo, pixman, X11, fontconfig or C++ runtime. GLib, PCRE2
+  and graphite2 arrive through this distribution's `libharfbuzz`, and its
+  FreeType links that HarfBuzz, as this plan predicted; neither has a static
+  archive here. The static link needs the dependency profile M5 also waits
+  on: HarfBuzz from its amalgamation without GLib, and FreeType, libpng,
+  zlib, libjpeg, libwebp and libunibreak built static.
+- **Budget.** distill-fb is 1.05 MiB; its shared libraries except glibc are
+  9.8 MiB, of which 2.2 MiB is GLib and what comes with it, so about 7.6 MiB
+  without them. Lexbor's shared library is 3.6 MiB of that. With the engine
+  and its libcurl the total is 25 MiB, the same reading question the
+  terminal shell's record left open.
+- **Stack and memory.** The shell's peak stack is 41 KiB; `check.py --stack`
+  runs the whole framebuffer suite in 64 KiB and shows it does not run in
+  16. Peak RSS at 1920x1080 is about 37 MiB, the three full-screen buffers
+  most of it.
+- **Permissions.** Group membership, as on this machine: `video` for
+  `/dev/fb0`, `input` for the mice. Without `input` the shell runs with the
+  keyboard only. A udev rule or logind's `TakeDevice` stay open below.
 
 ## Testing and gates
 

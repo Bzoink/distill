@@ -6,7 +6,6 @@
 #include "dfs.h"
 #include "shaper.h"
 
-#include <ctype.h>
 #include <errno.h>
 #include <ft2build.h>
 #include FT_FREETYPE_H
@@ -165,14 +164,14 @@ static void load_fonts(DRenderContext *context, const char *font_dir)
 
 static void trim_family_token(const char **begin, const char **end)
 {
-    while (*begin < *end && isspace((unsigned char)**begin)) ++*begin;
-    while (*end > *begin && isspace((unsigned char)*((*end) - 1))) --*end;
+    while (*begin < *end && d_isspace(**begin)) ++*begin;
+    while (*end > *begin && d_isspace(*((*end) - 1))) --*end;
     if (*end - *begin >= 2 && ((*(*begin) == '\'' && *((*end) - 1) == '\'') ||
                                (*(*begin) == '"' && *((*end) - 1) == '"'))) {
         ++*begin;
         --*end;
-        while (*begin < *end && isspace((unsigned char)**begin)) ++*begin;
-        while (*end > *begin && isspace((unsigned char)*((*end) - 1))) --*end;
+        while (*begin < *end && d_isspace(**begin)) ++*begin;
+        while (*end > *begin && d_isspace(*((*end) - 1))) --*end;
     }
 }
 
@@ -553,6 +552,19 @@ void d_render_draw_marker(DRenderContext *context, DRenderRect rect,
     }
     d_paint_disc(context->paint, rect.x + rect.width / 2.0, rect.y + rect.height / 2.0,
                  rect.width > 3 ? rect.width / 4.0 : 2.0, color);
+}
+
+void d_render_disc(DRenderContext *context, double cx, double cy, double radius,
+                   DRenderColor color)
+{
+    if (!context) return;
+    d_paint_disc(context->paint, cx, cy, radius, color);
+}
+
+void d_render_blit(DRenderContext *context, int x, int y, const DRenderPixels *source)
+{
+    if (!context || !source || !source->data) return;
+    d_paint_blit(context->paint, x, y, source->data, source->width, source->height, source->stride);
 }
 
 void d_render_set_clip(DRenderContext *context, DRenderRect rect)

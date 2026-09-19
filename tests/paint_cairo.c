@@ -155,6 +155,23 @@ void d_paint_disc(DPaint *paint, double cx, double cy, double radius, DRenderCol
     cairo_restore(paint->cairo);
 }
 
+void d_paint_blit(DPaint *paint, int x, int y, const uint32_t *pixels, int width, int height,
+                  int stride)
+{
+    if (!paint || !pixels || width <= 0 || height <= 0) return;
+    cairo_surface_t *image = cairo_image_surface_create_for_data(
+        (unsigned char *)pixels, CAIRO_FORMAT_ARGB32, width, height, stride);
+    cairo_save(paint->cairo);
+    cairo_set_operator(paint->cairo, CAIRO_OPERATOR_SOURCE);
+    cairo_rectangle(paint->cairo, x, y, width, height);
+    cairo_clip(paint->cairo);
+    cairo_set_source_surface(paint->cairo, image, x, y);
+    cairo_paint(paint->cairo);
+    cairo_restore(paint->cairo);
+    cairo_surface_finish(image);
+    cairo_surface_destroy(image);
+}
+
 void d_paint_clip_push(DPaint *paint, DRenderRect rect)
 {
     cairo_save(paint->cairo);

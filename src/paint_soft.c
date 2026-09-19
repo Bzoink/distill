@@ -354,6 +354,19 @@ void d_paint_disc(DPaint *paint, double cx, double cy, double radius, DRenderCol
     }
 }
 
+void d_paint_blit(DPaint *paint, int x, int y, const uint32_t *pixels, int width, int height,
+                  int stride)
+{
+    if (!paint || !pixels || width <= 0 || height <= 0 || stride < width * 4) return;
+    Box box = intersect(current_clip(paint), (Box){x, y, x + width, y + height});
+    if (box.x1 <= box.x0) return;
+    const unsigned char *base = (const unsigned char *)pixels;
+    for (int py = box.y0; py < box.y1; ++py) {
+        const uint32_t *source = (const uint32_t *)(base + (size_t)(py - y) * (size_t)stride);
+        memcpy(pixel_at(paint, box.x0, py), source + (box.x0 - x), (size_t)(box.x1 - box.x0) * 4);
+    }
+}
+
 void d_paint_clip_push(DPaint *paint, DRenderRect rect)
 {
     if (!paint) return;

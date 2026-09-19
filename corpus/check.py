@@ -227,6 +227,29 @@ def find_tui():
     sys.exit("no distill-tui found; build it first (cmake -S . -B build && cmake --build build)")
 
 
+def find_fb(name="distill-fb"):
+    candidates = [
+        os.environ.get("DISTILL_FB") if name == "distill-fb" else None,
+        os.path.join(os.path.dirname(HERE), "build", name),
+    ]
+    for candidate in candidates:
+        if candidate and os.path.isfile(candidate) and os.access(candidate, os.X_OK):
+            return candidate
+    sys.exit(f"no {name} found; build it first (cmake -S . -B build && cmake --build build)")
+
+
+def run_fb_suite(port, stack_kib=None):
+    """The framebuffer shell through its memory sink; [(status, label, detail)]."""
+    import fb_suite
+    fb = find_fb()
+    defect = find_fb("distill-fb-defect") if stack_kib is None else None
+    fb_suite.SHELL_STACK_KIB = stack_kib
+    try:
+        return fb_suite.run(fb, f"http://127.0.0.1:{port}", defect)
+    finally:
+        fb_suite.SHELL_STACK_KIB = None
+
+
 def find_app():
     candidates = [
         os.environ.get("DISTILL_APP"),
@@ -748,6 +771,26 @@ def run_stack_gate(engine, port, manifest, timeout_s):
                                 "so the 64 KiB run models nothing")
             else:
                 print(f"  negative control: the shell did not run in 16 KiB (status {status})")
+
+            # The framebuffer shell: its whole suite in 64 KiB, and not in 16.
+            import fb_suite
+            results = run_fb_suite(port, stack_kib=64)
+            broken = [label for status, label, _ in results if status != "pass"]
+            for label in broken:
+                failures.append(f"framebuffer shell in 64 KiB: {label}")
+            print(f"  framebuffer shell in 64 KiB: {len(results) - len(broken)} of {len(results)} checks")
+            fb_suite.SHELL_STACK_KIB = 16
+            try:
+                small = fb_suite.Run(find_fb(), f"{base}/09-article.html", ["wait", "STATE", "quit"],
+                                     dict(os.environ, HOME=home, XDG_CONFIG_HOME=os.path.join(home, "config"),
+                                          DISTILL_AUDIO_BACKEND="null"), scratch)
+            finally:
+                fb_suite.SHELL_STACK_KIB = None
+            if small.states:
+                failures.append("negative control: the framebuffer shell ran in 16 KiB of stack, "
+                                "so the 64 KiB run models nothing")
+            else:
+                print(f"  negative control: the framebuffer shell did not run in 16 KiB (status {small.status})")
         finally:
             tui_suite.SHELL_STACK_KIB = None
             del os.environ["DISTILL_ENGINE"]
@@ -1093,6 +1136,8 @@ def main():
                     help="run the engine in-process, every page in one distill-host")
     ap.add_argument("--tui", action="store_true",
                     help="Phase 6: drive the terminal shell through a pty")
+    ap.add_argument("--fb", action="store_true",
+                    help="the framebuffer shell, through its scripted memory display")
     ap.add_argument("--bundles", action="store_true",
                     help="also run saved local bundles as recorded, non-gating checks")
     ap.add_argument("--arm", choices=("a", "b"), default="a",
@@ -1192,6 +1237,21 @@ def main():
 
         if args.paint:
             return run_paint_gate(engine, port, manifest, args.timeout)
+
+        if args.fb:
+            print(f"{DIM}fb:      {find_fb()}\nserver:  http://127.0.0.1:{port}/\nmode:    framebuffer shell (memory display){RESET}\n")
+            results = run_fb_suite(port)
+            failed = 0
+            for status, label, detail in results:
+                mark = f"{GREEN}pass{RESET}" if status == "pass" else f"{RED}FAIL{RESET}"
+                print(f"  {mark}  {label}" + (f"  {DIM}{detail[:300]}{RESET}" if detail else ""))
+                failed += status != "pass"
+            print()
+            if failed:
+                print(f"{RED}FAILED{RESET}  {failed} framebuffer check(s)")
+                return 1
+            print(f"{GREEN}OK{RESET}  all {len(results)} framebuffer checks pass")
+            return 0
 
         if args.tui:
             import tui_suite

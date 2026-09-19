@@ -508,6 +508,8 @@ NetSurf's fb frontend is **read-only reference** (GPL-2.0) throughout, never lif
 
 **Done when:** the same URL, read and interacted with, is navigable by keyboard alone and by mouse alone on the framebuffer, matching the desktop experience — within budget.
 
+**Result (2026-09-19):** `distill-fb` is built and gated (`check.py --fb`, 56 checks through a scripted memory display; `--stack` runs them in 64 KiB). Reading, forms, history, the viewer and audio work by keyboard and by mouse, and a form sends byte for byte what the terminal and the desktop send. The permission story is group membership (`video`, `input`). Two things are open, with the details in [FRAMEBUFFER_PLAN.md](FRAMEBUFFER_PLAN.md): the console sink's hand check on a real VT (VT switching, restore after a crash, the mouse), which no gate can do; and the budget's GLib rule, which this distribution's HarfBuzz breaks until HarfBuzz and FreeType are built for the target — without them the shell's shared set is about 7.6 MiB.
+
 ### Phase 6 — TUI
 *The last visualization target*
 

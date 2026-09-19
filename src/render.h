@@ -137,6 +137,12 @@ void d_render_stroke(DRenderContext *context, DRenderRect rect, int width,
                      DRenderColor color);
 void d_render_draw_marker(DRenderContext *context, DRenderRect rect,
                           DRenderColor color, bool ordered, int index);
+/* A filled circle, its centre and radius free to fall between pixels. */
+void d_render_disc(DRenderContext *context, double cx, double cy, double radius,
+                   DRenderColor color);
+/* Another context's pixels -- a layer painted once and composited many
+   times -- copied opaque with their top-left at (x, y). */
+void d_render_blit(DRenderContext *context, int x, int y, const DRenderPixels *source);
 void d_render_set_clip(DRenderContext *context, DRenderRect rect);
 void d_render_del_clip(DRenderContext *context);
 

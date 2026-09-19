@@ -38,6 +38,13 @@ void d_page_destroy(DPage *document);
 int d_page_height(const DPage *document);
 int d_page_paint(DPage *document, int scroll_y);
 bool d_page_pixels(DPage *document, DRenderPixels *pixels);
+/* The context the document paints into, for a shell that draws over a
+   painted band -- its own form controls, a focus ring -- in the same pixels,
+   and with the fonts the document already loaded. */
+DRenderContext *d_page_context(DPage *document);
+/* The document y of the element with this id, or -1: where a section link
+   scrolls to. */
+int d_page_anchor_y(const DPage *document, const char *id);
 size_t d_page_form_boxes(const DPage *document,
                                             DFormBox *boxes, size_t box_capacity);
 /* Anchor URL under a document-space point, written to href_out; non-zero when
