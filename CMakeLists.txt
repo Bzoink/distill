@@ -6,7 +6,7 @@ project(distill VERSION 1.0 LANGUAGES C CXX)
 include(GNUInstallDirs)
 
 # The production application and all bespoke code are C23. C++ remains enabled
-# only for the litehtml-facing adapter, which is linked into the probe target.
+# for external HarfBuzz builds; Distill has no C++ source boundary of its own.
 set(CMAKE_C_STANDARD 23)
 set(CMAKE_C_STANDARD_REQUIRED ON)
 set(CMAKE_C_EXTENSIONS OFF)
@@ -30,22 +30,20 @@ pkg_check_modules(DISTILL_UNIBREAK REQUIRED IMPORTED_TARGET libunibreak)
 # the framebuffer and TUI targets can use the same decoder as the desktop one.
 pkg_check_modules(DISTILL_IMAGE REQUIRED IMPORTED_TARGET libpng libjpeg libwebp)
 
-# The raster renderer -- litehtml laying out, FreeType and HarfBuzz shaping,
-# our own software painter (src/paint_soft.c) filling pixels -- is what the
-# desktop shell and --render draw with. It is found rather than required: a
-# machine without FreeType or HarfBuzz still builds the engine, the reader
-# page, the Markdown export and the terminal front end. DISTILL_RENDERER=OFF
-# asks for that build deliberately. Cairo is not part of it: only a GTK host
-# links Cairo, to put the painter's pixels in a window, and the reference
-# painter `check.py --paint` compares against (tests/paint_cairo.c).
-option(DISTILL_RENDERER "Build the litehtml renderer when its dependencies are present" ON)
+# The raster renderer -- reader_layout, FreeType and HarfBuzz shaping, and our
+# software painter -- is what the desktop shell and --render draw with. It is
+# found rather than required: a machine without the font stack still builds
+# the engine, the reader page, the Markdown export and the terminal front end.
+# Cairo is not part of it: only the reference painter used by check.py links
+# Cairo.
+option(DISTILL_RENDERER "Build the pixel renderer when its dependencies are present" ON)
 set(DISTILL_HAVE_RENDERER OFF)
 if(DISTILL_RENDERER)
     pkg_check_modules(DISTILL_RENDER IMPORTED_TARGET freetype2 harfbuzz)
-    if(DISTILL_RENDER_FOUND AND EXISTS "${EXTERNAL_PREFIX}/lib/liblitehtml.a")
+    if(DISTILL_RENDER_FOUND)
         set(DISTILL_HAVE_RENDERER ON)
     else()
-        message(STATUS "FreeType, HarfBuzz or litehtml not found; building without the renderer")
+        message(STATUS "FreeType or HarfBuzz not found; building without the renderer")
     endif()
 endif()
 message(STATUS "Distill renderer: ${DISTILL_HAVE_RENDERER}")
@@ -168,26 +166,6 @@ target_include_directories(distill-app-state-test PRIVATE src)
 distill_enable_assertions(distill-app-state-test)
 add_test(NAME distill-app-state COMMAND distill-app-state-test)
 
-if(DISTILL_HAVE_RENDERER)
-    add_executable(distill-litehtml-geometry-test tests/litehtml_geometry_test.c src/litehtml_probe.cpp src/image.c)
-    target_compile_definitions(distill-litehtml-geometry-test PRIVATE
-        DISTILL_TEST_FONT_DIR="${CMAKE_SOURCE_DIR}/external/fonts"
-    )
-    target_include_directories(distill-litehtml-geometry-test PRIVATE
-        src
-        "${EXTERNAL_PREFIX}/include"
-    )
-    target_link_directories(distill-litehtml-geometry-test PRIVATE "${EXTERNAL_PREFIX}/lib")
-    target_link_libraries(distill-litehtml-geometry-test PRIVATE
-        litehtml
-        gumbo
-        distill-render-core
-        distill-paint
-    )
-    distill_enable_assertions(distill-litehtml-geometry-test)
-    add_test(NAME distill-litehtml-geometry COMMAND distill-litehtml-geometry-test)
-endif()
-
 # The audio core. miniaudio is a single-source third-party header, vendored
 # under external/ like every other dependency. The core decodes with it; the
 # platform's audio backend plays what it decodes and is the one translation
@@ -220,16 +198,40 @@ if(DISTILL_HAVE_RENDERER)
     target_include_directories(distill-paint PUBLIC src)
 
     # check.py --paint: the same reader page painted by the software painter,
-    # by the Cairo painter it replaced, and by a software painter with a
+    # by the Cairo reference painter, and by a software painter with a
     # deliberate defect, which the comparison must catch.
     function(distill_paint_tool name painter)
-        add_executable(${name} tests/paint_tool.c src/litehtml_probe.cpp)
-        target_include_directories(${name} PRIVATE src "${EXTERNAL_PREFIX}/include")
-        target_link_directories(${name} PRIVATE "${EXTERNAL_PREFIX}/lib")
-        target_link_libraries(${name} PRIVATE litehtml gumbo distill-render-core ${painter})
+        add_executable(${name} tests/paint_tool.c)
+        target_link_libraries(${name} PRIVATE distill-layout distill-render-core ${painter})
     endfunction()
-    distill_paint_tool(distill-paint-soft distill-paint)
 
+    # The reader page's own layout (src/reader_layout.c), landed in M4.
+    add_library(distill-layout STATIC src/reader_layout.c)
+    target_include_directories(distill-layout PUBLIC src "${EXTERNAL_PREFIX}/include")
+    target_link_directories(distill-layout PUBLIC "${EXTERNAL_PREFIX}/lib")
+    target_link_libraries(distill-layout PUBLIC lexbor distill-render-core m)
+    add_executable(distill-layout-reader tests/layout_dump.c)
+    target_link_libraries(distill-layout-reader PRIVATE distill-layout distill-render-core distill-paint)
+    add_executable(distill-layout-paint tests/paint_tool.c)
+    target_link_libraries(distill-layout-paint PRIVATE distill-layout distill-render-core distill-paint)
+    add_executable(distill-layout-geometry-test tests/layout_geometry_test.c)
+    target_compile_definitions(distill-layout-geometry-test PRIVATE
+        DISTILL_TEST_FONT_DIR="${CMAKE_SOURCE_DIR}/external/fonts"
+    )
+    target_link_libraries(distill-layout-geometry-test PRIVATE distill-layout distill-render-core distill-paint)
+    distill_enable_assertions(distill-layout-geometry-test)
+    add_test(NAME distill-layout-geometry COMMAND distill-layout-geometry-test)
+
+    add_library(distill-layout-defect STATIC src/reader_layout.c)
+    target_compile_definitions(distill-layout-defect PRIVATE DISTILL_LAYOUT_DEFECT=1)
+    target_include_directories(distill-layout-defect PUBLIC src "${EXTERNAL_PREFIX}/include")
+    target_link_directories(distill-layout-defect PUBLIC "${EXTERNAL_PREFIX}/lib")
+    target_link_libraries(distill-layout-defect PUBLIC lexbor distill-render-core m)
+    add_executable(distill-layout-defect-paint tests/paint_tool.c)
+    target_link_libraries(distill-layout-defect-paint PRIVATE distill-layout-defect distill-render-core distill-paint)
+
+    add_executable(distill-paint-soft tests/paint_tool.c)
+    target_link_libraries(distill-paint-soft PRIVATE distill-layout distill-render-core distill-paint)
     add_library(distill-paint-defect STATIC src/paint_soft.c)
     target_compile_definitions(distill-paint-defect PRIVATE DISTILL_PAINT_DEFECT=1)
     target_link_libraries(distill-paint-defect PUBLIC PkgConfig::DISTILL_IMAGE m)
@@ -246,8 +248,8 @@ if(DISTILL_HAVE_RENDERER)
 
 endif()
 
-# The reader-page walker and the front ends that are not litehtml: the
-# Markdown export today, the terminal renderer beside it. It reads the page
+# The reader-page walker and the text front ends: the Markdown export today,
+# the terminal renderer beside it. It reads the page
 # Distill wrote, so it needs Lexbor and the line breaker and nothing that
 # paints.
 add_library(distill-reader STATIC src/reader_walk.c src/reader_markdown.c src/reader_cells.c)
@@ -316,9 +318,8 @@ target_link_libraries(distill-engine PUBLIC
     m
 )
 if(DISTILL_HAVE_RENDERER)
-    target_sources(distill-engine PRIVATE src/litehtml_probe.cpp)
     target_compile_definitions(distill-engine PRIVATE DISTILL_RENDER=1)
-    target_link_libraries(distill-engine PUBLIC litehtml gumbo distill-render-core distill-paint)
+    target_link_libraries(distill-engine PUBLIC distill-layout distill-render-core distill-paint)
 endif()
 
 add_executable(distill src/distill.c)
@@ -379,7 +380,7 @@ install(DIRECTORY external/fonts/ DESTINATION ${CMAKE_INSTALL_DATADIR}/distill/f
 # files through GLib -- so it lives with the Linux backends rather than in the
 # portable core. Whether it stays is an open decision (muroxi_compat.md).
 if(DISTILL_HAVE_RENDERER AND DISTILL_GTK_FOUND)
-    add_executable(distill-gtk src/platform/linux/app.c src/app_state.c src/litehtml_probe.cpp)
+    add_executable(distill-gtk src/platform/linux/app.c src/app_state.c)
     target_compile_options(distill-gtk PRIVATE $<$<COMPILE_LANGUAGE:C>:-Wno-pedantic>)
     target_include_directories(distill-gtk PRIVATE
         src
@@ -389,8 +390,7 @@ if(DISTILL_HAVE_RENDERER AND DISTILL_GTK_FOUND)
     target_link_libraries(distill-gtk PRIVATE
         distill-media-audio
         distill-shell
-        litehtml
-        gumbo
+        distill-layout
         distill-render-core
         distill-paint
         distill-version
@@ -415,16 +415,3 @@ set_target_properties(distill-arm-b PROPERTIES
     INSTALL_RPATH "${EXTERNAL_PREFIX}/lib"
 )
 install(TARGETS distill-arm-b RUNTIME DESTINATION bin)
-
-if(DISTILL_HAVE_RENDERER)
-    add_executable(distill-arm-b-pruned src/distill.c src/engine.c src/engine_args.c "${DISTILL_EMBEDDED_JS}" src/litehtml_probe.cpp src/render.c src/paint_soft.c src/shaper.c src/image.c)
-    target_compile_definitions(distill-arm-b-pruned PRIVATE DISTILL_B_PRUNED=1 DISTILL_NO_EXTRACT=1)
-    target_include_directories(distill-arm-b-pruned PRIVATE "${EXTERNAL_PREFIX}/include" ${CURL_INCLUDE_DIRS})
-    target_link_directories(distill-arm-b-pruned PRIVATE "${EXTERNAL_PREFIX}/lib")
-    target_link_libraries(distill-arm-b-pruned PRIVATE qjs CURL::libcurl distill-measure distill-version litehtml gumbo Threads::Threads PkgConfig::DISTILL_RENDER PkgConfig::DISTILL_UNIBREAK PkgConfig::DISTILL_IMAGE ${CMAKE_DL_LIBS} m)
-    set_target_properties(distill-arm-b-pruned PROPERTIES
-        BUILD_RPATH "${EXTERNAL_PREFIX}/lib"
-        INSTALL_RPATH "${EXTERNAL_PREFIX}/lib"
-    )
-    install(TARGETS distill-arm-b-pruned RUNTIME DESTINATION bin)
-endif()

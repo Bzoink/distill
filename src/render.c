@@ -210,7 +210,7 @@ static int family_token_score(const char *begin, const char *end, const DFontFil
     return 1000;
 }
 
-/* litehtml passes the complete CSS font-family list to the container. Keep
+/* The page layout passes the complete CSS font-family list to the renderer. Keep
    the order from that list: an exact family should beat a generic family,
    while a generic family should still be a useful fallback when the bundled
    face is unavailable. Quoted names are kept intact while finding commas. */

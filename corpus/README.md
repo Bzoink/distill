@@ -57,9 +57,9 @@ and rejected URI counts. Its stable field checks live in
 recorded for breadth and is never a gate.
 
 `--render DIR` sends the same settled extraction result through the reader
-template, litehtml layout, and the FreeType/HarfBuzz/Cairo paint backend. It
+template, `reader_layout`, and the FreeType/HarfBuzz software painter. It
 writes one PNG per corpus page and gates only that the renderer creates a
-non-empty PNG with valid dimensions; visual quality remains a human review.
+non-empty PNG with valid dimensions; pixel parity is covered by `--paint`.
 
 `--viewer DIR` runs the gallery fixture through the fit-to-width media viewer
 path and checks its navigation surface produces a valid PNG.
@@ -67,8 +67,8 @@ path and checks its navigation surface produces a valid PNG.
 The Phase 3 desktop shell is `build/distill-gtk`. Run it with `--url URL` to
 open a page in the GTK reader, or run `./check.py --app` for the display-free
 history/form-geometry/address-bar shell gate. The window provides an address bar, cached
-back/forward history, a Cairo reader surface, native GTK form controls placed
-from litehtml geometry, simple GET/POST submission, URI-validated external
+back/forward history, a software-painted reader surface, native GTK form controls placed
+from reader geometry, simple GET/POST submission, URI-validated external
 hand-off, three reader themes, eight zoom levels, and a reading-list toggle.
 
 Zoom is a layout setting, not a scale applied to the finished surface: the
@@ -89,14 +89,13 @@ both that search and what each setting resolves to.
 
 Text selection is drag, double-click for a word, triple-click for a block,
 Ctrl+A for the page, Ctrl+C to copy, and Escape to clear; a finished drag also
-goes to the X11 primary selection. The runs come from the renderer -- litehtml
-hands its container one per line with the box it filled -- and are collected
+goes to the X11 primary selection. The runs come from `reader_layout` and are collected
 over the whole document rather than the painted band, so a selection reaches
 text that has never been on screen. Where a character sits inside a run is a
 shaping question, answered in cluster steps, which is what keeps a boundary
 from landing inside an "fi" ligature or between the two bytes of an "o".
 Copying rejoins what the layout broke: runs of one block become one paragraph,
-a change of block is a line break. `distill-litehtml-geometry` gates the runs,
+a change of block is a line break. `distill-layout-geometry` gates the runs,
 the cluster round-trip and that collecting text leaves link hit-testing alone;
 `--self-test` gates what a selection turns into.
 
@@ -349,9 +348,8 @@ Two things the fixture gates that nothing else could:
   only in that file.
 
 The decoder and the drawing of it are covered by `ctest`, not here, and
-deliberately at pixel level. The image path's first bug was an offset:
-litehtml hands `draw_background` a resolved document position, and adding it
-to the origin box drew every image at twice its own offset. That looks like a
+deliberately at pixel level. The image path's first bug was an offset: adding
+the resolved document position to the origin box drew every image at twice its own offset. That looks like a
 partly clipped image rather than a wrong coordinate, and a smoke test that
 asked only "did anything get drawn" passed the whole time.
 

@@ -817,13 +817,34 @@ Done.
 ### M4 — our own layout
 
 `reader_layout` with cell and pixel measurers, the style table, the box list
-and logical direction. While it is built, compare its pixel output with
-litehtml's for every page in the render gate.
+and logical direction. While it is built, compare its pixel output with the
+reference layout for every page in the render gate.
 
 **Done when** the layout comparison stays within a stated threshold for the
 render corpus, has been shown to fail against a deliberately broken layout,
-and `--tui` passes on the cell measurer. Then delete litehtml, Gumbo and
-[litehtml_probe.cpp](../litehtml_probe.cpp).
+and `--tui` passes on the cell measurer. Then delete litehtml, Gumbo and the
+C++ adapter.
+
+#### M4 result (2026-09-19)
+
+Done. `reader_layout` is now the production pixel measurer and the TUI keeps
+using the same page model through its cell measurer. The engine, GTK host and
+headless render tools all link the C layout and software painter; the old
+litehtml/Gumbo/C++ adapter path is no longer built or shipped.
+
+The temporary layout parity gate compared all 48 render-corpus pages against
+the reference layout at the stated limit of 0.5 mean difference per channel
+and 16 pixels in the largest differing region. It passed every page: the
+worst mean was 0.363 per channel and the worst differing region was 0 pixels.
+Both deliberately broken-layout controls failed as required: `09-article`
+had mean 6.707 and region 122, while `paint/primitives.html` had mean 3.330
+and region 1470.
+
+The permanent software-painter gate still passes all 48 pages, with worst
+mean 0.041 per channel and no differing region; both painter negative controls
+fail. The 42-check `--tui` gate passes, as do the full default, `--render` and
+`--extract` corpus gates. CTest passes all 12 tests, including the layout
+geometry contract.
 
 ### M5 — portable build
 

@@ -66,7 +66,7 @@ typedef struct {
     char placeholder[256];
     /* Each select choice is value, label, selectedness, separated by ASCII
        unit/record separators. The renderer owns the markup; this compact C
-       ABI avoids exposing litehtml's C++ tree to the GTK shell. */
+       ABI avoids exposing the layout tree to the GTK shell. */
     char options[4096];
     char action[2048];
     char method[16];
@@ -76,9 +76,9 @@ typedef struct {
 } DFormBox;
 
 /* One run of text as the renderer drew it: the string, the box it filled, and
-   the block it belongs to. Selection is built from these -- litehtml hands the
-   container each run already broken to a line, which is the granularity a
-   reader selects at. */
+   the block it belongs to. Selection is built from these -- the layout records
+   each run already broken to a line, which is the granularity a reader
+   selects at. */
 typedef struct {
     int x;
     int y;

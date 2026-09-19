@@ -7,13 +7,13 @@ something PLAN.md decided, it says so and says why; see
 Revised 2026-09-18 by [muroxi_compat.md](muroxi_compat.md), which makes
 Distill portable to Muroxi. Where a section below was changed by it, the
 section says so. In short: the page model is `reader_layout`'s box list, not
-litehtml's geometry; the key decoder is shared core code that also decodes SGR
+reader_layout's geometry; the key decoder is shared core code that also decodes SGR
 mouse reports; and phase H's check is the static link, not `ldd`.
 
 ## Direction
 
-Same core, a different place to put the pixels. The reader page, litehtml's
-layout, the shaper, the fonts and the themes are the desktop's. What is new is
+Same core, a different place to put the pixels. The reader page,
+`reader_layout`, the shaper, the fonts and the themes are the desktop's. What is new is
 everything GTK was doing for us: painting, getting pixels onto a screen,
 reading the keyboard and mouse, and drawing the controls a page's forms need.
 
@@ -46,9 +46,8 @@ console can be screenshotted by a gate.
 ## What already exists
 
 **The paint seam is already a C interface.** `src/render.h` is everything
-litehtml draws with — fill, stroke, text, image, list marker, clip — and
-`src/litehtml_probe.cpp` contains no Cairo call at all. Cairo lives entirely
-inside `src/render.c`, behind that interface.
+`reader_layout` draws with — fill, stroke, text, image, list marker, clip.
+Cairo lives entirely inside the reference painter, behind that interface.
 
 **Cairo is doing very little.** `render.c` uses it for seven things: solid
 fills, rectangle strokes, compositing FreeType's 8-bit glyph masks
@@ -75,14 +74,12 @@ links them as the TUI does.
 with link, control, anchor and focus geometry recorded during layout — with
 the TUI's *plumbing*. It is not a port of either file.
 
-*(Revised 2026-09-18. This plan first built on the GTK shell's page model:
-`DLinkBox`, `DFormBox` and document bands from
-`distill_litehtml_document_render_region`. litehtml cannot be built on
-Muroxi, which has no C++ runtime, so
-[muroxi_compat.md](muroxi_compat.md#our-own-layout-in-place-of-litehtml)
-replaces it with `reader_layout`, the TUI's `reader_cells` generalised to a
-pixel measurer. Until M4 lands, the shell may read litehtml's geometry through
-the same box-list shape, so nothing above it changes when the source does.)*
+*(Revised 2026-09-19. This plan originally used the GTK shell's page model:
+`DLinkBox`, `DFormBox` and litehtml render bands. Muroxi cannot build litehtml,
+so [muroxi_compat.md](muroxi_compat.md#our-own-layout-in-place-of-litehtml)
+replaced that model with `reader_layout`, the TUI's `reader_cells` generalised
+to a pixel measurer. M4 has landed, so the shell reads the production box list
+directly.)*
 
 ## The findings that shape this plan
 
@@ -244,8 +241,8 @@ tap to click, palm rejection) and are where libinput earns its keep. They are
 
 ### Painting chrome and forms
 
-The shell draws its own chrome with the same `d_render_*` calls litehtml
-uses: address bar, status line, progress, the audio transport and menus for
+The shell draws its own chrome with the same `d_render_*` calls the reader
+layout uses: address bar, status line, progress, the audio transport and menus for
 theme and zoom. Nothing here is a widget toolkit. It is a handful of
 fixed-shape controls drawn at known places.
 
@@ -479,7 +476,7 @@ dependency — and it covers Muroxi too.)*
 - **The budget's reading.** Still open from the TUI's record: libcurl and
   OpenSSL alone exceed 8 MB as this distribution packages them. The
   framebuffer target adds FreeType and HarfBuzz to that line; litehtml and
-  libstdc++ (2.9 MB) leave it with muroxi_compat.md M4, and Mbed TLS in place
+  libstdc++ (2.9 MB) were removed by muroxi_compat.md M4, and Mbed TLS in place
   of OpenSSL is an open decision there.
 
 ## Non-goals

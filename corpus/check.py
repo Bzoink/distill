@@ -201,16 +201,15 @@ def find_engine():
     sys.exit("no distill engine found; build it first (cmake -S . -B build && cmake --build build)")
 
 
-def find_arm_b(pruned=False):
+def find_arm_b():
     candidates = [
-        os.environ.get("DISTILL_ARM_B_PRUNED" if pruned else "DISTILL_ARM_B"),
-        os.path.join(os.path.dirname(HERE), "build", "distill-arm-b-pruned" if pruned else "distill-arm-b"),
+        os.environ.get("DISTILL_ARM_B"),
+        os.path.join(os.path.dirname(HERE), "build", "distill-arm-b"),
     ]
     for candidate in candidates:
         if candidate and os.path.isfile(candidate) and os.access(candidate, os.X_OK):
             return candidate
-    label = "Arm B'" if pruned else "Arm B"
-    sys.exit(f"no {label} engine found; build it first (cmake -S . -B build && cmake --build build)")
+    sys.exit("no Arm B engine found; build it first (cmake -S . -B build && cmake --build build)")
 
 
 def find_tui():
@@ -1088,15 +1087,15 @@ def main():
                     help="Phase 6: drive the terminal shell through a pty")
     ap.add_argument("--bundles", action="store_true",
                     help="also run saved local bundles as recorded, non-gating checks")
-    ap.add_argument("--arm", choices=("a", "b", "b-pruned"), default="a",
-                    help="engine arm: a is the C23 runtime with Lexbor extraction (default), b is the JS-side linkedom comparison, b-pruned is the no-Lexbor/litehtml baseline")
+    ap.add_argument("--arm", choices=("a", "b"), default="a",
+                    help="engine arm: a is the C23 runtime with Lexbor extraction (default), b is the JS-side linkedom comparison")
     ap.add_argument("--keep-dom", metavar="DIR", help="save each dumped DOM")
     ap.add_argument("--budget", type=int, default=6000, help="virtual time budget, ms")
     ap.add_argument("--timeout", type=int, default=45, help="real-time cap per page, s")
     args = ap.parse_args()
 
     if args.app:
-        incompatible = args.id or args.live or args.baseline or args.extract or args.render or args.viewer or args.bundles or args.keep_dom or args.tui
+        incompatible = args.id or args.live or args.baseline or args.extract or args.render or args.viewer or args.paint or args.bundles or args.keep_dom or args.tui
         if incompatible:
             ap.error("--app is a standalone Phase 3 shell smoke test")
         app = find_app()
@@ -1146,7 +1145,7 @@ def main():
         if not os.access(host, os.X_OK):
             sys.exit("no distill-host found; build it first (cmake --build build)")
         ENGINE_HOST = EngineHost(host)
-    arm_b = find_arm_b(args.arm == "b-pruned") if not args.baseline and args.arm in ("b", "b-pruned") else None
+    arm_b = find_arm_b() if not args.baseline and args.arm == "b" else None
     port = free_port()
 
     if args.keep_dom:
@@ -1197,8 +1196,8 @@ def main():
             if not pages:
                 sys.exit(f"no page with id {args.id!r}")
 
-        mode = "baseline (reference browser)" if args.baseline else ("Arm B' (no-Lexbor + litehtml)" if args.arm == "b-pruned" else ("Arm B (JS-side linkedom)" if args.arm == "b" else ("Phase 2 media viewer" if args.viewer else ("Phase 2 reader PNG" if args.render else ("Arm A extraction (C23)" if args.extract else "Arm A (C23 runtime + Lexbor extraction)")))))
-        driver = browser if args.baseline else (arm_b if args.arm in ("b", "b-pruned") else engine)
+        mode = "baseline (reference browser)" if args.baseline else ("Arm B (JS-side linkedom)" if args.arm == "b" else ("Phase 2 media viewer" if args.viewer else ("Phase 2 reader PNG" if args.render else ("Arm A extraction (C23)" if args.extract else "Arm A (C23 runtime + Lexbor extraction)"))))
+        driver = browser if args.baseline else (arm_b if args.arm == "b" else engine)
         print(f"{DIM}{'browser' if args.baseline else 'driver'}: {driver}\nserver:  http://127.0.0.1:{port}/\nmode:    {mode}{RESET}\n")
 
         total_failed, gates_failed = 0, []
@@ -1268,7 +1267,7 @@ def main():
             elif args.baseline:
                 html, err = dump_dom(browser, url, args.budget, args.timeout)
                 extraction = None
-            elif args.arm in ("b", "b-pruned"):
+            elif args.arm == "b":
                 html, err = dump_arm_b(arm_b, url, manifest.get("settle_cap_ms", 5000), args.timeout)
                 extraction = None
             else:

@@ -82,7 +82,7 @@ enum {
        link could not be activated without selecting a character of it. */
     DRAG_THRESHOLD_PX = 3,
     /* Long enough to keep a host and a file name, short enough to fit the
-       column: litehtml breaks neither on overflow-wrap nor on word-break, so
+       column: the reader layout breaks neither on overflow-wrap nor on word-break, so
        a URL that does not fit simply runs off the edge of the page. */
     DISPLAY_URL_BUDGET = 58
 };
@@ -568,7 +568,7 @@ static void update_form_style(App *app, const char *theme, int zoom)
         ".distill-form-textarea,.distill-form-select{color:%s;background-color:%s;"
         "background-image:none;border:1px solid %s;border-radius:3px;}"
         ".distill-form-textarea text{color:%s;background-color:%s;}"
-        /* Checkbox and radio boxes are placed using litehtml's exact inline
+        /* Checkbox and radio boxes are placed using the layout's exact inline
            rectangle. Remove GTK's theme padding so their indicator starts at
            that rectangle rather than being inset from the label's left edge. */
         ".distill-form-choice{color:%s;padding:0;margin:0;min-width:0;min-height:0;}"
@@ -732,7 +732,7 @@ static void save_zoom(int zoom)
     g_key_file_free(settings);
 }
 
-/* Rebuilding the litehtml document resets the adjustment while GTK lays out
+/* Rebuilding the reader document resets the adjustment while GTK lays out
    the new child. Restore the reader position from an idle callback, after the
    child has its real height, so the adjustment can accept the old offset. */
 static gboolean restore_reader_scroll(gpointer opaque)
@@ -1856,7 +1856,7 @@ static void open_link(App *app, const char *uri);
 
 /* Ask the laid-out document, not the collected boxes. Only block-level
    anchors have a placement, so a box list finds headlines that happen to fill
-   their line and misses every link inside a sentence; litehtml did the layout
+   their line and misses every link inside a sentence; the page layout knows
    and knows what is under the point either way. The boxes remain for keyboard
    navigation, which needs an ordered list rather than a point. */
 static bool link_href_at(const App *app, double x, double y, char *href, size_t capacity)
@@ -1982,7 +1982,7 @@ static char *fetch_media_file(const char *url, char **error_message)
 }
 
 /* A URL as something to read. The same reason as in the reader template:
-   litehtml has no overflow-wrap, so a long URL runs off the edge. */
+   the page layout has no overflow-wrap, so a long URL runs off the edge. */
 static char *display_url(const char *url)
 {
     const char *text = url ? url : "";
@@ -2019,7 +2019,7 @@ static char *viewer_html(App *app, const char *url, const char *file,
         /* Full-bleed stage, margins for everything else: the renderer fits an
            image to the surface width, so an inset stage would clip that much
            off the right of a wide one, and a horizontal padding rule shifts
-           sibling blocks in this litehtml build. */
+           sibling blocks in this viewer layout. */
         ".top{font-size:.82em;color:#aaa79f;margin:0 30px 18px;}"
         ".stage{background:#24272a;margin:0 0 16px;}"
         ".stage img{display:block;}"
@@ -2028,7 +2028,7 @@ static char *viewer_html(App *app, const char *url, const char *file,
         "a{color:#78b9cf;text-decoration:none;}"
         ".nav{margin:0 30px;}.nav a{margin-right:18px;}"
         ".spent{color:#6b6862;margin-right:18px;}"
-        /* <main> is not a block element in litehtml's master stylesheet, so
+        /* <main> is not a block element in the reference stylesheet, so
            the viewer puts its content straight in the body rather than
            wrapping it in one and laying out around an inline box. */
         "</style></head><body>");
@@ -2046,7 +2046,7 @@ static char *viewer_html(App *app, const char *url, const char *file,
            that a failure is reported with its reason instead of as an empty
            frame. The size is left to the renderer, which fits an image to the
            surface; an explicit CSS size on an <img> reserves the box but is
-           not painted by this litehtml build. */
+           not painted by this viewer layout. */
         d_image_free(&image);
         char *escaped = escape_markup(file);
         g_string_append_printf(out, "<img src=\"%s\">", escaped);
@@ -4091,7 +4091,7 @@ static bool run_selection_self_test(void)
     bool ok = true;
     DTextBox boxes[5] = {
         /* One paragraph over two lines, then a second paragraph, then two
-           list items, laid out the way litehtml hands them over. */
+           list items, laid out the way the page model hands them over. */
         {.x = 0, .y = 0, .width = 200, .height = 20, .block = 1, .block_tag = "p",
          .text = "The harbour was quiet"},
         {.x = 0, .y = 20, .width = 200, .height = 20, .block = 1, .block_tag = "p",

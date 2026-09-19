@@ -18,7 +18,7 @@ static bool write_solid_png(const char *path, int width, int height,
                             unsigned char red, unsigned char green, unsigned char blue);
 
 /* The image path is worth a pixel-level assertion rather than a "did it draw
-   something" one. Its first bug was an offset: litehtml reports a resolved
+   something" one. Its first bug was an offset: the layout reports a resolved
    document position for a background, and adding that to the origin box drew
    every image at twice its own offset -- which looks like a partly clipped
    image, not like a wrong coordinate, and a smoke test would have passed. */
@@ -68,7 +68,7 @@ static void test_image_is_drawn_where_it_is_laid_out(void)
 
 /* An image wider than the surface is fitted to it rather than overflowing:
    the renderer decides that, because an <img> carrying an explicit CSS size
-   reserves its box and is never painted in this litehtml build. */
+   reserves its box and is never painted by this layout. */
 static void test_wide_image_is_fitted_to_the_surface(void)
 {
     const char *source = "/tmp/distill-image-wide-source.png";
@@ -147,7 +147,7 @@ int main(void)
     assert(strcmp(boxes[0].type, "search") == 0);
     assert(strcmp(boxes[0].name, "q") == 0);
     /* The reader gives every input the same explicit height as its GTK
-       overlay. That makes litehtml reserve the vertical space rather than
+       overlay. That makes the layout reserve the vertical space rather than
        putting the next label where an empty input's zero-height content box
        would be. */
     assert(boxes[0].width > 0);
@@ -185,7 +185,7 @@ int main(void)
     assert(strcmp(native[2].type, "checkbox") == 0 && native[2].checked);
     assert(strcmp(native[3].type, "radio") == 0 && native[3].required);
 
-    /* Choice labels are rendered by litehtml while their indicators are GTK
+    /* Choice labels are rendered by the page layout while their indicators are GTK
        overlays. Hitting either label must identify the input it controls. */
     const char *choice_page =
         "<!doctype html><style>html,body{margin:0}body{font-size:18px}"
@@ -268,7 +268,7 @@ int main(void)
     /* Text runs are what a selection is built from. The container is handed
        one per line with the box it filled, and nothing else in the boundary
        can answer where a character sits -- the shell has no layout of its own
-       and no access to the fonts litehtml chose. */
+       and no access to the fonts chosen by the layout. */
     const char *text_page =
         "<!doctype html><style>html,body{margin:0}body{font-size:18px;width:420px}"
         "p{margin:0 0 20px}li{margin:0}</style>"
@@ -331,7 +331,7 @@ int main(void)
     d_page_destroy(text_document);
 
     /* Collecting the text must leave the document as it found it. Both passes
-       ask litehtml what is under a point, and the collecting one asks it a
+       ask the layout what is under a point, and the collecting one asks it a
        thousand times in a row; a link that stops answering afterwards is a
        page whose links stop working the moment a reader selects a word. */
     const char *mixed_page =
@@ -402,7 +402,7 @@ int main(void)
     test_remote_sources_are_refused();
     test_bundled_font_roles_are_available();
 
-    puts("litehtml-geometry: ok");
+    puts("reader-layout-geometry: ok");
     return 0;
 }
 

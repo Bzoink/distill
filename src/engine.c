@@ -2229,10 +2229,6 @@ static char *run_extraction(Engine *engine, const char *serialized, bool include
 }
 #endif
 
-#ifdef DISTILL_B_PRUNED
-extern int distill_litehtml_probe(const char *html);
-#endif
-
 /* A page can be useful before its scripts run and empty after a framework
    crashes. Keep the two extraction results separate until there is enough
    evidence to choose one. These scores are deliberately content-oriented:
@@ -2862,7 +2858,7 @@ static void append_json_forms(Engine *engine, JSValueConst forms, DBuffer *outpu
     }
 }
 
-/* A URL as something to read rather than something to parse. litehtml
+/* A URL as something to read rather than something to parse. The reader
    implements neither overflow-wrap nor word-break, so a CDN URL is one
    unbreakable token that simply runs off the right edge of the column and
    keeps going. Shortening it is not only a layout fix: the host and the file
@@ -3307,7 +3303,7 @@ static char *reader_template(Engine *engine, const char *json, const char *theme
     dbuf_puts(&output,
         "}html,body{margin:0;padding:0;background:var(--page-background);color:var(--page-text);}");
     /* The measure lives on <body>, which is the one box guaranteed to be a
-       block here: litehtml's master stylesheet has no rule for <main>, which
+       block here: the reader stylesheet has no rule for <main>, which
        lays out as an inline box, and giving that box the measure instead
        changes how the margins inside the page collapse. So body is capped at
        the measure plus its gutters and centred in whatever the surface is,
@@ -3338,7 +3334,7 @@ static char *reader_template(Engine *engine, const char *json, const char *theme
         ".result-card{padding:.7em 0;border-bottom:1px solid var(--border);}.result-card h3{margin:0 0 .3em;}"
         ".form-card form{margin:0;background:transparent;text-align:left;}"
         ".form-field-label{display:block;margin:.7em 0 0;color:var(--page-text);text-align:left;}");
-    /* A native control is placed on the geometry litehtml reports for the
+    /* A native control is placed on the geometry reader_layout reports for the
        field it replaces, so a field that does not grow with the type leaves
        the reader with page-sized text in thumbnail-sized boxes. */
     dbuf_printf(&output,
@@ -3376,7 +3372,7 @@ static char *reader_template(Engine *engine, const char *json, const char *theme
                   ".form-card form select,.form-card form button{color:var(--card-background);"
                   "background:var(--card-background);background-image:none;"
                   "border-color:var(--card-background);text-shadow:none;}");
-    /* litehtml exposes a form control's content box. Native GTK controls are
+    /* reader_layout exposes a form control's content box. Native GTK controls are
        positioned from that geometry, so remove the source control's padding
        and border only while it is hidden behind its GTK replacement. Its
        reported origin is then the outer edge that GTK must occupy. Explicit
@@ -3384,7 +3380,7 @@ static char *reader_template(Engine *engine, const char *json, const char *theme
     if (native_forms)
         dbuf_puts(&output,
                   ".form-card form input,.form-card form textarea,.form-card form select{padding:0;border-width:0;}");
-    /* Mirrored rules rather than logical properties: litehtml lays out the
+    /* Mirrored rules rather than logical properties: reader_layout lays out the
        reader template, and physical sides are what it reliably supports. */
     if (rtl) {
         dbuf_puts(&output,
@@ -3517,14 +3513,14 @@ static char *viewer_template(Engine *engine, const char *json, int media_index,
     dbuf_puts(&output,
         "<!doctype html><html><head><meta charset=\"utf-8\"><title>Media viewer</title><style>"
         /* Deliberately plain block layout. An earlier version centred the
-           image with flexbox inside a calc() height, and litehtml drew a
+           image with flexbox inside a calc() height, and the reference drew a
            fraction of it.
 
            The stage is full bleed and everything else is inset with margins,
            for a reason worth writing down: the renderer fits an image to the
            surface width, so a stage inset by N would lose N pixels off the
            right of every wide image. Horizontal padding is avoided because in
-           this litehtml build a padding rule shifted sibling blocks as well
+           the reference build a padding rule shifted sibling blocks as well
            as its own, which moved the stage and clipped the image again. */
         "html,body{margin:0;background:#17191b;color:#f5f1e8;}"
         "body{font-family:sans-serif;padding:26px 0;}"
@@ -4239,7 +4235,7 @@ static int run_page(const DEngineRequest *request)
         free(json);
 #else
         (void)render_width; (void)render_height; (void)font_dir;
-        note("this build has no litehtml renderer\n");
+        note("this build has no pixel renderer\n");
         result = 2;
 #endif
     } else if (render_path) {
@@ -4268,7 +4264,7 @@ static int run_page(const DEngineRequest *request)
         free(json);
 #else
         (void)render_width; (void)render_height; (void)font_dir;
-        note("this build has no litehtml renderer\n");
+        note("this build has no pixel renderer\n");
         result = 2;
 #endif
     } else if (markdown_path) {
@@ -4334,9 +4330,6 @@ static int run_page(const DEngineRequest *request)
     } else if (dump_dom) {
         if (engine_callbacks && engine_callbacks->output)
             engine_callbacks->output(engine_callbacks->opaque, serialized);
-#ifdef DISTILL_B_PRUNED
-        note("arm-b-pruned litehtml=%s\n", distill_litehtml_probe(serialized) ? "ok" : "failed");
-#endif
     }
     run_stats.output_ms = clock_ms() - phase_started;
     /* The output above is still produced so the challenge shell can be

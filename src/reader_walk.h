@@ -3,7 +3,7 @@
 
 /* The reader page as a stream of events.
 
-   Every front end that is not litehtml renders the reader page by walking it:
+   Text front ends render the reader page by walking it:
    the Markdown export writes the events as text, the terminal writes them as
    cells. One walk means one reading of the page -- the shape the reader chose,
    its cards and their order reach every front end without any of them knowing
@@ -58,8 +58,7 @@ typedef struct {
 } ReaderImage;
 
 /* The fields the desktop shell reads out of a laid-out form, filled the same
-   way (see collect_form_boxes in litehtml_probe.cpp): whatever submits from a
-   terminal submits the same request. */
+   way: whatever submits from a terminal submits the same request. */
 typedef struct {
     bool in_form;
     unsigned form_index;       /* document order among forms, from 0 */

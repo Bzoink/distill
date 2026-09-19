@@ -11,7 +11,7 @@
 
    The buffer is 32-bit words, 0xAARRGGBB with colour multiplied by alpha --
    the layout Cairo calls ARGB32 and a framebuffer calls XRGB8888, since the
-   surface is always opaque. Coordinates that litehtml or the shaper produce
+   surface is always opaque. Coordinates that the layout or the shaper produce
    as fractions are passed as fractions, so the coverage at the edge of a
    glyph, a rule or a circle is the painter's to get right. */
 
