@@ -2,6 +2,7 @@
 #include "page.h"
 
 #include <assert.h>
+#include <locale.h>
 #include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -122,6 +123,56 @@ static void test_bundled_font_roles_are_available(void)
         d_render_font_destroy(font);
     }
     d_render_destroy(context);
+}
+
+static void test_heading_hierarchy(void)
+{
+    const char *html =
+        "<!doctype html><html><body><main>"
+        "<p>Lead paragraph.</p><h1>Title</h1><p>Opening paragraph.</p>"
+        "<h2>Section</h2><p>Section paragraph.</p><h3>Subsection</h3>"
+        "<p>Subsection paragraph.</p></main></body></html>";
+    DPage *page = d_page_create(html, 760, 800, DISTILL_TEST_FONT_DIR);
+    assert(page);
+    size_t count = d_page_text_boxes(page, NULL, 0);
+    DTextBox *runs = calloc(count, sizeof(*runs));
+    assert(runs);
+    assert(d_page_text_boxes(page, runs, count) == count);
+
+    DTextBox *paragraph_before_h2 = NULL, *h1 = NULL, *h2 = NULL, *h3 = NULL;
+    for (size_t i = 0; i < count; ++i) {
+        if (!strcmp(runs[i].text, "Title") && !strcmp(runs[i].block_tag, "h1")) h1 = &runs[i];
+        else if (!strcmp(runs[i].text, "Section") && !strcmp(runs[i].block_tag, "h2")) h2 = &runs[i];
+        else if (!strcmp(runs[i].text, "Subsection") && !strcmp(runs[i].block_tag, "h3")) h3 = &runs[i];
+        else if (!strcmp(runs[i].text, "Opening") && !strcmp(runs[i].block_tag, "p")) paragraph_before_h2 = &runs[i];
+    }
+    assert(h1 && h2 && h3 && paragraph_before_h2);
+    assert(h1->height > h2->height && h2->height > h3->height);
+    assert(h2->y - (paragraph_before_h2->y + paragraph_before_h2->height) >= 28);
+
+    free(runs);
+    d_page_destroy(page);
+}
+
+/* The GTK shell calls setlocale, and under a locale whose decimal point is a
+   comma a strtof-based CSS parser read "2.5em" as 2 and junk and dropped the
+   declaration: headings at body size, no paragraph margins, and every gate
+   green because the engine never leaves the C locale. */
+static void test_heading_hierarchy_in_comma_locale(void)
+{
+    static const char *const locales[] = {"sv_SE.UTF-8", "de_DE.UTF-8", "fr_FR.UTF-8", "nl_NL.UTF-8"};
+    const char *chosen = NULL;
+    for (size_t i = 0; i < sizeof(locales) / sizeof(locales[0]) && !chosen; ++i) {
+        if (!setlocale(LC_NUMERIC, locales[i])) continue;
+        if (localeconv()->decimal_point[0] == ',') chosen = locales[i];
+    }
+    if (!chosen) {
+        setlocale(LC_NUMERIC, "C");
+        puts("reader-layout-geometry: no comma-decimal locale installed; skipped the locale check");
+        return;
+    }
+    test_heading_hierarchy();
+    setlocale(LC_NUMERIC, "C");
 }
 
 int main(void)
@@ -401,6 +452,8 @@ int main(void)
     test_unreadable_image_takes_no_space();
     test_remote_sources_are_refused();
     test_bundled_font_roles_are_available();
+    test_heading_hierarchy();
+    test_heading_hierarchy_in_comma_locale();
 
     puts("reader-layout-geometry: ok");
     return 0;

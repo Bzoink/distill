@@ -210,6 +210,40 @@ static inline bool d_isspace(char c)
     return c == ' ' || c == '\t' || c == '\r' || c == '\n' || c == '\f';
 }
 
+/* strtod for the numbers the web writes: optional sign, digits, a '.'
+   fraction, an exponent. strtod reads the decimal point from LC_NUMERIC,
+   and a shell that calls setlocale (GTK does) under a comma locale then
+   reads "2.5em" as 2 followed by junk -- every fractional length in the
+   reader stylesheet silently dropped. No inf, nan or hex: CSS has none. */
+static inline double d_strtod(const char *text, char **end)
+{
+    const char *p = text;
+    while (d_isspace(*p)) ++p;
+    bool negative = *p == '-';
+    if (*p == '-' || *p == '+') ++p;
+    double value = 0;
+    bool digits = false;
+    while (*p >= '0' && *p <= '9') { value = value * 10 + (*p++ - '0'); digits = true; }
+    if (*p == '.' && p[1] >= '0' && p[1] <= '9') {
+        double scale = 1;
+        for (++p; *p >= '0' && *p <= '9'; ++p) { scale /= 10; value += (*p - '0') * scale; }
+        digits = true;
+    }
+    if (!digits) { if (end) *end = (char *)text; return 0; }
+    if ((*p == 'e' || *p == 'E') &&
+        ((p[1] >= '0' && p[1] <= '9') ||
+         ((p[1] == '-' || p[1] == '+') && p[2] >= '0' && p[2] <= '9'))) {
+        ++p;
+        bool down = *p == '-';
+        if (*p == '-' || *p == '+') ++p;
+        int exponent = 0;
+        for (; *p >= '0' && *p <= '9'; ++p) if (exponent < 400) exponent = exponent * 10 + (*p - '0');
+        for (int i = 0; i < exponent; ++i) value = down ? value / 10 : value * 10;
+    }
+    if (end) *end = (char *)p;
+    return negative ? -value : value;
+}
+
 static inline char *d_read_file(const char *path, size_t *length)
 {
     FILE *file = fopen(path, "rb");

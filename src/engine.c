@@ -3319,10 +3319,13 @@ static char *reader_template(Engine *engine, const char *json, const char *theme
         metrics.top_padding, metrics.side_padding,
         metrics.bottom_padding, metrics.side_padding, metrics.column);
     dbuf_puts(&output,
-        "h1,h2,h3,.eyebrow,button,input,.button,th{font-family:\"Source Sans 3\",sans-serif;}"
-        "h1{font-size:2.35em;line-height:1.08;letter-spacing:-.025em;margin:0 0 1.1em;color:var(--heading-text);}"
-        "h2{font-size:1.45em;line-height:1.2;margin:1.7em 0 .55em;color:var(--heading-text);}"
-        "h3{font-size:1.15em;line-height:1.25;margin:1.35em 0 .45em;color:var(--heading-text);}"
+        "h1,h2,h3,h4,h5,h6,.eyebrow,button,input,.button,th{font-family:\"Source Sans 3\",sans-serif;}"
+        "h1{font-size:2.5em;line-height:1.1;letter-spacing:-.025em;margin:0 0 .75em;color:var(--heading-text);}"
+        "h2{font-size:1.45em;line-height:1.2;margin:1.6em 0 .45em;color:var(--heading-text);}"
+        "h3{font-size:1.2em;line-height:1.25;margin:1.4em 0 .4em;color:var(--heading-text);}"
+        "h4{font-size:1.05em;line-height:1.3;margin:1.3em 0 .35em;color:var(--heading-text);}"
+        "h5{font-size:.95em;line-height:1.35;margin:1.2em 0 .3em;color:var(--heading-text);}"
+        "h6{font-size:.85em;line-height:1.4;margin:1.15em 0 .3em;color:var(--heading-text);}"
         ".link-index h2,.link-index h3{font-size:1em;line-height:1.35;margin:0 0 .55em;font-weight:600;}"
         ".link-index p,.link-index ul,.link-index ol{line-height:1.35;margin:0 0 .55em;}"
         "p,ul,ol,pre,blockquote{margin:0 0 1.05em;}"

@@ -186,12 +186,15 @@ static const char DEFAULT_CSS[] =
        so component classes such as `.button` can override it. */
     "a{text-decoration:underline;color:#00f;}"
     "h1,h2,h3,h4,h5,h6,div{display:block;}"
-    "h1{font-weight:bold;margin-top:.67em;margin-bottom:.67em;font-size:2em;}"
-    "h2{font-weight:bold;margin-top:.83em;margin-bottom:.83em;font-size:1.5em;}"
-    "h3{font-weight:bold;margin-top:1em;margin-bottom:1em;font-size:1.17em;}"
-    "h4{font-weight:bold;margin-top:1.33em;margin-bottom:1.33em;}"
-    "h5{font-weight:bold;margin-top:1.67em;margin-bottom:1.67em;font-size:.83em;}"
-    "h6{font-weight:bold;margin-top:2.33em;margin-bottom:2.33em;font-size:.67em;}"
+    /* Reader typography makes the document structure visible at a glance:
+       the title is unmistakable, section headings step down, and a new
+       section gets air above it without leaving a large hole below its label. */
+    "h1{font-weight:bold;margin-top:1.1em;margin-bottom:.55em;font-size:2.25em;line-height:1.1;}"
+    "h2{font-weight:bold;margin-top:1.6em;margin-bottom:.45em;font-size:1.45em;line-height:1.2;}"
+    "h3{font-weight:bold;margin-top:1.4em;margin-bottom:.4em;font-size:1.2em;line-height:1.25;}"
+    "h4{font-weight:bold;margin-top:1.3em;margin-bottom:.35em;font-size:1.05em;line-height:1.3;}"
+    "h5{font-weight:bold;margin-top:1.2em;margin-bottom:.3em;font-size:.95em;line-height:1.35;}"
+    "h6{font-weight:bold;margin-top:1.15em;margin-bottom:.3em;font-size:.85em;line-height:1.4;}"
     "br{display:inline-block;}span{display:inline;}img{display:inline-block;}"
     "hr{display:block;margin-top:.5em;margin-bottom:.5em;margin-left:auto;margin-right:auto;"
     "border-style:solid;border-width:1px;border-color:gray;}"
@@ -556,7 +559,7 @@ static bool parse_len(const char *value, Len *out)
     if (word_is(value, "auto")) { *out = LEN_AUTO; return true; }
     if (word_is(value, "none")) { *out = LEN_NONE; return true; }
     char *end = NULL;
-    float number = strtof(value, &end);
+    float number = (float)d_strtod(value, &end);
     if (end == value) return false;
     while (d_isspace(*end)) ++end;
     if (!*end) *out = (Len){number, number == 0 ? U_PX : U_NUMBER};
@@ -605,7 +608,7 @@ static bool parse_color(const char *value, DRenderColor *out)
         const char *p = open + 1;
         for (int i = 0; i < 4; ++i) {
             char *end = NULL;
-            c[i] = strtof(p, &end);
+            c[i] = (float)d_strtod(p, &end);
             if (end == p) { if (i < 3) return false; c[3] = 1; break; }
             p = end;
             if (*p == '%') { c[i] = i < 3 ? c[i] * 2.55f : c[i] / 100.0f; ++p; }

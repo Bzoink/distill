@@ -1920,14 +1920,14 @@ static double media_duration_seconds(const char *value)
     while (*value == ' ') ++value;
     if (*value != 'P' && *value != 'p') {
         char *end = NULL;
-        double seconds = strtod(value, &end);
+        double seconds = d_strtod(value, &end);
         if (end == value || seconds < 0) return 0;
         /* HH:MM:SS, the other spelling that turns up in data- attributes. */
         if (end && *end == ':') {
             double parts[3] = {seconds, 0, 0}; size_t count = 1;
             while (*end == ':' && count < 3) {
                 const char *next = end + 1; char *stop = NULL;
-                double part = strtod(next, &stop);
+                double part = d_strtod(next, &stop);
                 if (stop == next) break;
                 parts[count++] = part; end = stop;
             }
@@ -1940,7 +1940,7 @@ static double media_duration_seconds(const char *value)
     for (const char *at = value + 1; *at; ++at) {
         if (*at == 'T' || *at == 't') { time_part = true; continue; }
         char *end = NULL;
-        double amount = strtod(at, &end);
+        double amount = d_strtod(at, &end);
         if (end == at) break;
         switch (*end) {
             case 'H': case 'h': total += amount * 3600; break;
