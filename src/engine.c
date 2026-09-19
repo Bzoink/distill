@@ -1,8 +1,12 @@
-#define _POSIX_C_SOURCE 200809L
-#define _XOPEN_SOURCE 700
-
 #include "cutil.h"
+#include "datadir.h"
+#include "dclock.h"
+#include "dfs.h"
 #include "distill_version.h"
+#include "dproc.h"
+#include "embedded_js.h"
+#include "engine.h"
+#include "measure.h"
 #include "reader_cells.h"
 #include "reader_walk.h"
 
@@ -10,15 +14,9 @@
 #include <curl/curl.h>
 
 #include <errno.h>
-#include <fcntl.h>
 #include <limits.h>
-#include <sys/stat.h>
 #include <time.h>
-#include <unistd.h>
 
-#ifndef DISTILL_SOURCE_DIR
-#define DISTILL_SOURCE_DIR "."
-#endif
 
 /* What we tell servers we are. The HTTP header and navigator.userAgent must
    carry the same string: a page that compares what the server saw against what
@@ -33,8 +31,8 @@
 
 /* Reader zoom, as a percentage of the design size. The bounds are part of the
    command line, so they are defined outside the renderer's build. */
-#define READER_ZOOM_MIN 50
-#define READER_ZOOM_MAX 300
+#define READER_ZOOM_MIN D_ENGINE_ZOOM_MIN
+#define READER_ZOOM_MAX D_ENGINE_ZOOM_MAX
 
 typedef struct Engine Engine;
 
@@ -108,6 +106,8 @@ typedef struct Request {
     JSValue resolve;
     JSValue reject;
     bool completed;
+    /* Waiting for a transfer slot: see Engine.max_fetches. */
+    bool queued;
     unsigned attempts;
     char *effective_url;
     struct curl_slist *wire_headers;
@@ -148,13 +148,23 @@ struct Engine {
     CURLSH *share;
     char *source_url;
     char *base_url;
-    char *cookie_jar_path;
-    bool cookie_jar_persistent;
+    /* Cookies live in memory, in the share; a session file, where there is
+       one, is read into it at the start and written from it at the end. */
+    char *session_path;
     char *script_cookies;
     uint64_t started;
     uint64_t cap_ms;
     uint64_t memory_limit;
     uint64_t max_scripts;
+    /* Transfers attached at once; more wait their turn. A platform states
+       what its network can carry -- Muroxi's is not yet safe for many
+       parallel transfers -- and pages ask for far more than they need at
+       once: M0 measured a median of 1, a 90th percentile of 6 and a maximum
+       of 46. 0 is no limit. */
+    uint64_t max_fetches;
+    /* Slots held for a blocking fetch waiting its turn, so queued requests
+       do not take them first. */
+    uint64_t fetch_slots_reserved;
     uint64_t scripts_run;
     uint64_t script_errors;
     size_t async_sequence;
@@ -163,6 +173,8 @@ struct Engine {
     int async_pending;
     bool load_sent;
     bool cap_hit;
+    /* Scripts are loading or settling: every fetch spends the settle budget. */
+    bool in_script_phase;
     /* Progress reporting, off unless the caller asked for it. */
     bool progress;
     int progress_percent;
@@ -175,10 +187,100 @@ struct Engine {
 
 static uint64_t clock_ms(void)
 {
-    struct timespec now;
-    clock_gettime(CLOCK_MONOTONIC, &now);
-    return (uint64_t)now.tv_sec * 1000u + (uint64_t)now.tv_nsec / 1000000u;
+    return d_clock_ms();
 }
+
+/* What one run cost, for the Muroxi budgets (muroxi_compat.md, M0). Always
+   collected, since it is a handful of counters; written out only when
+   DISTILL_STATS asks. fetch, runtime, scripts, extract and output partition
+   the run; the two load times are the parts of runtime and extract spent
+   reading linkedom's and Readability's bytecode. */
+static struct {
+    DJsHeap js_heap;
+    uint64_t fetches;
+    uint64_t fetches_at_once;
+    uint64_t started;
+    uint64_t fetch_ms;
+    uint64_t runtime_ms;
+    uint64_t linkedom_load_ms;
+    uint64_t scripts_ms;
+    uint64_t extract_ms;
+    uint64_t readability_load_ms;
+    unsigned readability_loads;
+    uint64_t output_ms;
+    /* The peak RSS as each phase ended, so the phase that raised it shows. */
+    long rss_fetch_kib, rss_runtime_kib, rss_scripts_kib, rss_extract_kib;
+    uint64_t scripts_run;
+    bool cap_hit;
+} run_stats;
+
+/* The callbacks of the run in progress. One engine runs at a time. */
+static const DEngineCallbacks *engine_callbacks;
+
+/* Diagnosis, one line at a time, to the caller's callback -- or to stderr
+   where there is none, which is what the command does anyway. */
+static void note(const char *format, ...)
+{
+    va_list args;
+    va_start(args, format);
+    int length = vsnprintf(NULL, 0, format, args);
+    va_end(args);
+    if (length < 0) return;
+    char *text = d_xmalloc((size_t)length + 1);
+    va_start(args, format);
+    vsnprintf(text, (size_t)length + 1, format, args);
+    va_end(args);
+    for (char *line = text; *line;) {
+        char *end = strchr(line, '\n');
+        if (end) *end = '\0';
+        if (engine_callbacks && engine_callbacks->diagnostic)
+            engine_callbacks->diagnostic(engine_callbacks->opaque, line);
+        else
+            note("%s\n", line);
+        if (!end) break;
+        line = end + 1;
+    }
+    free(text);
+}
+
+/* How deep JavaScript may recurse, in bytes of native stack. QuickJS checks
+   its own depth against this and throws a catchable RangeError; the check is
+   only worth having if it fires before the real stack runs out. The limit
+   used to be a flat 8 MiB -- the whole of Linux's default stack -- so a page
+   recursing about 4,600 calls deep killed the engine with SIGSEGV instead.
+
+   The margin is for the C frames QuickJS does not count: those above the
+   point it measures from, and our own host functions. M0 measured the
+   engine's deepest stack on real pages at 345 KiB (YouTube), so 1 MiB is
+   about three times that. */
+#define JS_STACK_CEILING (8u * 1024u * 1024u)
+#define JS_STACK_MARGIN (1024u * 1024u)
+
+static size_t js_stack_limit(void)
+{
+    size_t available = d_proc_stack_limit();
+    if (!available) return JS_STACK_CEILING;
+    size_t margin = available / 2 < JS_STACK_MARGIN ? available / 2 : JS_STACK_MARGIN;
+    size_t limit = available - margin;
+    return limit < JS_STACK_CEILING ? limit : JS_STACK_CEILING;
+}
+
+static const JSMallocFunctions js_heap_functions = {
+    d_js_heap_calloc,
+    d_js_heap_malloc,
+    d_js_heap_free,
+    d_js_heap_realloc,
+    d_js_heap_usable_size,
+};
+
+static void note_fetch_started(uint64_t in_flight)
+{
+    ++run_stats.fetches;
+    if (in_flight > run_stats.fetches_at_once) run_stats.fetches_at_once = in_flight;
+}
+
+static uint64_t requests_attached(const Engine *engine);
+static void process_network(Engine *engine);
 
 /* One line per step on stdout: "progress PERCENT PHASE". The caller wanted to
    know the run is alive and roughly how far along it is, and a one-shot child
@@ -205,8 +307,8 @@ static void report_progress(Engine *engine, int percent, const char *phase)
     if (percent == engine->progress_percent && d_eq(phase, engine->progress_phase)) return;
     engine->progress_percent = percent;
     engine->progress_phase = phase;
-    printf("progress %d %s\n", percent, phase);
-    fflush(stdout);
+    if (engine_callbacks && engine_callbacks->progress)
+        engine_callbacks->progress(engine_callbacks->opaque, percent, phase);
 }
 
 /* Where the page actually came from. A redirect -- or a scheme this run had
@@ -217,8 +319,8 @@ static void report_location(Engine *engine)
 {
     if (!engine || !engine->progress || !engine->source_url) return;
     if (strchr(engine->source_url, '\n')) return;
-    printf("location %s\n", engine->source_url);
-    fflush(stdout);
+    if (engine_callbacks && engine_callbacks->location)
+        engine_callbacks->location(engine_callbacks->opaque, engine->source_url);
 }
 
 static char *js_string(JSContext *ctx, JSValueConst value)
@@ -393,10 +495,11 @@ static char *resolve_url(const char *base, const char *candidate)
         free(head);
         return out;
     }
-    char cwd[PATH_MAX];
-    if (!getcwd(cwd, sizeof(cwd))) return d_strdup(candidate);
+    char *cwd = d_fs_current_directory();
+    if (!cwd) return d_strdup(candidate);
     const char *slash = strrchr(base, '/');
     char *prefix = slash ? d_strndup(base, (size_t)(slash - base + 1)) : d_cat2(cwd, "/");
+    free(cwd);
     char *joined = d_cat2(prefix, candidate);
     free(prefix);
     return joined;
@@ -429,11 +532,13 @@ static char *file_from_url(const char *url)
 static char *absolute_input(const char *input)
 {
     if (is_http_url(input) || d_starts(input, "file://")) return d_strdup(input);
-    char *resolved = realpath(input, NULL);
+    char *resolved = d_fs_absolute(input);
     if (resolved) return resolved;
-    char cwd[PATH_MAX];
-    if (!getcwd(cwd, sizeof(cwd))) return d_strdup(input);
-    return d_cat3(cwd, "/", input);
+    char *cwd = d_fs_current_directory();
+    if (!cwd) return d_strdup(input);
+    char *joined = d_cat3(cwd, "/", input);
+    free(cwd);
+    return joined;
 }
 
 static size_t curl_write(void *ptr, size_t size, size_t count, void *opaque)
@@ -503,21 +608,21 @@ static void configure_curl_common(Engine *engine, CURL *easy, const char *refere
     curl_easy_setopt(easy, CURLOPT_SHARE, engine->share);
     /* An empty COOKIEFILE enables libcurl's in-memory cookie engine. The
        share handle makes it common to the main request and all subresources.
-       A session file is named instead, so cookies written by an earlier run
-       are read back in -- which is what lets a login survive to the next
-       navigation. */
-    curl_easy_setopt(easy, CURLOPT_COOKIEFILE,
-                     engine->cookie_jar_persistent && engine->cookie_jar_path
-                         ? engine->cookie_jar_path : "");
-    if (engine->cookie_jar_path) {
-        curl_easy_setopt(easy, CURLOPT_COOKIEJAR, engine->cookie_jar_path);
-    }
+       No file is named: a session file is read and written by the engine
+       itself (load_session, save_session), so libcurl never touches disk. */
+    curl_easy_setopt(easy, CURLOPT_COOKIEFILE, "");
     curl_easy_setopt(easy, CURLOPT_USERAGENT, DISTILL_USER_AGENT);
     curl_easy_setopt(easy, CURLOPT_ACCEPT_ENCODING, "");
     /* A client presenting a Chrome user agent should negotiate the protocol
        version Chrome negotiates. HTTP/1.1-only traffic from a self-declared
-       Chrome is an inconsistency some origins reject on its own. */
-    curl_easy_setopt(easy, CURLOPT_HTTP_VERSION, (long)CURL_HTTP_VERSION_2TLS);
+       Chrome is an inconsistency some origins reject on its own.
+
+       Only where this libcurl speaks HTTP/2. Built without it -- Muroxi's
+       is -- curl refuses the option, and HTTP/1.1 is then the answer by
+       accident rather than by decision. */
+    static int http2 = -1;
+    if (http2 < 0) http2 = (curl_version_info(CURLVERSION_NOW)->features & CURL_VERSION_HTTP2) != 0;
+    if (http2) curl_easy_setopt(easy, CURLOPT_HTTP_VERSION, (long)CURL_HTTP_VERSION_2TLS);
     /* FOLLOWLOCATION without a bound follows a redirect loop until the
        request timeout expires, spending the whole settle budget. */
     curl_easy_setopt(easy, CURLOPT_MAXREDIRS, 20L);
@@ -753,6 +858,22 @@ static bool transport_never_opened(CURLcode result)
     }
 }
 
+/* A failure TLS itself reported: a handshake or a certificate refused. */
+static bool transport_tls_refused(CURLcode result)
+{
+    switch (result) {
+    case CURLE_SSL_CONNECT_ERROR:
+    case CURLE_PEER_FAILED_VERIFICATION:
+    case CURLE_SSL_CERTPROBLEM:
+    case CURLE_SSL_CACERT_BADFILE:
+    case CURLE_SSL_ISSUER_ERROR:
+    case CURLE_SSL_INVALIDCERTSTATUS:
+        return true;
+    default:
+        return false;
+    }
+}
+
 static bool fetch_sync_request(Engine *engine, const char *url, DBuffer *body,
                                long *status, char **effective_url,
                                const char *request_method, const char *request_data,
@@ -777,6 +898,41 @@ static bool fetch_sync_request(Engine *engine, const char *url, DBuffer *body,
         return true;
     }
     free(path);
+    /* A script or module fetched while scripts load is part of
+       the settle budget, which is a hard cap. Each used to get the whole cap
+       as its own timeout and was fetched even after the cap had passed, so a
+       page with a long chain of blocking scripts ran far past it: X settled
+       in 13 s against a 5 s cap. Give each what is left, and nothing once it
+       is spent. */
+    long timeout_ms = (long)engine->cap_ms;
+    if (engine->in_script_phase && engine->cap_ms) {
+        uint64_t elapsed = clock_ms() - engine->started;
+        if (elapsed >= engine->cap_ms) {
+            engine->cap_hit = true;
+            return false;
+        }
+        timeout_ms = (long)(engine->cap_ms - elapsed);
+    }
+    /* A blocking fetch is a transfer like any other, so it waits for a slot
+       under the fetch limit too, keeping the network moving meanwhile. Only
+       in the script phase: before it nothing else is in flight. */
+    if (engine->in_script_phase && engine->max_fetches && engine->multi &&
+        requests_attached(engine) >= engine->max_fetches) {
+        ++engine->fetch_slots_reserved;
+        while (requests_attached(engine) >= engine->max_fetches) {
+            uint64_t elapsed = clock_ms() - engine->started;
+            if (engine->cap_ms && elapsed >= engine->cap_ms) {
+                --engine->fetch_slots_reserved;
+                engine->cap_hit = true;
+                return false;
+            }
+            curl_multi_poll(engine->multi, NULL, 0, 10, NULL);
+            process_network(engine);
+        }
+        --engine->fetch_slots_reserved;
+        if (engine->cap_ms) timeout_ms = (long)(engine->cap_ms - (clock_ms() - engine->started));
+        if (timeout_ms < 1) timeout_ms = 1;
+    }
     CURL *easy = curl_easy_init();
     if (!easy) return false;
     curl_easy_setopt(easy, CURLOPT_URL, url);
@@ -797,11 +953,12 @@ static bool fetch_sync_request(Engine *engine, const char *url, DBuffer *body,
         document_request ? NULL : engine->source_url, NULL, document_request);
     curl_easy_setopt(easy, CURLOPT_HTTPHEADER, headers);
     curl_easy_setopt(easy, CURLOPT_CONNECTTIMEOUT_MS, connection_timeout_ms(engine));
-    curl_easy_setopt(easy, CURLOPT_TIMEOUT_MS, (long)engine->cap_ms);
+    curl_easy_setopt(easy, CURLOPT_TIMEOUT_MS, timeout_ms);
     if (request_method && d_ieq(request_method, "post")) {
         curl_easy_setopt(easy, CURLOPT_POST, 1L);
         curl_easy_setopt(easy, CURLOPT_POSTFIELDS, request_data ? request_data : "");
     }
+    note_fetch_started(requests_attached(engine) + 1);
     CURLcode result = curl_easy_perform(easy);
     long code = 0;
     curl_easy_getinfo(easy, CURLINFO_RESPONSE_CODE, &code);
@@ -857,10 +1014,10 @@ static void note_exception(Engine *engine, const char *where)
     ++engine->script_errors;
     JSValue exception = JS_GetException(engine->context);
     char *message = js_string(engine->context, exception);
-    fprintf(stderr, "script error [%s]: %s\n", where, message);
+    note("script error [%s]: %s\n", where, message);
     JSValue stack_value = JS_GetPropertyStr(engine->context, exception, "stack");
     char *stack = js_string(engine->context, stack_value);
-    if (*stack && !d_eq(stack, message)) fprintf(stderr, "script stack [%s]: %s\n", where, stack);
+    if (*stack && !d_eq(stack, message)) note("script stack [%s]: %s\n", where, stack);
     free(stack);
     JS_FreeValue(engine->context, stack_value);
     free(message);
@@ -917,6 +1074,15 @@ static void free_request(Engine *engine, Request *request)
 
 static bool attach_request_handle(Engine *engine, Request *request)
 {
+    /* Counted before this request has a handle, on every path here: new,
+       retried or dequeued. A new request is not in the list yet, so counting
+       after attaching would miss it. */
+    uint64_t attached = requests_attached(engine);
+    if (engine->max_fetches && attached + engine->fetch_slots_reserved >= engine->max_fetches) {
+        request->queued = true;
+        return true;
+    }
+    request->queued = false;
     request->easy = curl_easy_init();
     if (!request->easy) return false;
     header_vec_clear(&request->response_headers);
@@ -948,7 +1114,18 @@ static bool attach_request_handle(Engine *engine, Request *request)
         request->easy = NULL;
         return false;
     }
+    note_fetch_started(attached + 1);
     return true;
+}
+
+/* Transfers the multi handle holds right now. A request's easy handle exists
+   exactly while its transfer is attached. */
+static uint64_t requests_attached(const Engine *engine)
+{
+    uint64_t attached = 0;
+    for (size_t i = 0; i < engine->requests.length; ++i)
+        if (engine->requests.items[i]->easy) ++attached;
+    return attached;
 }
 
 static Request *start_request(Engine *engine, RequestKind kind, const char *url,
@@ -1365,11 +1542,11 @@ static JSValue console_callback(JSContext *ctx, JSValueConst this_val, int argc,
     fputs("distill console", stderr);
     for (int i = 0; i < argc; ++i) {
         char *arg = js_string(ctx, argv[i]);
-        fprintf(stderr, " %s", arg);
+        note(" %s", arg);
         if (JS_IsObject(argv[i])) {
             JSValue stack_value = JS_GetPropertyStr(ctx, argv[i], "stack");
             char *stack = js_string(ctx, stack_value);
-            if (*stack) fprintf(stderr, "\n  stack: %s", stack);
+            if (*stack) note("\n  stack: %s", stack);
             free(stack);
             JS_FreeValue(ctx, stack_value);
         }
@@ -1469,6 +1646,18 @@ static void process_network(Engine *engine)
         request->completed = true;
         finish_request(engine, request);
     }
+    /* Slots freed above go to waiting requests, in the order they were made. */
+    for (size_t i = 0; i < engine->requests.length; ++i) {
+        Request *request = engine->requests.items[i];
+        if (!request->queued || request->completed) continue;
+        if (engine->max_fetches &&
+            requests_attached(engine) + engine->fetch_slots_reserved >= engine->max_fetches) break;
+        if (!attach_request_handle(engine, request)) {
+            request->queued = false;
+            request->completed = true;
+            finish_request(engine, request);
+        }
+    }
 }
 
 /* A module specifier resolves against the URL of the module that imported
@@ -1559,84 +1748,88 @@ static void dispatch_host_event(Engine *engine, const char *kind, const char *ty
     JS_FreeValue(engine->context, dispatch);
 }
 
-static const char *HOST_JS =
-"globalThis.__listeners = {window: Object.create(null), document: Object.create(null)};"
-"globalThis.__add = function(kind, type, callback) { (globalThis.__listeners[kind][type] ||= []).push(callback); };"
-"globalThis.__dispatch = function(kind, type) { for (const callback of (globalThis.__listeners[kind][type] || []).slice()) callback({type, target: kind === 'window' ? window : document}); };"
-"globalThis.__setWindow = function(name, value) { Object.defineProperty(window, name, {value, writable:true, configurable:true}); };"
-"globalThis.Element = window.Element; globalThis.Node = window.Node; globalThis.Event = window.Event; globalThis.HTMLAnchorElement = window.HTMLAnchorElement; globalThis.HTMLImageElement = window.HTMLImageElement; globalThis.HTMLFormElement = window.HTMLFormElement;"
-"__setWindow('addEventListener', (type, callback) => __add('window', type, callback));"
-"__setWindow('removeEventListener', () => {}); __setWindow('dispatchEvent', event => __dispatch('window', event.type));"
-"__setWindow('window', window); __setWindow('document', document);"
-"__setWindow('self', window); globalThis.self = window;"
-"__setWindow('innerWidth', 1280); __setWindow('innerHeight', 1024);"
-"__setWindow('setTimeout', setTimeout); __setWindow('clearTimeout', clearTimeout); __setWindow('setInterval', setInterval); __setWindow('clearInterval', clearInterval);"
-"globalThis.requestIdleCallback = callback => setTimeout(() => callback({didTimeout:false, timeRemaining:() => 50}), 1); globalThis.cancelIdleCallback = id => clearTimeout(id); __setWindow('requestIdleCallback', requestIdleCallback); __setWindow('cancelIdleCallback', cancelIdleCallback);"
-"__setWindow('requestAnimationFrame', requestAnimationFrame); __setWindow('fetch', fetch); __setWindow('console', console);"
-"if (typeof requestAnimationFrame !== 'function') globalThis.requestAnimationFrame = callback => setTimeout(callback, 16); __setWindow('requestAnimationFrame', requestAnimationFrame);"
-"__setWindow('scrollTo', () => {}); __setWindow('scrollBy', () => {});"
-"Object.defineProperty(document, 'addEventListener', {value:(type, callback) => __add('document', type, callback), configurable:true});"
-"Object.defineProperty(document, 'removeEventListener', {value:() => {}, configurable:true});"
-"Object.defineProperty(document, 'dispatchEvent', {value:event => __dispatch('document', event.type), configurable:true});"
-"document.readyState = 'loading';"
-"document.visibilityState = 'visible';"
-"Object.defineProperty(document, 'cookie', {get() { return __distillCookieGet(); }, set(value) { __distillCookieSet(String(value)); }, configurable:true});"
-"globalThis.localStorage = {__data: Object.create(null), getItem(k) { return this.__data[k] === undefined ? null : this.__data[k]; }, setItem(k,v) { this.__data[k] = String(v); }, removeItem(k) { delete this.__data[k]; }, clear() { this.__data = Object.create(null); }, key(i) { return Object.keys(this.__data)[i] ?? null; }};"
-"Object.defineProperty(localStorage, 'length', {get() { return Object.keys(this.__data).length; }});"
-"globalThis.sessionStorage = {__data: Object.create(null), getItem(k) { return this.__data[k] === undefined ? null : this.__data[k]; }, setItem(k,v) { this.__data[k] = String(v); }, removeItem(k) { delete this.__data[k]; }, clear() { this.__data = Object.create(null); }, key(i) { return Object.keys(this.__data)[i] ?? null; }};"
-"Object.defineProperty(sessionStorage, 'length', {get() { return Object.keys(this.__data).length; }});"
-"__setWindow('localStorage', localStorage); __setWindow('sessionStorage', sessionStorage);"
-"globalThis.navigator = window.navigator || {userAgent: '" DISTILL_USER_AGENT "', language: 'en-US', platform: 'Linux'};"
-"Object.defineProperty(navigator, 'userAgent', {value:'" DISTILL_USER_AGENT "', configurable:true}); if (!navigator.language) navigator.language = 'en-US'; __setWindow('navigator', navigator);"
-"globalThis.screen = {width: 1280, height: 1024}; __setWindow('screen', screen);"
-"globalThis.visualViewport = {width:1280, height:1024, offsetLeft:0, offsetTop:0, pageLeft:0, pageTop:0, scale:1, addEventListener() {}, removeEventListener() {}}; __setWindow('visualViewport', visualViewport);"
-"globalThis.crypto = {getRandomValues(a) { for (let i=0;i<a.length;i++) a[i] = (i * 73 + 41) & 255; return a; }}; __setWindow('crypto', crypto);"
-"globalThis.CSS = {escape(value) { return String(value).replace(/[^a-zA-Z0-9_-]/g, ch => '\\\\' + ch); }, supports() { return false; }}; __setWindow('CSS', CSS);"
-"globalThis.AbortSignal = class { constructor() { this.aborted=false; this.reason=undefined; this.__listeners=[]; } addEventListener(type, callback) { if (type === 'abort' && typeof callback === 'function') this.__listeners.push(callback); } removeEventListener(type, callback) { if (type === 'abort') this.__listeners=this.__listeners.filter(item => item !== callback); } dispatchEvent(event) { for (const callback of this.__listeners.slice()) callback.call(this, event); return true; } throwIfAborted() { if (this.aborted) throw this.reason || new Error('The operation was aborted'); } };"
-"globalThis.AbortController = class { constructor() { this.signal=new AbortSignal(); } abort(reason) { if (this.signal.aborted) return; this.signal.aborted=true; this.signal.reason=reason || new Error('The operation was aborted'); this.signal.dispatchEvent({type:'abort', target:this.signal}); } }; __setWindow('AbortSignal', AbortSignal); __setWindow('AbortController', AbortController);"
-"globalThis.CustomEvent = class extends Event { constructor(type, init={}) { super(type, init); this.detail=init.detail; } }; __setWindow('CustomEvent', CustomEvent);"
-"globalThis.Intl = { getCanonicalLocales(locales) { if (locales == null) return []; return (Array.isArray(locales) ? locales : [locales]).map(String); }, Locale: class { constructor(locale) { this.baseName=String(locale || 'en-US'); this.language=this.baseName.split('-')[0]; } toString() { return this.baseName; } maximize() { return this; } }, NumberFormat: class { constructor(locales, options) { this.locales=locales; this.options=options || {}; } format(value) { return String(value); } formatToParts(value) { return [{type:'integer', value:String(value)}]; } resolvedOptions() { return {locale:'en-US', numberingSystem:'latn'}; } }, DateTimeFormat: class { constructor(locales, options) { this.locales=locales; this.options=options || {}; } format(value) { return new Date(value == null ? Date.now() : value).toISOString(); } formatToParts(value) { return [{type:'literal', value:this.format(value)}]; } resolvedOptions() { return {locale:'en-US', calendar:'gregory', numberingSystem:'latn', timeZone:'UTC'}; } }, PluralRules: class { select(value) { return Number(value) === 1 ? 'one' : 'other'; } resolvedOptions() { return {locale:'en-US', type:'cardinal', pluralCategories:['one','other']}; } }, RelativeTimeFormat: class { format(value, unit) { return String(value) + ' ' + String(unit); } resolvedOptions() { return {locale:'en-US', numeric:'always', style:'long'}; } }, ListFormat: class { format(values) { return Array.from(values || []).join(', '); } }, Collator: class { compare(a, b) { return String(a).localeCompare(String(b)); } }, Segmenter: class { segment(value) { return Array.from(String(value), segment => ({segment})); } }, DisplayNames: class { of(value) { return String(value); } } }; __setWindow('Intl', Intl);"
-"globalThis.matchMedia = q => ({matches: false, media: q, addListener() {}, removeListener() {}, addEventListener() {}, removeEventListener() {}}); __setWindow('matchMedia', matchMedia);"
-"globalThis.performance = {now: () => Date.now(), mark() {}, measure() {}, getEntries() { return []; }, getEntriesByName() { return []; }, getEntriesByType() { return []; }, clearMarks() {}, clearMeasures() {}}; __setWindow('performance', performance);"
-"globalThis.PerformanceObserver = class { constructor(callback) { this.callback=callback; } observe() {} disconnect() {} takeRecords() { return []; } }; PerformanceObserver.supportedEntryTypes=[]; __setWindow('PerformanceObserver', PerformanceObserver);"
-"globalThis.NodeFilter = {SHOW_ALL:4294967295, SHOW_ELEMENT:1, SHOW_TEXT:4, SHOW_COMMENT:128, FILTER_ACCEPT:1, FILTER_REJECT:2, FILTER_SKIP:3}; __setWindow('NodeFilter', NodeFilter);"
-"globalThis.history = {pushState(s,t,u) { const suffix = String(u); location.search = suffix[0] === '?' ? suffix : ''; location.href = location.href.split('?')[0] + location.search; }, replaceState(s,t,u) { this.pushState(s,t,u); }}; __setWindow('history', history);"
-"if (typeof Element !== 'undefined') Element.prototype.getBoundingClientRect = function() { return {x:0,y:0,top:0,left:0,width:800,height:20,right:800,bottom:20}; };"
-"if (typeof Element !== 'undefined') { Object.defineProperty(Element.prototype, 'offsetHeight', {get() { return 20; }}); Object.defineProperty(Element.prototype, 'offsetWidth', {get() { return 800; }}); }"
-"if (document.createRange) { const __createRange=document.createRange.bind(document); document.createRange=() => { const range=__createRange(); range.getBoundingClientRect=() => ({x:0,y:0,top:0,left:0,width:800,height:20,right:800,bottom:20}); range.getClientRects=() => [range.getBoundingClientRect()]; return range; }; }"
-"globalThis.__resolveURL = function(value, baseValue) { const raw = String(value || ''); const fallback = (document.querySelector('base') && document.querySelector('base').getAttribute('href')) || location.href; const base = String(baseValue || fallback); const schemeAt = base.indexOf('://'); const baseOrigin = schemeAt < 0 ? '' : base.slice(0, schemeAt + 3) + base.slice(schemeAt + 3).split(/[/?#]/)[0]; if (/^[a-z]+:/i.test(raw)) return raw; if (raw.startsWith('//')) return (location.protocol || 'https:') + raw; if (raw.startsWith('/')) return baseOrigin + raw; const basePathEnd = base.search(/[?#]/); const basePath = basePathEnd < 0 ? base : base.slice(0, basePathEnd); const prefix = basePath.endsWith('/') ? basePath : basePath.slice(0, basePath.lastIndexOf('/') + 1); const pieces = (prefix + raw).split('/'); const clean = []; for (const piece of pieces) { if (!piece || piece === '.') continue; if (piece === '..') clean.pop(); else clean.push(piece); } return baseOrigin + '/' + clean.join('/'); };"
-"globalThis.URLSearchParams = class { constructor(value='') { this.__pairs=[]; const source=String(value).replace(/^\\?/, ''); for (const part of source ? source.split('&') : []) { const at=part.indexOf('='); const key=decodeURIComponent((at < 0 ? part : part.slice(0, at)).replace(/\\+/g, ' ')); const val=decodeURIComponent((at < 0 ? '' : part.slice(at + 1)).replace(/\\+/g, ' ')); this.__pairs.push([key, val]); } } append(key, value) { this.__pairs.push([String(key), String(value)]); } set(key, value) { this.delete(key); this.append(key, value); } get(key) { const item=this.__pairs.find(pair => pair[0] === String(key)); return item ? item[1] : null; } getAll(key) { return this.__pairs.filter(pair => pair[0] === String(key)).map(pair => pair[1]); } has(key) { return this.__pairs.some(pair => pair[0] === String(key)); } delete(key) { this.__pairs=this.__pairs.filter(pair => pair[0] !== String(key)); } forEach(callback, thisArg) { this.__pairs.forEach(pair => callback.call(thisArg, pair[1], pair[0], this)); } entries() { return this.__pairs[Symbol.iterator](); } keys() { return this.__pairs.map(pair => pair[0])[Symbol.iterator](); } values() { return this.__pairs.map(pair => pair[1])[Symbol.iterator](); } toString() { return this.__pairs.map(pair => encodeURIComponent(pair[0]) + '=' + encodeURIComponent(pair[1])).join('&'); } [Symbol.iterator]() { return this.entries(); } };"
-"globalThis.Headers = class { constructor(init) { this.__items=Object.create(null); if (init) { if (typeof init.forEach === 'function') init.forEach((v,k) => this.append(k,v)); else if (Array.isArray(init)) init.forEach(pair => this.append(pair[0], pair[1])); else Object.keys(init).forEach(k => this.append(k, init[k])); } } append(name,value) { const key=String(name).toLowerCase(); this.__items[key]=this.__items[key] ? this.__items[key]+', '+String(value) : String(value); } set(name,value) { this.__items[String(name).toLowerCase()]=String(value); } get(name) { const value=this.__items[String(name).toLowerCase()]; return value === undefined ? null : value; } has(name) { return Object.prototype.hasOwnProperty.call(this.__items, String(name).toLowerCase()); } delete(name) { delete this.__items[String(name).toLowerCase()]; } forEach(callback,thisArg) { Object.keys(this.__items).forEach(k => callback.call(thisArg,this.__items[k],k,this)); } entries() { return Object.keys(this.__items).map(k => [k,this.__items[k]]); } keys() { return Object.keys(this.__items); } values() { return Object.keys(this.__items).map(k => this.__items[k]); } [Symbol.iterator]() { return this.entries()[Symbol.iterator](); } }; __setWindow('Headers', Headers);"
-"globalThis.URL = class { constructor(value, base) { const href=__resolveURL(value, base); const scheme=href.indexOf('://'); const authorityStart=scheme < 0 ? 0 : scheme + 3; const tail=href.slice(authorityStart); const authorityEnd=tail.search(/[/?#]/); const authority=authorityEnd < 0 ? tail : tail.slice(0, authorityEnd); const rest=authorityEnd < 0 ? '' : tail.slice(authorityEnd); const pathEnd=rest.search(/[?#]/); this.protocol=scheme < 0 ? '' : href.slice(0, scheme + 1); this.origin=scheme < 0 ? '' : href.slice(0, authorityStart) + authority; this.host=authority; this.hostname=authority.replace(/^.*@/, '').replace(/:\\d+$/, ''); this.port=(this.hostname === authority ? '' : authority.slice(authority.lastIndexOf(':') + 1)); this.pathname=pathEnd < 0 ? (rest || '/') : (rest.slice(0, pathEnd) || '/'); const query=rest.indexOf('?'); const hash=rest.indexOf('#'); this.search=query < 0 ? '' : rest.slice(query, hash < 0 ? rest.length : hash); this.hash=hash < 0 ? '' : rest.slice(hash); this.username=''; this.password=''; this.href=this.origin + this.pathname + this.search + this.hash; this.searchParams=new URLSearchParams(this.search); } toString() { return this.href; } toJSON() { return this.href; } static canParse(value, base) { try { new URL(value, base); return true; } catch (e) { return false; } } }; globalThis.URL.createObjectURL = () => 'blob:distill'; globalThis.URL.revokeObjectURL = () => {}; __setWindow('URL', URL); __setWindow('URLSearchParams', URLSearchParams);"
-"globalThis.__anchorPart = function(node, part) { const href = __resolveURL(node.getAttribute('href') || ''); const scheme = href.indexOf('://'); if (scheme < 0) return part === 'href' ? href : ''; const authority = scheme + 3; const tail = href.slice(authority); const end = tail.search(/[/?#]/); const host = end < 0 ? tail : tail.slice(0, end); const rest = end < 0 ? '' : tail.slice(end); const pathEnd = rest.search(/[?#]/); const pathname = pathEnd < 0 ? (rest || '/') : (rest.slice(0, pathEnd) || '/'); const query = rest.indexOf('?'); const hash = rest.indexOf('#'); const search = query < 0 ? '' : rest.slice(query, hash < 0 ? rest.length : hash); const fragment = hash < 0 ? '' : rest.slice(hash); const portAt = host.lastIndexOf(':'); const hasPort = portAt > -1 && host.indexOf(']') < portAt; const hostname = hasPort ? host.slice(0, portAt) : host; const port = hasPort ? host.slice(portAt + 1) : ''; if (part === 'href') return href; if (part === 'protocol') return href.slice(0, scheme + 1); if (part === 'host') return host; if (part === 'hostname') return hostname; if (part === 'port') return port; if (part === 'pathname') return pathname; if (part === 'search') return search; if (part === 'hash') return fragment; return ''; };"
-"try { Object.defineProperty(HTMLAnchorElement.prototype, 'href', {get() { return __anchorPart(this, 'href'); }, set(value) { this.setAttribute('href', value); }, configurable:true}); Object.defineProperty(HTMLAnchorElement.prototype, 'protocol', {get() { return __anchorPart(this, 'protocol'); }, configurable:true}); Object.defineProperty(HTMLAnchorElement.prototype, 'host', {get() { return __anchorPart(this, 'host'); }, configurable:true}); Object.defineProperty(HTMLAnchorElement.prototype, 'hostname', {get() { return __anchorPart(this, 'hostname'); }, configurable:true}); Object.defineProperty(HTMLAnchorElement.prototype, 'port', {get() { return __anchorPart(this, 'port'); }, configurable:true}); Object.defineProperty(HTMLAnchorElement.prototype, 'pathname', {get() { return __anchorPart(this, 'pathname'); }, configurable:true}); Object.defineProperty(HTMLAnchorElement.prototype, 'search', {get() { return __anchorPart(this, 'search'); }, configurable:true}); Object.defineProperty(HTMLAnchorElement.prototype, 'hash', {get() { return __anchorPart(this, 'hash'); }, configurable:true}); } catch (e) {}"
-"try { Object.defineProperty(HTMLImageElement.prototype, 'src', {get() { return __resolveURL(this.getAttribute('src')); }, configurable:true}); } catch (e) {}"
-"try { Object.defineProperty(HTMLFormElement.prototype, 'action', {get() { return __resolveURL(this.getAttribute('action')); }, configurable:true}); } catch (e) {}"
-"for (const node of document.querySelectorAll('a')) try { Object.defineProperty(node, 'href', {get() { return __resolveURL(this.getAttribute('href')); }, configurable:true}); } catch (e) {}"
-"for (const node of document.querySelectorAll('img')) try { Object.defineProperty(node, 'src', {get() { return __resolveURL(this.getAttribute('src')); }, configurable:true}); } catch (e) {}"
-"for (const node of document.querySelectorAll('form')) try { Object.defineProperty(node, 'action', {get() { return __resolveURL(this.getAttribute('action')); }, configurable:true}); } catch (e) {}"
-"globalThis.getComputedStyle = node => ({display: node.id === 'genuinely-hidden' ? 'none' : ((node.getAttribute && node.getAttribute('hidden') !== null) ? 'none' : 'block'), visibility: 'visible', marginLeft: '0px', marginRight: '0px', getPropertyValue(name) { return this[name] || ''; }}); __setWindow('getComputedStyle', getComputedStyle);"
-"globalThis.IntersectionObserver = class { constructor(callback) { this.callback = callback; } observe(target) { this.callback([{target, isIntersecting:true, intersectionRatio:1, intersectionRect:{top:0,left:0,width:1280,height:1024,right:1280,bottom:1024}}], this); } unobserve() {} disconnect() {} };"
-"globalThis.ResizeObserver = class { constructor(callback) { this.callback=callback; } observe(target) { this.callback([{target, contentRect:{x:0,y:0,top:0,left:0,width:800,height:20,right:800,bottom:20}, borderBoxSize:[{inlineSize:800,blockSize:20},], contentBoxSize:[{inlineSize:800,blockSize:20}]}], this); } unobserve() {} disconnect() {} }; __setWindow('ResizeObserver', ResizeObserver);"
-"globalThis.MutationObserver = class { constructor(callback) { this.callback = callback; } observe() { this.callback([{}], this); } disconnect() {} };"
-"globalThis.XMLHttpRequest = class { constructor() { this.readyState=0; this.status=0; this.responseText=''; this.responseURL=''; this.onreadystatechange=null; this.onload=null; this.onerror=null; this._headers=Object.create(null); this._responseHeaders=Object.create(null); } open(method,url,async=true) { this._method=method || 'GET'; this._url=url; this._async=async; this.readyState=1; } setRequestHeader(name,value) { const key=String(name).toLowerCase(); this._headers[key]=this._headers[key] ? this._headers[key]+', '+String(value) : String(value); } getResponseHeader(name) { return this._responseHeaders[String(name).toLowerCase()] || null; } getAllResponseHeaders() { return Object.keys(this._responseHeaders).map(k=>k+': '+this._responseHeaders[k]).join('\\r\\n'); } send(body) { fetch(this._url,{method:this._method,body,headers:this._headers}).then(r => { this.status=r.status; this.responseURL=r.url || this._url; r.headers.forEach((v,k)=>{this._responseHeaders[k.toLowerCase()]=v;}); return r.text(); }).then(t => { this.responseText=t; this.readyState=4; if (this.onreadystatechange) this.onreadystatechange(); if (this.onload) this.onload(); }).catch(error => { if (this.onerror) this.onerror(error); }); } };"
-"__setWindow('XMLHttpRequest', XMLHttpRequest); __setWindow('IntersectionObserver', IntersectionObserver); __setWindow('MutationObserver', MutationObserver);"
+/* One literal per line: ISO C promises literals of 4095 characters, and the
+   whole shim is several times that. Joined with nothing between them, as the
+   adjacent literals were, so the script is byte-for-byte what it was. */
+static const char *const HOST_JS[] = {
+"globalThis.__listeners = {window: Object.create(null), document: Object.create(null)};",
+"globalThis.__add = function(kind, type, callback) { (globalThis.__listeners[kind][type] ||= []).push(callback); };",
+"globalThis.__dispatch = function(kind, type) { for (const callback of (globalThis.__listeners[kind][type] || []).slice()) callback({type, target: kind === 'window' ? window : document}); };",
+"globalThis.__setWindow = function(name, value) { Object.defineProperty(window, name, {value, writable:true, configurable:true}); };",
+"globalThis.Element = window.Element; globalThis.Node = window.Node; globalThis.Event = window.Event; globalThis.HTMLAnchorElement = window.HTMLAnchorElement; globalThis.HTMLImageElement = window.HTMLImageElement; globalThis.HTMLFormElement = window.HTMLFormElement;",
+"__setWindow('addEventListener', (type, callback) => __add('window', type, callback));",
+"__setWindow('removeEventListener', () => {}); __setWindow('dispatchEvent', event => __dispatch('window', event.type));",
+"__setWindow('window', window); __setWindow('document', document);",
+"__setWindow('self', window); globalThis.self = window;",
+"__setWindow('innerWidth', 1280); __setWindow('innerHeight', 1024);",
+"__setWindow('setTimeout', setTimeout); __setWindow('clearTimeout', clearTimeout); __setWindow('setInterval', setInterval); __setWindow('clearInterval', clearInterval);",
+"globalThis.requestIdleCallback = callback => setTimeout(() => callback({didTimeout:false, timeRemaining:() => 50}), 1); globalThis.cancelIdleCallback = id => clearTimeout(id); __setWindow('requestIdleCallback', requestIdleCallback); __setWindow('cancelIdleCallback', cancelIdleCallback);",
+"__setWindow('requestAnimationFrame', requestAnimationFrame); __setWindow('fetch', fetch); __setWindow('console', console);",
+"if (typeof requestAnimationFrame !== 'function') globalThis.requestAnimationFrame = callback => setTimeout(callback, 16); __setWindow('requestAnimationFrame', requestAnimationFrame);",
+"__setWindow('scrollTo', () => {}); __setWindow('scrollBy', () => {});",
+"Object.defineProperty(document, 'addEventListener', {value:(type, callback) => __add('document', type, callback), configurable:true});",
+"Object.defineProperty(document, 'removeEventListener', {value:() => {}, configurable:true});",
+"Object.defineProperty(document, 'dispatchEvent', {value:event => __dispatch('document', event.type), configurable:true});",
+"document.readyState = 'loading';",
+"document.visibilityState = 'visible';",
+"Object.defineProperty(document, 'cookie', {get() { return __distillCookieGet(); }, set(value) { __distillCookieSet(String(value)); }, configurable:true});",
+"globalThis.localStorage = {__data: Object.create(null), getItem(k) { return this.__data[k] === undefined ? null : this.__data[k]; }, setItem(k,v) { this.__data[k] = String(v); }, removeItem(k) { delete this.__data[k]; }, clear() { this.__data = Object.create(null); }, key(i) { return Object.keys(this.__data)[i] ?? null; }};",
+"Object.defineProperty(localStorage, 'length', {get() { return Object.keys(this.__data).length; }});",
+"globalThis.sessionStorage = {__data: Object.create(null), getItem(k) { return this.__data[k] === undefined ? null : this.__data[k]; }, setItem(k,v) { this.__data[k] = String(v); }, removeItem(k) { delete this.__data[k]; }, clear() { this.__data = Object.create(null); }, key(i) { return Object.keys(this.__data)[i] ?? null; }};",
+"Object.defineProperty(sessionStorage, 'length', {get() { return Object.keys(this.__data).length; }});",
+"__setWindow('localStorage', localStorage); __setWindow('sessionStorage', sessionStorage);",
+"globalThis.navigator = window.navigator || {userAgent: '" DISTILL_USER_AGENT "', language: 'en-US', platform: 'Linux'};",
+"Object.defineProperty(navigator, 'userAgent', {value:'" DISTILL_USER_AGENT "', configurable:true}); if (!navigator.language) navigator.language = 'en-US'; __setWindow('navigator', navigator);",
+"globalThis.screen = {width: 1280, height: 1024}; __setWindow('screen', screen);",
+"globalThis.visualViewport = {width:1280, height:1024, offsetLeft:0, offsetTop:0, pageLeft:0, pageTop:0, scale:1, addEventListener() {}, removeEventListener() {}}; __setWindow('visualViewport', visualViewport);",
+"globalThis.crypto = {getRandomValues(a) { for (let i=0;i<a.length;i++) a[i] = (i * 73 + 41) & 255; return a; }}; __setWindow('crypto', crypto);",
+"globalThis.CSS = {escape(value) { return String(value).replace(/[^a-zA-Z0-9_-]/g, ch => '\\\\' + ch); }, supports() { return false; }}; __setWindow('CSS', CSS);",
+"globalThis.AbortSignal = class { constructor() { this.aborted=false; this.reason=undefined; this.__listeners=[]; } addEventListener(type, callback) { if (type === 'abort' && typeof callback === 'function') this.__listeners.push(callback); } removeEventListener(type, callback) { if (type === 'abort') this.__listeners=this.__listeners.filter(item => item !== callback); } dispatchEvent(event) { for (const callback of this.__listeners.slice()) callback.call(this, event); return true; } throwIfAborted() { if (this.aborted) throw this.reason || new Error('The operation was aborted'); } };",
+"globalThis.AbortController = class { constructor() { this.signal=new AbortSignal(); } abort(reason) { if (this.signal.aborted) return; this.signal.aborted=true; this.signal.reason=reason || new Error('The operation was aborted'); this.signal.dispatchEvent({type:'abort', target:this.signal}); } }; __setWindow('AbortSignal', AbortSignal); __setWindow('AbortController', AbortController);",
+"globalThis.CustomEvent = class extends Event { constructor(type, init={}) { super(type, init); this.detail=init.detail; } }; __setWindow('CustomEvent', CustomEvent);",
+"globalThis.Intl = { getCanonicalLocales(locales) { if (locales == null) return []; return (Array.isArray(locales) ? locales : [locales]).map(String); }, Locale: class { constructor(locale) { this.baseName=String(locale || 'en-US'); this.language=this.baseName.split('-')[0]; } toString() { return this.baseName; } maximize() { return this; } }, NumberFormat: class { constructor(locales, options) { this.locales=locales; this.options=options || {}; } format(value) { return String(value); } formatToParts(value) { return [{type:'integer', value:String(value)}]; } resolvedOptions() { return {locale:'en-US', numberingSystem:'latn'}; } }, DateTimeFormat: class { constructor(locales, options) { this.locales=locales; this.options=options || {}; } format(value) { return new Date(value == null ? Date.now() : value).toISOString(); } formatToParts(value) { return [{type:'literal', value:this.format(value)}]; } resolvedOptions() { return {locale:'en-US', calendar:'gregory', numberingSystem:'latn', timeZone:'UTC'}; } }, PluralRules: class { select(value) { return Number(value) === 1 ? 'one' : 'other'; } resolvedOptions() { return {locale:'en-US', type:'cardinal', pluralCategories:['one','other']}; } }, RelativeTimeFormat: class { format(value, unit) { return String(value) + ' ' + String(unit); } resolvedOptions() { return {locale:'en-US', numeric:'always', style:'long'}; } }, ListFormat: class { format(values) { return Array.from(values || []).join(', '); } }, Collator: class { compare(a, b) { return String(a).localeCompare(String(b)); } }, Segmenter: class { segment(value) { return Array.from(String(value), segment => ({segment})); } }, DisplayNames: class { of(value) { return String(value); } } }; __setWindow('Intl', Intl);",
+"globalThis.matchMedia = q => ({matches: false, media: q, addListener() {}, removeListener() {}, addEventListener() {}, removeEventListener() {}}); __setWindow('matchMedia', matchMedia);",
+"globalThis.performance = {now: () => Date.now(), mark() {}, measure() {}, getEntries() { return []; }, getEntriesByName() { return []; }, getEntriesByType() { return []; }, clearMarks() {}, clearMeasures() {}}; __setWindow('performance', performance);",
+"globalThis.PerformanceObserver = class { constructor(callback) { this.callback=callback; } observe() {} disconnect() {} takeRecords() { return []; } }; PerformanceObserver.supportedEntryTypes=[]; __setWindow('PerformanceObserver', PerformanceObserver);",
+"globalThis.NodeFilter = {SHOW_ALL:4294967295, SHOW_ELEMENT:1, SHOW_TEXT:4, SHOW_COMMENT:128, FILTER_ACCEPT:1, FILTER_REJECT:2, FILTER_SKIP:3}; __setWindow('NodeFilter', NodeFilter);",
+"globalThis.history = {pushState(s,t,u) { const suffix = String(u); location.search = suffix[0] === '?' ? suffix : ''; location.href = location.href.split('?')[0] + location.search; }, replaceState(s,t,u) { this.pushState(s,t,u); }}; __setWindow('history', history);",
+"if (typeof Element !== 'undefined') Element.prototype.getBoundingClientRect = function() { return {x:0,y:0,top:0,left:0,width:800,height:20,right:800,bottom:20}; };",
+"if (typeof Element !== 'undefined') { Object.defineProperty(Element.prototype, 'offsetHeight', {get() { return 20; }}); Object.defineProperty(Element.prototype, 'offsetWidth', {get() { return 800; }}); }",
+"if (document.createRange) { const __createRange=document.createRange.bind(document); document.createRange=() => { const range=__createRange(); range.getBoundingClientRect=() => ({x:0,y:0,top:0,left:0,width:800,height:20,right:800,bottom:20}); range.getClientRects=() => [range.getBoundingClientRect()]; return range; }; }",
+"globalThis.__resolveURL = function(value, baseValue) { const raw = String(value || ''); const fallback = (document.querySelector('base') && document.querySelector('base').getAttribute('href')) || location.href; const base = String(baseValue || fallback); const schemeAt = base.indexOf('://'); const baseOrigin = schemeAt < 0 ? '' : base.slice(0, schemeAt + 3) + base.slice(schemeAt + 3).split(/[/?#]/)[0]; if (/^[a-z]+:/i.test(raw)) return raw; if (raw.startsWith('//')) return (location.protocol || 'https:') + raw; if (raw.startsWith('/')) return baseOrigin + raw; const basePathEnd = base.search(/[?#]/); const basePath = basePathEnd < 0 ? base : base.slice(0, basePathEnd); const prefix = basePath.endsWith('/') ? basePath : basePath.slice(0, basePath.lastIndexOf('/') + 1); const pieces = (prefix + raw).split('/'); const clean = []; for (const piece of pieces) { if (!piece || piece === '.') continue; if (piece === '..') clean.pop(); else clean.push(piece); } return baseOrigin + '/' + clean.join('/'); };",
+"globalThis.URLSearchParams = class { constructor(value='') { this.__pairs=[]; const source=String(value).replace(/^\\?/, ''); for (const part of source ? source.split('&') : []) { const at=part.indexOf('='); const key=decodeURIComponent((at < 0 ? part : part.slice(0, at)).replace(/\\+/g, ' ')); const val=decodeURIComponent((at < 0 ? '' : part.slice(at + 1)).replace(/\\+/g, ' ')); this.__pairs.push([key, val]); } } append(key, value) { this.__pairs.push([String(key), String(value)]); } set(key, value) { this.delete(key); this.append(key, value); } get(key) { const item=this.__pairs.find(pair => pair[0] === String(key)); return item ? item[1] : null; } getAll(key) { return this.__pairs.filter(pair => pair[0] === String(key)).map(pair => pair[1]); } has(key) { return this.__pairs.some(pair => pair[0] === String(key)); } delete(key) { this.__pairs=this.__pairs.filter(pair => pair[0] !== String(key)); } forEach(callback, thisArg) { this.__pairs.forEach(pair => callback.call(thisArg, pair[1], pair[0], this)); } entries() { return this.__pairs[Symbol.iterator](); } keys() { return this.__pairs.map(pair => pair[0])[Symbol.iterator](); } values() { return this.__pairs.map(pair => pair[1])[Symbol.iterator](); } toString() { return this.__pairs.map(pair => encodeURIComponent(pair[0]) + '=' + encodeURIComponent(pair[1])).join('&'); } [Symbol.iterator]() { return this.entries(); } };",
+"globalThis.Headers = class { constructor(init) { this.__items=Object.create(null); if (init) { if (typeof init.forEach === 'function') init.forEach((v,k) => this.append(k,v)); else if (Array.isArray(init)) init.forEach(pair => this.append(pair[0], pair[1])); else Object.keys(init).forEach(k => this.append(k, init[k])); } } append(name,value) { const key=String(name).toLowerCase(); this.__items[key]=this.__items[key] ? this.__items[key]+', '+String(value) : String(value); } set(name,value) { this.__items[String(name).toLowerCase()]=String(value); } get(name) { const value=this.__items[String(name).toLowerCase()]; return value === undefined ? null : value; } has(name) { return Object.prototype.hasOwnProperty.call(this.__items, String(name).toLowerCase()); } delete(name) { delete this.__items[String(name).toLowerCase()]; } forEach(callback,thisArg) { Object.keys(this.__items).forEach(k => callback.call(thisArg,this.__items[k],k,this)); } entries() { return Object.keys(this.__items).map(k => [k,this.__items[k]]); } keys() { return Object.keys(this.__items); } values() { return Object.keys(this.__items).map(k => this.__items[k]); } [Symbol.iterator]() { return this.entries()[Symbol.iterator](); } }; __setWindow('Headers', Headers);",
+"globalThis.URL = class { constructor(value, base) { const href=__resolveURL(value, base); const scheme=href.indexOf('://'); const authorityStart=scheme < 0 ? 0 : scheme + 3; const tail=href.slice(authorityStart); const authorityEnd=tail.search(/[/?#]/); const authority=authorityEnd < 0 ? tail : tail.slice(0, authorityEnd); const rest=authorityEnd < 0 ? '' : tail.slice(authorityEnd); const pathEnd=rest.search(/[?#]/); this.protocol=scheme < 0 ? '' : href.slice(0, scheme + 1); this.origin=scheme < 0 ? '' : href.slice(0, authorityStart) + authority; this.host=authority; this.hostname=authority.replace(/^.*@/, '').replace(/:\\d+$/, ''); this.port=(this.hostname === authority ? '' : authority.slice(authority.lastIndexOf(':') + 1)); this.pathname=pathEnd < 0 ? (rest || '/') : (rest.slice(0, pathEnd) || '/'); const query=rest.indexOf('?'); const hash=rest.indexOf('#'); this.search=query < 0 ? '' : rest.slice(query, hash < 0 ? rest.length : hash); this.hash=hash < 0 ? '' : rest.slice(hash); this.username=''; this.password=''; this.href=this.origin + this.pathname + this.search + this.hash; this.searchParams=new URLSearchParams(this.search); } toString() { return this.href; } toJSON() { return this.href; } static canParse(value, base) { try { new URL(value, base); return true; } catch (e) { return false; } } }; globalThis.URL.createObjectURL = () => 'blob:distill'; globalThis.URL.revokeObjectURL = () => {}; __setWindow('URL', URL); __setWindow('URLSearchParams', URLSearchParams);",
+"globalThis.__anchorPart = function(node, part) { const href = __resolveURL(node.getAttribute('href') || ''); const scheme = href.indexOf('://'); if (scheme < 0) return part === 'href' ? href : ''; const authority = scheme + 3; const tail = href.slice(authority); const end = tail.search(/[/?#]/); const host = end < 0 ? tail : tail.slice(0, end); const rest = end < 0 ? '' : tail.slice(end); const pathEnd = rest.search(/[?#]/); const pathname = pathEnd < 0 ? (rest || '/') : (rest.slice(0, pathEnd) || '/'); const query = rest.indexOf('?'); const hash = rest.indexOf('#'); const search = query < 0 ? '' : rest.slice(query, hash < 0 ? rest.length : hash); const fragment = hash < 0 ? '' : rest.slice(hash); const portAt = host.lastIndexOf(':'); const hasPort = portAt > -1 && host.indexOf(']') < portAt; const hostname = hasPort ? host.slice(0, portAt) : host; const port = hasPort ? host.slice(portAt + 1) : ''; if (part === 'href') return href; if (part === 'protocol') return href.slice(0, scheme + 1); if (part === 'host') return host; if (part === 'hostname') return hostname; if (part === 'port') return port; if (part === 'pathname') return pathname; if (part === 'search') return search; if (part === 'hash') return fragment; return ''; };",
+"try { Object.defineProperty(HTMLAnchorElement.prototype, 'href', {get() { return __anchorPart(this, 'href'); }, set(value) { this.setAttribute('href', value); }, configurable:true}); Object.defineProperty(HTMLAnchorElement.prototype, 'protocol', {get() { return __anchorPart(this, 'protocol'); }, configurable:true}); Object.defineProperty(HTMLAnchorElement.prototype, 'host', {get() { return __anchorPart(this, 'host'); }, configurable:true}); Object.defineProperty(HTMLAnchorElement.prototype, 'hostname', {get() { return __anchorPart(this, 'hostname'); }, configurable:true}); Object.defineProperty(HTMLAnchorElement.prototype, 'port', {get() { return __anchorPart(this, 'port'); }, configurable:true}); Object.defineProperty(HTMLAnchorElement.prototype, 'pathname', {get() { return __anchorPart(this, 'pathname'); }, configurable:true}); Object.defineProperty(HTMLAnchorElement.prototype, 'search', {get() { return __anchorPart(this, 'search'); }, configurable:true}); Object.defineProperty(HTMLAnchorElement.prototype, 'hash', {get() { return __anchorPart(this, 'hash'); }, configurable:true}); } catch (e) {}",
+"try { Object.defineProperty(HTMLImageElement.prototype, 'src', {get() { return __resolveURL(this.getAttribute('src')); }, configurable:true}); } catch (e) {}",
+"try { Object.defineProperty(HTMLFormElement.prototype, 'action', {get() { return __resolveURL(this.getAttribute('action')); }, configurable:true}); } catch (e) {}",
+"for (const node of document.querySelectorAll('a')) try { Object.defineProperty(node, 'href', {get() { return __resolveURL(this.getAttribute('href')); }, configurable:true}); } catch (e) {}",
+"for (const node of document.querySelectorAll('img')) try { Object.defineProperty(node, 'src', {get() { return __resolveURL(this.getAttribute('src')); }, configurable:true}); } catch (e) {}",
+"for (const node of document.querySelectorAll('form')) try { Object.defineProperty(node, 'action', {get() { return __resolveURL(this.getAttribute('action')); }, configurable:true}); } catch (e) {}",
+"globalThis.getComputedStyle = node => ({display: node.id === 'genuinely-hidden' ? 'none' : ((node.getAttribute && node.getAttribute('hidden') !== null) ? 'none' : 'block'), visibility: 'visible', marginLeft: '0px', marginRight: '0px', getPropertyValue(name) { return this[name] || ''; }}); __setWindow('getComputedStyle', getComputedStyle);",
+"globalThis.IntersectionObserver = class { constructor(callback) { this.callback = callback; } observe(target) { this.callback([{target, isIntersecting:true, intersectionRatio:1, intersectionRect:{top:0,left:0,width:1280,height:1024,right:1280,bottom:1024}}], this); } unobserve() {} disconnect() {} };",
+"globalThis.ResizeObserver = class { constructor(callback) { this.callback=callback; } observe(target) { this.callback([{target, contentRect:{x:0,y:0,top:0,left:0,width:800,height:20,right:800,bottom:20}, borderBoxSize:[{inlineSize:800,blockSize:20},], contentBoxSize:[{inlineSize:800,blockSize:20}]}], this); } unobserve() {} disconnect() {} }; __setWindow('ResizeObserver', ResizeObserver);",
+"globalThis.MutationObserver = class { constructor(callback) { this.callback = callback; } observe() { this.callback([{}], this); } disconnect() {} };",
+"globalThis.XMLHttpRequest = class { constructor() { this.readyState=0; this.status=0; this.responseText=''; this.responseURL=''; this.onreadystatechange=null; this.onload=null; this.onerror=null; this._headers=Object.create(null); this._responseHeaders=Object.create(null); } open(method,url,async=true) { this._method=method || 'GET'; this._url=url; this._async=async; this.readyState=1; } setRequestHeader(name,value) { const key=String(name).toLowerCase(); this._headers[key]=this._headers[key] ? this._headers[key]+', '+String(value) : String(value); } getResponseHeader(name) { return this._responseHeaders[String(name).toLowerCase()] || null; } getAllResponseHeaders() { return Object.keys(this._responseHeaders).map(k=>k+': '+this._responseHeaders[k]).join('\\r\\n'); } send(body) { fetch(this._url,{method:this._method,body,headers:this._headers}).then(r => { this.status=r.status; this.responseURL=r.url || this._url; r.headers.forEach((v,k)=>{this._responseHeaders[k.toLowerCase()]=v;}); return r.text(); }).then(t => { this.responseText=t; this.readyState=4; if (this.onreadystatechange) this.onreadystatechange(); if (this.onload) this.onload(); }).catch(error => { if (this.onerror) this.onerror(error); }); } };",
+"__setWindow('XMLHttpRequest', XMLHttpRequest); __setWindow('IntersectionObserver', IntersectionObserver); __setWindow('MutationObserver', MutationObserver);",
 /* Audio is a no-op that remembers what it was handed. A page whose player is
    built in script would otherwise throw mid-settle and take the rest of the
    page down with it, so this is content fidelity first; the recorded URLs are
    reported as diagnostics, and never become media references -- the reader
    plays declarative sources only. See src/documents/MEDIA_PLAYBACK_PLAN.md. */
-"globalThis.__distillScriptAudio = [];"
-"globalThis.Audio = class { constructor(src) { this.src = src == null ? '' : String(src); if (this.src) __distillScriptAudio.push(this.src); this.currentTime=0; this.duration=NaN; this.paused=true; this.ended=false; this.volume=1; this.muted=false; this.loop=false; this.autoplay=false; this.preload='none'; this.readyState=0; this.networkState=0; this.crossOrigin=null; this.error=null; this.__listeners=Object.create(null); } play() { this.paused=false; return Promise.resolve(); } pause() { this.paused=true; } load() {} canPlayType() { return ''; } addEventListener(type, callback) { if (typeof callback !== 'function') return; (this.__listeners[type] = this.__listeners[type] || []).push(callback); } removeEventListener(type, callback) { const list=this.__listeners[type]; if (list) this.__listeners[type]=list.filter(item => item !== callback); } dispatchEvent(event) { const list=this.__listeners[event && event.type]; if (list) for (const callback of list.slice()) callback.call(this, event); return true; } }; __setWindow('Audio', Audio);"
+"globalThis.__distillScriptAudio = [];",
+"globalThis.Audio = class { constructor(src) { this.src = src == null ? '' : String(src); if (this.src) __distillScriptAudio.push(this.src); this.currentTime=0; this.duration=NaN; this.paused=true; this.ended=false; this.volume=1; this.muted=false; this.loop=false; this.autoplay=false; this.preload='none'; this.readyState=0; this.networkState=0; this.crossOrigin=null; this.error=null; this.__listeners=Object.create(null); } play() { this.paused=false; return Promise.resolve(); } pause() { this.paused=true; } load() {} canPlayType() { return ''; } addEventListener(type, callback) { if (typeof callback !== 'function') return; (this.__listeners[type] = this.__listeners[type] || []).push(callback); } removeEventListener(type, callback) { const list=this.__listeners[type]; if (list) this.__listeners[type]=list.filter(item => item !== callback); } dispatchEvent(event) { const list=this.__listeners[event && event.type]; if (list) for (const callback of list.slice()) callback.call(this, event); return true; } }; __setWindow('Audio', Audio);",
 /* The same courtesy for declarative media elements: linkedom parses <audio>
    and <video> but gives them no playback methods, and a script calling play()
    on one is ordinary. Patch the prototypes where they exist, the nodes the
    document already has, and anything created later. */
-"globalThis.__distillMediaMethods = function(node) { if (!node || typeof node.play === 'function') return node; node.play = function() { return Promise.resolve(); }; node.pause = function() {}; node.load = function() {}; node.canPlayType = function() { return ''; }; return node; };"
-"for (const name of ['HTMLMediaElement','HTMLAudioElement','HTMLVideoElement']) try { const type=globalThis[name]; if (type && type.prototype) __distillMediaMethods(type.prototype); } catch (e) {}"
-"try { for (const node of document.querySelectorAll('audio,video')) __distillMediaMethods(node); } catch (e) {}"
-"if (document.createElement) { const __createElement=document.createElement.bind(document); document.createElement=function(name, options) { const node=__createElement(name, options); const tag=String(name || '').toLowerCase(); if (tag === 'audio' || tag === 'video') __distillMediaMethods(node); return node; }; }"
-"__setWindow('Node', globalThis.Node || {ELEMENT_NODE:1,TEXT_NODE:3,DOCUMENT_NODE:9,DOCUMENT_FRAGMENT_NODE:11});";
+"globalThis.__distillMediaMethods = function(node) { if (!node || typeof node.play === 'function') return node; node.play = function() { return Promise.resolve(); }; node.pause = function() {}; node.load = function() {}; node.canPlayType = function() { return ''; }; return node; };",
+"for (const name of ['HTMLMediaElement','HTMLAudioElement','HTMLVideoElement']) try { const type=globalThis[name]; if (type && type.prototype) __distillMediaMethods(type.prototype); } catch (e) {}",
+"try { for (const node of document.querySelectorAll('audio,video')) __distillMediaMethods(node); } catch (e) {}",
+"if (document.createElement) { const __createElement=document.createElement.bind(document); document.createElement=function(name, options) { const node=__createElement(name, options); const tag=String(name || '').toLowerCase(); if (tag === 'audio' || tag === 'video') __distillMediaMethods(node); return node; }; }",
+"__setWindow('Node', globalThis.Node || {ELEMENT_NODE:1,TEXT_NODE:3,DOCUMENT_NODE:9,DOCUMENT_FRAGMENT_NODE:11});",
+};
 
 static bool evaluate(Engine *engine, const char *source, size_t length,
                      const char *filename, int flags)
@@ -1674,19 +1867,12 @@ static void process_async_scripts(Engine *engine)
 
 static bool load_linkedom(Engine *engine, const DBuffer *html)
 {
-    char *worker_path = d_cat3(DISTILL_SOURCE_DIR,
-                               "/external/js/linkedom/node_modules/linkedom/worker.js", "");
-    size_t worker_length = 0;
-    char *worker = d_read_file(worker_path, &worker_length);
-    if (!worker) {
-        fprintf(stderr, "linkedom worker.js missing: %s\n", worker_path);
-        free(worker_path);
-        return false;
-    }
-    JSValue module_value = JS_Eval(engine->context, worker, worker_length,
-                                   worker_path, JS_EVAL_TYPE_MODULE | JS_EVAL_FLAG_COMPILE_ONLY);
-    free(worker); free(worker_path);
-    if (JS_IsException(module_value)) { note_exception(engine, "linkedom compile"); return false; }
+    /* Compiled at build time (embedded_js.h); read, not parsed. */
+    uint64_t load_started = clock_ms();
+    JSValue module_value = JS_ReadObject(engine->context, distill_js_linkedom,
+                                         distill_js_linkedom_size, JS_READ_OBJ_BYTECODE);
+    run_stats.linkedom_load_ms += clock_ms() - load_started;
+    if (JS_IsException(module_value)) { note_exception(engine, "linkedom load"); return false; }
     if (JS_ResolveModule(engine->context, module_value) < 0) {
         note_exception(engine, "linkedom resolve");
         JS_FreeValue(engine->context, module_value);
@@ -1774,7 +1960,12 @@ static bool install_host(Engine *engine)
     JS_SetPropertyStr(ctx, console, "log", JS_NewCFunctionMagic(ctx, console_callback, "log", 0, JS_CFUNC_generic_magic, 0));
     JS_SetPropertyStr(ctx, console, "error", JS_NewCFunctionMagic(ctx, console_callback, "error", 0, JS_CFUNC_generic_magic, 1));
     JS_SetPropertyStr(ctx, engine->global, "console", console);
-    return evaluate(engine, HOST_JS, strlen(HOST_JS), "distill-host.js", JS_EVAL_TYPE_GLOBAL);
+    DBuffer script;
+    dbuf_init(&script);
+    for (size_t i = 0; i < sizeof(HOST_JS) / sizeof(HOST_JS[0]); ++i) dbuf_puts(&script, HOST_JS[i]);
+    bool ok = evaluate(engine, script.data, script.length, "distill-host.js", JS_EVAL_TYPE_GLOBAL);
+    dbuf_free(&script);
+    return ok;
 }
 
 static bool discover_scripts(Engine *engine)
@@ -2014,8 +2205,7 @@ static void settle(Engine *engine)
             break;
         }
         if (!request_in_flight(engine) && !JS_IsJobPending(engine->runtime) && !timer_near(engine)) break;
-        struct timespec delay = {.tv_sec = 0, .tv_nsec = 10000000};
-        nanosleep(&delay, NULL);
+        d_clock_sleep_ms(10);
     }
 }
 
@@ -3416,7 +3606,7 @@ static bool save_media_file(Engine *engine, const char *json, int media_index,
         }
     }
     dbuf_free(&body);
-    if (!ok) fprintf(stderr, "unable to save media %s (status %ld)\n", url, status);
+    if (!ok) note("unable to save media %s (status %ld)\n", url, status);
     free(url);
     JS_FreeValue(engine->context, item);
     JS_FreeValue(engine->context, media);
@@ -3452,6 +3642,8 @@ static bool write_file_bytes(const char *path, const char *data, size_t length)
     return ok;
 }
 
+static void save_session(Engine *engine);
+
 static void engine_cleanup(Engine *engine)
 {
     if (!engine) return;
@@ -3474,27 +3666,11 @@ static void engine_cleanup(Engine *engine)
         JS_FreeContext(engine->context);
     }
     if (engine->runtime) JS_FreeRuntime(engine->runtime);
-    /* Cookies live in the share, not in any one easy handle, so closing the
-       request handles does not reliably write them out. Flush explicitly,
-       while the share is still alive, or a login is lost at exit. */
-    if (engine->cookie_jar_persistent && engine->cookie_jar_path && engine->share) {
-        CURL *flush = curl_easy_init();
-        if (flush) {
-            curl_easy_setopt(flush, CURLOPT_SHARE, engine->share);
-            /* Read before writing: a run that set no cookies must not
-               truncate a session file that already holds some. */
-            curl_easy_setopt(flush, CURLOPT_COOKIEFILE, engine->cookie_jar_path);
-            curl_easy_setopt(flush, CURLOPT_COOKIEJAR, engine->cookie_jar_path);
-            curl_easy_setopt(flush, CURLOPT_COOKIELIST, "FLUSH");
-            curl_easy_cleanup(flush);
-        }
-    }
+    /* Written while the share still holds the cookies, or a login is lost. */
+    save_session(engine);
     if (engine->multi) curl_multi_cleanup(engine->multi);
     if (engine->share) curl_share_cleanup(engine->share);
-    /* A per-run jar is scratch and is removed. A session file belongs to the
-       user and is theirs to delete. */
-    if (engine->cookie_jar_path && !engine->cookie_jar_persistent) unlink(engine->cookie_jar_path);
-    free(engine->cookie_jar_path);
+    free(engine->session_path);
     free(engine->script_cookies);
     free(engine->source_url); free(engine->base_url);
     *engine = (Engine){0};
@@ -3505,63 +3681,103 @@ static void engine_cleanup(Engine *engine)
    not, rather than silently writing cookies into a file others can read. */
 static bool prepare_session_file(Engine *engine, const char *path)
 {
-    struct stat info;
-    if (stat(path, &info) == 0) {
-        if (!S_ISREG(info.st_mode)) {
-            fprintf(stderr, "session file %s is not a regular file\n", path);
-            return false;
-        }
-        if (info.st_mode & (S_IRWXG | S_IRWXO)) {
-            fprintf(stderr,
-                    "refusing session file %s: mode %04o is accessible to other users; "
-                    "run chmod 600 on it\n",
-                    path, (unsigned)(info.st_mode & 07777));
-            return false;
-        }
-    } else {
-        int fd = open(path, O_WRONLY | O_CREAT | O_EXCL, S_IRUSR | S_IWUSR);
-        if (fd < 0) {
-            fprintf(stderr, "unable to create session file %s: %s\n", path, strerror(errno));
-            return false;
-        }
-        close(fd);
+    unsigned mode = 0;
+    switch (d_fs_ensure_private(path, &mode)) {
+    case D_FS_PRIVATE_OK:
+    case D_FS_PRIVATE_CREATED:
+        break;
+    case D_FS_PRIVATE_NOT_A_FILE:
+        note("session file %s is not a regular file\n", path);
+        return false;
+    case D_FS_PRIVATE_SHARED:
+        note("refusing session file %s: mode %04o is accessible to other users; "
+                "run chmod 600 on it\n",
+                path, mode);
+        return false;
+    case D_FS_PRIVATE_FAILED:
+        note("unable to create session file %s: %s\n", path, strerror(errno));
+        return false;
     }
-    engine->cookie_jar_path = d_strdup(path);
-    engine->cookie_jar_persistent = true;
+    engine->session_path = d_strdup(path);
     return true;
+}
+
+/* The session file is a Netscape cookie file, the format libcurl reads and
+   writes. Each line goes to the cookie engine as it is; comments do not,
+   except the "#HttpOnly_" prefix, which is part of a cookie line. */
+static void load_session(Engine *engine)
+{
+    size_t length = 0;
+    char *text = d_read_file(engine->session_path, &length);
+    if (!text) return;
+    CURL *easy = curl_easy_init();
+    if (easy) {
+        curl_easy_setopt(easy, CURLOPT_SHARE, engine->share);
+        curl_easy_setopt(easy, CURLOPT_COOKIEFILE, "");
+        for (char *line = text; line && *line;) {
+            char *end = strchr(line, '\n');
+            if (end) *end = '\0';
+            size_t size = strlen(line);
+            if (size && line[size - 1] == '\r') line[--size] = '\0';
+            if (size && (line[0] != '#' || d_starts(line, "#HttpOnly_")))
+                curl_easy_setopt(easy, CURLOPT_COOKIELIST, line);
+            line = end ? end + 1 : NULL;
+        }
+        curl_easy_cleanup(easy);
+    }
+    memset(text, 0, length);
+    free(text);
+}
+
+/* Everything the jar holds, the loaded cookies included, so a run that set
+   none leaves the file as it found it. Replaced whole: a crash mid-write
+   leaves the old session, not half of the new one. */
+static void save_session(Engine *engine)
+{
+    if (!engine->session_path || !engine->share) return;
+    CURL *easy = curl_easy_init();
+    if (!easy) return;
+    curl_easy_setopt(easy, CURLOPT_SHARE, engine->share);
+    curl_easy_setopt(easy, CURLOPT_COOKIEFILE, "");
+    struct curl_slist *list = NULL;
+    if (curl_easy_getinfo(easy, CURLINFO_COOKIELIST, &list) == CURLE_OK) {
+        DBuffer out;
+        dbuf_init(&out);
+        dbuf_puts(&out, "# Netscape HTTP Cookie File\n# Written by distill; holds live credentials.\n\n");
+        for (struct curl_slist *item = list; item; item = item->next) {
+            dbuf_puts(&out, item->data);
+            dbuf_puts(&out, "\n");
+        }
+        if (!d_fs_replace(engine->session_path, out.data, out.length))
+            note("unable to save session file %s", engine->session_path);
+        memset(out.data, 0, out.length);
+        dbuf_free(&out);
+    }
+    curl_slist_free_all(list);
+    curl_easy_cleanup(easy);
 }
 
 static bool init_network(Engine *engine, const char *session_file)
 {
-    if (session_file && *session_file) {
-        if (!prepare_session_file(engine, session_file)) return false;
-    } else {
-        char cookie_template[] = "/tmp/distill-cookies-XXXXXX";
-        int cookie_fd = mkstemp(cookie_template);
-        if (cookie_fd < 0) return false;
-        close(cookie_fd);
-        engine->cookie_jar_path = d_strdup(cookie_template);
-        engine->cookie_jar_persistent = false;
-    }
+    if (session_file && *session_file && !prepare_session_file(engine, session_file)) return false;
     engine->share = curl_share_init();
     if (!engine->share ||
         curl_share_setopt(engine->share, CURLSHOPT_SHARE, CURL_LOCK_DATA_COOKIE) != CURLSHE_OK) {
         if (engine->share) curl_share_cleanup(engine->share);
         engine->share = NULL;
-        if (!engine->cookie_jar_persistent) unlink(engine->cookie_jar_path);
-        free(engine->cookie_jar_path);
-        engine->cookie_jar_path = NULL;
+        free(engine->session_path);
+        engine->session_path = NULL;
         return false;
     }
     engine->multi = curl_multi_init();
     if (!engine->multi) {
         curl_share_cleanup(engine->share);
         engine->share = NULL;
-        if (!engine->cookie_jar_persistent) unlink(engine->cookie_jar_path);
-        free(engine->cookie_jar_path);
-        engine->cookie_jar_path = NULL;
+        free(engine->session_path);
+        engine->session_path = NULL;
         return false;
     }
+    if (engine->session_path) load_session(engine);
     return true;
 }
 
@@ -3712,37 +3928,47 @@ static char *media_resource_document(const MediaResource *resource, const char *
     return dbuf_take(&out);
 }
 
-static int run_page(const char *input, uint64_t cap_ms, uint64_t memory_mb,
-                    uint64_t max_scripts, bool dump_dom, bool extract,
-                    const char *render_path, const char *viewer_path, int media_index,
-                    const char *save_media_path, const char *fetch_media_path,
-                    const char *fetch_kind,
-                    int render_width, int render_height,
-                    const char *font_dir, const char *template_path,
-                    const char *markdown_path,
-                    const char *cells_path, int cell_columns, int cell_rows,
-                    const char *theme, bool native_forms, int zoom,
-                    const char *request_method,
-                    const char *request_data, const char *session_file,
-                    bool progress, bool https_optional)
+static int run_page(const DEngineRequest *request)
 {
+    const char *input = request->url;
+    uint64_t cap_ms = request->cap_ms, memory_mb = request->memory_mb;
+    uint64_t max_scripts = request->max_scripts, max_fetches = request->max_fetches;
+    bool dump_dom = request->dump_dom, extract = request->extract;
+    const char *render_path = request->render_path, *viewer_path = request->viewer_path;
+    int media_index = request->media_index;
+    const char *save_media_path = request->save_media_path;
+    const char *fetch_media_path = request->fetch_media_path;
+    const char *fetch_kind = request->fetch_kind ? request->fetch_kind : "image";
+    int render_width = request->render_width, render_height = request->render_height;
+    const char *font_dir = request->font_dir, *template_path = request->template_path;
+    const char *markdown_path = request->markdown_path, *cells_path = request->cells_path;
+    int cell_columns = request->cell_columns, cell_rows = request->cell_rows;
+    const char *theme = request->theme ? request->theme : "warm";
+    bool native_forms = request->native_forms;
+    int zoom = request->zoom;
+    const char *request_method = request->request_method;
+    const char *request_data = request->request_data, *session_file = request->session_file;
+    bool progress = request->progress, https_optional = request->https_optional;
     Engine engine = {0};
 #ifdef DISTILL_RENDER
     char *owned_font_dir = NULL;
-    if ((render_path || viewer_path) && !font_dir) {
-        owned_font_dir = d_cat2(DISTILL_SOURCE_DIR, "/external/fonts");
-        if (access(owned_font_dir, R_OK) == 0) font_dir = owned_font_dir;
+    /* The bundled faces, unless the caller named a collection. */
+    const char *font_env = getenv("DISTILL_FONT_DIR");
+    if ((render_path || viewer_path) && !font_dir && !(font_env && *font_env)) {
+        owned_font_dir = d_data_path("fonts", NULL);
+        if (owned_font_dir) font_dir = owned_font_dir;
     }
 #endif
     engine.cap_ms = cap_ms;
     engine.progress = progress;
     engine.memory_limit = memory_mb * 1024u * 1024u;
     engine.max_scripts = max_scripts;
+    engine.max_fetches = max_fetches;
     engine.source_url = absolute_input(input);
     engine.base_url = d_strdup(engine.source_url);
     engine.started = clock_ms();
     if (!init_network(&engine, session_file)) {
-        fprintf(stderr, "unable to initialize network state\n");
+        note("unable to initialize network state\n");
 #ifdef DISTILL_RENDER
         free(owned_font_dir);
 #endif
@@ -3767,6 +3993,22 @@ static int run_page(const char *input, uint64_t cap_ms, uint64_t memory_mb,
        Only when the connection never opened. A certificate this run distrusts
        means a server that does have TLS, and stepping down to plaintext there
        would be taking an attacker's advice. */
+    /* TLS that refused while the clock is not to be trusted is the clock's
+       fault, and the user can fix it: say so, with its own status, rather
+       than report a network failure -- and rather than step a guessed
+       https:// down to plaintext to get round it. */
+    if (!loaded && d_starts(engine.source_url, "https://") && transport_tls_refused(transport) &&
+        !d_clock_wall_trusted()) {
+        note("the system clock is not trusted, so secure connections are refused; "
+             "set the date and time, then try %s again", engine.source_url);
+        dbuf_free(&html);
+        engine_cleanup(&engine);
+#ifdef DISTILL_RENDER
+        free(owned_font_dir);
+#endif
+        free(effective_url);
+        return D_ENGINE_UNTRUSTED_TIME;
+    }
     if (!loaded && https_optional && transport_never_opened(transport) &&
         d_starts(engine.source_url, "https://")) {
         char *plain = d_cat2("http://", engine.source_url + strlen("https://"));
@@ -3781,7 +4023,7 @@ static int run_page(const char *input, uint64_t cap_ms, uint64_t memory_mb,
                                     &effective_url, request_method, request_data, NULL);
     }
     if (!loaded) {
-        fprintf(stderr, "unable to load %s (status %ld)\n", engine.source_url, status);
+        note("unable to load %s (status %ld)\n", engine.source_url, status);
         dbuf_free(&html);
         engine_cleanup(&engine);
 #ifdef DISTILL_RENDER
@@ -3824,7 +4066,7 @@ static int run_page(const char *input, uint64_t cap_ms, uint64_t memory_mb,
            bytes happen to be: a download of a 404 must fail, not save the
            server's apology under the name of a song. */
         if (status >= 400) {
-            fprintf(stderr, "the server answered %ld for %s\n", status, engine.source_url);
+            note("the server answered %ld for %s\n", status, engine.source_url);
             dbuf_free(&html);
             free(initial_html);
             engine_cleanup(&engine);
@@ -3835,13 +4077,13 @@ static int run_page(const char *input, uint64_t cap_ms, uint64_t memory_mb,
         }
         bool ok = *format && write_file_bytes(fetch_media_path, html.data, html.length);
         if (!ok && !*format)
-            fprintf(stderr, "not %s: %s\n",
+            note("not %s: %s\n",
                     d_eq(fetch_kind, "audio") ? "audio this reader can decode" : "an image",
                     engine.source_url);
         else if (!ok)
-            fprintf(stderr, "unable to write %s\n", fetch_media_path);
+            note("unable to write %s\n", fetch_media_path);
         else
-            fprintf(stderr, "fetched %s, %zu bytes\n", format, html.length);
+            note("fetched %s, %zu bytes\n", format, html.length);
         dbuf_free(&html);
         free(initial_html);
         engine_cleanup(&engine);
@@ -3857,7 +4099,7 @@ static int run_page(const char *input, uint64_t cap_ms, uint64_t memory_mb,
        ordinary course and produce the same card an embedded reference gets. */
     MediaResource resource = media_resource_kind((const unsigned char *)html.data, html.length);
     if (resource.kind) {
-        fprintf(stderr, "%s resource (%s), %zu bytes: presenting it rather than parsing it\n",
+        note("%s resource (%s), %zu bytes: presenting it rather than parsing it\n",
                 resource.kind, resource.mime, html.length);
         char *document = media_resource_document(&resource, engine.source_url, html.length);
         dbuf_free(&html);
@@ -3870,11 +4112,14 @@ static int run_page(const char *input, uint64_t cap_ms, uint64_t memory_mb,
     engine.challenge = challenge_kind(html.data, html.length,
                                       DISTILL_CHALLENGE_SERVED_BYTES);
     if (engine.challenge) {
-        fprintf(stderr, "challenge page detected (%s) for %s; skipping script execution\n",
+        note("challenge page detected (%s) for %s; skipping script execution\n",
                 engine.challenge, engine.source_url);
     }
 
-    engine.runtime = JS_NewRuntime();
+    run_stats.fetch_ms = clock_ms() - engine.started;
+    if (d_measure_enabled()) run_stats.rss_fetch_kib = d_measure_peak_rss_kib();
+    uint64_t phase_started = clock_ms();
+    engine.runtime = JS_NewRuntime2(&js_heap_functions, &run_stats.js_heap);
     if (!engine.runtime) {
         dbuf_free(&html); free(initial_html); engine_cleanup(&engine);
 #ifdef DISTILL_RENDER
@@ -3884,7 +4129,10 @@ static int run_page(const char *input, uint64_t cap_ms, uint64_t memory_mb,
     }
     JS_SetRuntimeOpaque(engine.runtime, &engine);
     JS_SetMemoryLimit(engine.runtime, engine.memory_limit);
-    JS_SetMaxStackSize(engine.runtime, 8u * 1024u * 1024u);
+    /* A caller that knows the stack this runs on -- an in-process host that
+       made the thread -- says so; otherwise it is the process's own. */
+    JS_SetMaxStackSize(engine.runtime,
+                       request->js_stack_bytes ? request->js_stack_bytes : js_stack_limit());
     JS_SetInterruptHandler(engine.runtime, interrupt_handler, &engine);
     engine.context = JS_NewContext(engine.runtime);
     if (!engine.context) {
@@ -3905,12 +4153,16 @@ static int run_page(const char *input, uint64_t cap_ms, uint64_t memory_mb,
         return 2;
     }
     dbuf_free(&html);
+    run_stats.runtime_ms = clock_ms() - phase_started;
+    if (d_measure_enabled()) run_stats.rss_runtime_kib = d_measure_peak_rss_kib();
+    phase_started = clock_ms();
     set_document_base(&engine);
     bool needs_extraction = viewer_path || render_path || template_path || markdown_path ||
                             cells_path || extract;
     char *initial_json = NULL;
     report_progress(&engine, PROGRESS_FETCH_END, "scripts");
     bool scripts_failed = false;
+    engine.in_script_phase = true;
     if (!engine.challenge) {
         if (!discover_scripts(&engine)) {
             /* Script discovery can be interrupted by a page whose DOM or
@@ -3918,7 +4170,7 @@ static int run_page(const char *input, uint64_t cap_ms, uint64_t memory_mb,
                The fetched response and its extraction are still valid; keep
                them and continue with the untouched document instead of
                turning a script failure into a transport failure. */
-            fprintf(stderr, "script discovery failed; continuing with initial document\n");
+            note("script discovery failed; continuing with initial document\n");
             scripts_failed = true;
         } else {
             settle(&engine);
@@ -3927,6 +4179,12 @@ static int run_page(const char *input, uint64_t cap_ms, uint64_t memory_mb,
     /* The settle cap stops page activity; it must not interrupt our own
        final DOM snapshot or extraction pass. */
     JS_SetInterruptHandler(engine.runtime, NULL, NULL);
+    engine.in_script_phase = false;
+    run_stats.scripts_ms = clock_ms() - phase_started;
+    if (d_measure_enabled()) run_stats.rss_scripts_kib = d_measure_peak_rss_kib();
+    run_stats.scripts_run = engine.scripts_run;
+    run_stats.cap_hit = engine.cap_hit;
+    phase_started = clock_ms();
     report_progress(&engine, PROGRESS_SCRIPTS_END, "extract");
     char *serialized = serialize_document(&engine);
     /* Some challenges write their message from script, so the served HTML
@@ -3937,7 +4195,7 @@ static int run_page(const char *input, uint64_t cap_ms, uint64_t memory_mb,
         engine.challenge = challenge_kind(serialized, strlen(serialized),
                                           DISTILL_CHALLENGE_SETTLED_BYTES);
         if (engine.challenge) {
-            fprintf(stderr, "challenge page detected (%s) for %s after script execution\n",
+            note("challenge page detected (%s) for %s after script execution\n",
                     engine.challenge, engine.source_url);
         }
     }
@@ -3963,6 +4221,9 @@ static int run_page(const char *input, uint64_t cap_ms, uint64_t memory_mb,
         free(initial_json);
         initial_json = NULL;
     }
+    run_stats.extract_ms = clock_ms() - phase_started;
+    if (d_measure_enabled()) run_stats.rss_extract_kib = d_measure_peak_rss_kib();
+    phase_started = clock_ms();
     report_progress(&engine, PROGRESS_EXTRACT_END, "render");
     if (viewer_path) {
 #ifdef DISTILL_RENDER
@@ -3973,17 +4234,17 @@ static int run_page(const char *input, uint64_t cap_ms, uint64_t memory_mb,
                                          saved ? save_media_path : NULL);
         if (!saved || !*template || !distill_litehtml_render(template, viewer_path,
                                                                render_width, render_height, font_dir)) {
-            fprintf(stderr, "unable to render media viewer %s\n", viewer_path);
+            note("unable to render media viewer %s\n", viewer_path);
             result = 3;
         } else {
-            fprintf(stderr, "rendered media viewer %s (%dx%d)\n",
+            note("rendered media viewer %s (%dx%d)\n",
                     viewer_path, render_width, render_height);
         }
         free(template);
         free(json);
 #else
         (void)render_width; (void)render_height; (void)font_dir;
-        fprintf(stderr, "this build has no litehtml renderer\n");
+        note("this build has no litehtml renderer\n");
         result = 2;
 #endif
     } else if (render_path) {
@@ -4003,16 +4264,16 @@ static int run_page(const char *input, uint64_t cap_ms, uint64_t memory_mb,
         }
         if (!template_ok || !*template || !distill_litehtml_render(template, render_path,
                                                                      render_width, used_height, font_dir)) {
-            fprintf(stderr, "unable to render %s\n", render_path);
+            note("unable to render %s\n", render_path);
             result = 3;
         } else {
-            fprintf(stderr, "rendered %s (%dx%d)\n", render_path, render_width, used_height);
+            note("rendered %s (%dx%d)\n", render_path, render_width, used_height);
         }
         free(template);
         free(json);
 #else
         (void)render_width; (void)render_height; (void)font_dir;
-        fprintf(stderr, "this build has no litehtml renderer\n");
+        note("this build has no litehtml renderer\n");
         result = 2;
 #endif
     } else if (markdown_path) {
@@ -4026,7 +4287,7 @@ static int run_page(const char *input, uint64_t cap_ms, uint64_t memory_mb,
         char *markdown = *template ? reader_markdown(template, engine.source_url)
                                    : d_strdup("");
         if (!*markdown || !write_file_bytes(markdown_path, markdown, strlen(markdown))) {
-            fprintf(stderr, "unable to write markdown %s\n", markdown_path);
+            note("unable to write markdown %s\n", markdown_path);
             result = 3;
         }
         free(markdown);
@@ -4034,7 +4295,7 @@ static int run_page(const char *input, uint64_t cap_ms, uint64_t memory_mb,
         free(json);
 #else
         (void)theme; (void)zoom;
-        fprintf(stderr, "this build has no reader page\n");
+        note("this build has no reader page\n");
         result = 2;
 #endif
     } else if (cells_path) {
@@ -4043,14 +4304,14 @@ static int run_page(const char *input, uint64_t cap_ms, uint64_t memory_mb,
         selected_json = NULL;
         char *template = reader_template(&engine, json, theme, native_forms, zoom);
         if (!*template || !write_cells(template, cell_columns, cell_rows, cells_path)) {
-            fprintf(stderr, "unable to write cells %s\n", cells_path);
+            note("unable to write cells %s\n", cells_path);
             result = 3;
         }
         free(template);
         free(json);
 #else
         (void)cell_columns; (void)cell_rows;
-        fprintf(stderr, "this build has no reader page\n");
+        note("this build has no reader page\n");
         result = 2;
 #endif
     } else if (template_path) {
@@ -4059,32 +4320,35 @@ static int run_page(const char *input, uint64_t cap_ms, uint64_t memory_mb,
         selected_json = NULL;
         char *template = reader_template(&engine, json, theme, native_forms, zoom);
         if (!*template || !write_file_bytes(template_path, template, strlen(template))) {
-            fprintf(stderr, "unable to write reader template %s\n", template_path);
+            note("unable to write reader template %s\n", template_path);
             result = 3;
         }
         free(template);
         free(json);
 #else
         (void)theme; (void)zoom;
-        fprintf(stderr, "this build has no reader page\n");
+        note("this build has no reader page\n");
         result = 2;
 #endif
     } else if (extract) {
         char *json = selected_json;
         selected_json = NULL;
-        puts(json);
+        if (engine_callbacks && engine_callbacks->output)
+            engine_callbacks->output(engine_callbacks->opaque, json);
         free(json);
     } else if (dump_dom) {
-        puts(serialized);
+        if (engine_callbacks && engine_callbacks->output)
+            engine_callbacks->output(engine_callbacks->opaque, serialized);
 #ifdef DISTILL_B_PRUNED
-        fprintf(stderr, "arm-b-pruned litehtml=%s\n", distill_litehtml_probe(serialized) ? "ok" : "failed");
+        note("arm-b-pruned litehtml=%s\n", distill_litehtml_probe(serialized) ? "ok" : "failed");
 #endif
     }
+    run_stats.output_ms = clock_ms() - phase_started;
     /* The output above is still produced so the challenge shell can be
        inspected; the status distinguishes it from a content run. */
     if (result == 0 && engine.challenge) result = 4;
     report_progress(&engine, 100, "done");
-    fprintf(stderr, "%s scripts=%llu cap_hit=%s\n", viewer_path ? "phase2-viewer" : (render_path ? "phase2" : (extract ? "phase1" : "phase0")),
+    note("%s scripts=%llu cap_hit=%s\n", viewer_path ? "phase2-viewer" : (render_path ? "phase2" : (extract ? "phase1" : "phase0")),
             (unsigned long long)engine.scripts_run, engine.cap_hit ? "true" : "false");
     free(selected_json);
     free(initial_json);
@@ -4097,202 +4361,152 @@ static int run_page(const char *input, uint64_t cap_ms, uint64_t memory_mb,
     return result;
 }
 
-static void usage(const char *program)
+static void json_string_append(DBuffer *out, const char *text)
 {
-    fprintf(stderr, "usage: %s --url URL [--dump-dom|--extract|--render FILE|--template FILE|--markdown FILE|--dump-cells FILE|--viewer FILE|--fetch-media FILE] [--media-index N] [--save-media FILE] [--width N] [--height N|0] [--font-dir DIR] [--theme warm|night|paper] [--zoom PERCENT] [--native-forms] [--progress] [--https-optional] [--request-method GET|POST] [--request-data DATA|--request-data-file FILE|-] [--session-file FILE] [--script-cap-ms N] [--memory-limit-mb N] [--max-scripts N] [--version]\n", program);
-    fprintf(stderr, "  --dump-cells FILE     lay the reader page out in character cells, as the terminal\n"
-        "                        shows it, and write it as plain text. --columns N (default\n"
-        "                        80) is the terminal width; --rows N (default 0, the whole\n"
-        "                        page) how much of it to write. --cells-from PAGE converts a\n"
-        "                        reader page already on disk, like --markdown-from.\n");
-    fprintf(stderr, "  --height 0            size the render to the content instead of cropping it.\n"
-        "  --fetch-media FILE    fetch one image and write its bytes, with no scripts and no\n"
-        "                        extraction. The format is taken from the bytes, not the\n"
-        "                        served content type, and a non-image is refused.\n");
-    fprintf(stderr, "  --zoom PERCENT        reader type size, 50 to 300, default 100. The column and the\n"
-        "                        gutters scale with it; the surface width caps both.\n");
-    fprintf(stderr, "  --progress            report \"progress PERCENT PHASE\" on stdout as the run moves\n"
-        "                        through fetch, scripts, extract and render. The phases are\n"
-        "                        what is measured; the percentage is their weighting. Not\n"
-        "                        available with --dump-dom or --extract, whose output is\n"
-        "                        stdout itself.\n");
-    fprintf(stderr, "  --session-file FILE   keep cookies across runs, so a login survives the next navigation.\n");
-    fprintf(stderr, "                        Created mode 600 and refused if others can read it.\n");
-    fprintf(stderr, "  --request-data-file F read the POST body from a file, or from stdin when F is \"-\".\n");
-    fprintf(stderr, "                        Prefer this for credentials: --request-data puts them in argv,\n");
-    fprintf(stderr, "                        which is visible in the process table and in shell history.\n");
+    dbuf_puts(out, "\"");
+    for (const unsigned char *p = (const unsigned char *)(text ? text : ""); *p; ++p) {
+        if (*p == '"' || *p == '\\') dbuf_printf(out, "\\%c", *p);
+        else if (*p < 0x20) dbuf_printf(out, "\\u%04x", *p);
+        else dbuf_append(out, (const char *)p, 1);
+    }
+    dbuf_puts(out, "\"");
 }
 
-/* A request body carrying a password must not reach argv: the command line is
-   visible in the process table and lands in shell history. It is read from a
-   file, or from stdin when the path is "-". */
-static char *read_request_body(const char *path)
+/* One line for M0's table. js_heap_final is read after the runtime is freed,
+   so anything but 0 is memory QuickJS still held at teardown. */
+static void write_run_stats(const char *url, int status)
 {
-    if (d_eq(path, "-")) {
-        DBuffer body; dbuf_init(&body);
-        char chunk[4096];
-        size_t got;
-        while ((got = fread(chunk, 1, sizeof(chunk), stdin)) > 0) dbuf_append(&body, chunk, got);
-        dbuf_append(&body, "", 1);
-        return dbuf_take(&body);
-    }
-    size_t length = 0;
-    char *data = d_read_file(path, &length);
-    if (!data) {
-        fprintf(stderr, "unable to read request body from %s: %s\n", path, strerror(errno));
-        return NULL;
-    }
-    /* A trailing newline from an editor or a heredoc is not part of the body. */
-    while (length && (data[length - 1] == '\n' || data[length - 1] == '\r')) data[--length] = '\0';
-    return data;
+    if (!d_measure_enabled()) return;
+    DBuffer fields; dbuf_init(&fields);
+    dbuf_puts(&fields, "\"url\":");
+    json_string_append(&fields, url);
+    dbuf_printf(&fields,
+                ",\"exit\":%d,\"js_heap_peak\":%zu,\"js_heap_final\":%zu,"
+                "\"fetches\":%llu,\"fetches_at_once\":%llu,\"scripts_run\":%llu,"
+                "\"cap_hit\":%s,\"readability_loads\":%u,"
+                "\"ms\":{\"total\":%llu,\"fetch\":%llu,\"runtime\":%llu,"
+                "\"linkedom_load\":%llu,\"scripts\":%llu,\"extract\":%llu,"
+                "\"readability_load\":%llu,\"output\":%llu},"
+                "\"rss_after_kib\":{\"fetch\":%ld,\"runtime\":%ld,\"scripts\":%ld,"
+                "\"extract\":%ld}",
+                status, run_stats.js_heap.peak, run_stats.js_heap.current,
+                (unsigned long long)run_stats.fetches,
+                (unsigned long long)run_stats.fetches_at_once,
+                (unsigned long long)run_stats.scripts_run,
+                run_stats.cap_hit ? "true" : "false", run_stats.readability_loads,
+                (unsigned long long)(clock_ms() - run_stats.started),
+                (unsigned long long)run_stats.fetch_ms,
+                (unsigned long long)run_stats.runtime_ms,
+                (unsigned long long)run_stats.linkedom_load_ms,
+                (unsigned long long)run_stats.scripts_ms,
+                (unsigned long long)run_stats.extract_ms,
+                (unsigned long long)run_stats.readability_load_ms,
+                (unsigned long long)run_stats.output_ms,
+                run_stats.rss_fetch_kib, run_stats.rss_runtime_kib,
+                run_stats.rss_scripts_kib, run_stats.rss_extract_kib);
+    dbuf_append(&fields, "", 1);
+    d_measure_finish("engine", fields.data);
+    dbuf_free(&fields);
 }
 
-int main(int argc, char **argv)
+
+void d_engine_request_init(DEngineRequest *request)
 {
-    const char *url = NULL;
-    const char *render_path = NULL;
-    const char *viewer_path = NULL;
-    const char *template_path = NULL;
-    const char *markdown_path = NULL;
-    const char *markdown_from = NULL;
-    const char *cells_path = NULL;
-    const char *cells_from = NULL;
-    int cell_columns = 80, cell_rows = 0;
-    const char *save_media_path = NULL;
-    const char *fetch_media_path = NULL;
-    const char *fetch_kind = "image";
-    const char *font_dir = NULL;
-    const char *theme = "warm";
-    const char *request_method = NULL;
-    const char *request_data = NULL;
-    const char *request_data_file = NULL;
-    const char *session_file = NULL;
-    char *owned_request_data = NULL;
-    uint64_t cap_ms = 5000, memory_mb = 128, max_scripts = 1000;
-    int render_width = 760, render_height = 1100;
-    int zoom = 100;
-    int media_index = 0;
-    bool dump_dom = false, extract = false, native_forms = false, progress = false;
-    bool https_optional = false;
-    for (int i = 1; i < argc; ++i) {
-        if (d_eq(argv[i], "--url") && i + 1 < argc) url = argv[++i];
-        else if (d_eq(argv[i], "--dump-dom")) dump_dom = true;
-        else if (d_eq(argv[i], "--extract")) extract = true;
-        else if (d_eq(argv[i], "--render") && i + 1 < argc) render_path = argv[++i];
-        else if (d_eq(argv[i], "--template") && i + 1 < argc) template_path = argv[++i];
-        else if (d_eq(argv[i], "--markdown") && i + 1 < argc) markdown_path = argv[++i];
-        else if (d_eq(argv[i], "--markdown-from") && i + 1 < argc) markdown_from = argv[++i];
-        else if (d_eq(argv[i], "--dump-cells") && i + 1 < argc) cells_path = argv[++i];
-        else if (d_eq(argv[i], "--cells-from") && i + 1 < argc) cells_from = argv[++i];
-        else if (d_eq(argv[i], "--columns") && i + 1 < argc) cell_columns = (int)strtol(argv[++i], NULL, 10);
-        else if (d_eq(argv[i], "--rows") && i + 1 < argc) cell_rows = (int)strtol(argv[++i], NULL, 10);
-        else if (d_eq(argv[i], "--viewer") && i + 1 < argc) viewer_path = argv[++i];
-        else if (d_eq(argv[i], "--media-index") && i + 1 < argc) media_index = (int)strtol(argv[++i], NULL, 10);
-        else if (d_eq(argv[i], "--save-media") && i + 1 < argc) save_media_path = argv[++i];
-        else if (d_eq(argv[i], "--fetch-media") && i + 1 < argc) fetch_media_path = argv[++i];
-        else if (d_eq(argv[i], "--fetch-kind") && i + 1 < argc) fetch_kind = argv[++i];
-        else if (d_eq(argv[i], "--width") && i + 1 < argc) render_width = (int)strtol(argv[++i], NULL, 10);
-        else if (d_eq(argv[i], "--height") && i + 1 < argc) render_height = (int)strtol(argv[++i], NULL, 10);
-        else if (d_eq(argv[i], "--font-dir") && i + 1 < argc) font_dir = argv[++i];
-        else if (d_eq(argv[i], "--theme") && i + 1 < argc) theme = argv[++i];
-        else if (d_eq(argv[i], "--zoom") && i + 1 < argc) zoom = (int)strtol(argv[++i], NULL, 10);
-        else if (d_eq(argv[i], "--native-forms")) native_forms = true;
-        else if (d_eq(argv[i], "--progress")) progress = true;
-        else if (d_eq(argv[i], "--https-optional")) https_optional = true;
-        else if (d_eq(argv[i], "--request-method") && i + 1 < argc) request_method = argv[++i];
-        else if (d_eq(argv[i], "--request-data") && i + 1 < argc) request_data = argv[++i];
-        else if (d_eq(argv[i], "--request-data-file") && i + 1 < argc) request_data_file = argv[++i];
-        else if (d_eq(argv[i], "--session-file") && i + 1 < argc) session_file = argv[++i];
-        else if (d_eq(argv[i], "--script-cap-ms") && i + 1 < argc) cap_ms = strtoull(argv[++i], NULL, 10);
-        else if (d_eq(argv[i], "--memory-limit-mb") && i + 1 < argc) memory_mb = strtoull(argv[++i], NULL, 10);
-        else if (d_eq(argv[i], "--max-scripts") && i + 1 < argc) max_scripts = strtoull(argv[++i], NULL, 10);
-        else if (d_eq(argv[i], "--help") || d_eq(argv[i], "-h")) { usage(argv[0]); return 0; }
-        else if (d_eq(argv[i], "--version")) { puts("distill " DISTILL_VERSION); return 0; }
+    *request = (DEngineRequest){
+        .fetch_kind = "image",
+        .theme = "warm",
+        .zoom = 100,
+        .render_width = 760,
+        .render_height = 1100,
+        .cell_columns = 80,
+        .cap_ms = 5000,
+        .memory_mb = 128,
+        .max_scripts = 1000,
+        .max_fetches = 8,
+    };
+}
+
+int d_engine_run(const DEngineRequest *request, const DEngineCallbacks *callbacks)
+{
+    static bool curl_ready = false;
+    if (!curl_ready) {
+        /* Once per process, and never torn down: an in-process host runs
+           many navigations, and curl_global_init is not safe to repeat
+           around them. */
+        if (curl_global_init(CURL_GLOBAL_DEFAULT) != CURLE_OK) return D_ENGINE_FAILED;
+        curl_ready = true;
     }
-    if (request_data && request_data_file) {
-        fprintf(stderr, "use --request-data or --request-data-file, not both\n");
-        return 2;
-    }
-    /* Converting a reader page already on disk. No URL, no fetch, no scripts:
-       the exported document is the page the reader is showing, not a second
-       reading of the same address, which may since have changed or may not be
-       reachable again without the session that produced it. */
-    if (markdown_from) {
-#ifdef DISTILL_READER
-        if (!markdown_path) { usage(argv[0]); return 2; }
-        size_t length = 0;
-        char *template = d_read_file(markdown_from, &length);
-        if (!template) {
-            fprintf(stderr, "unable to read reader page %s\n", markdown_from);
-            return 2;
-        }
-        char *markdown = reader_markdown(template, url);
-        bool ok = *markdown && write_file_bytes(markdown_path, markdown, strlen(markdown));
-        if (!ok) fprintf(stderr, "unable to write markdown %s\n", markdown_path);
-        free(markdown);
-        free(template);
-        return ok ? 0 : 3;
-#else
-        fprintf(stderr, "this build has no reader page\n");
-        return 2;
-#endif
-    }
-    if (cells_from) {
-#ifdef DISTILL_READER
-        if (!cells_path || cell_columns < 8 || cell_rows < 0) { usage(argv[0]); return 2; }
-        size_t length = 0;
-        char *template = d_read_file(cells_from, &length);
-        if (!template) {
-            fprintf(stderr, "unable to read reader page %s\n", cells_from);
-            return 2;
-        }
-        bool ok = write_cells(template, cell_columns, cell_rows, cells_path);
-        if (!ok) fprintf(stderr, "unable to write cells %s\n", cells_path);
-        free(template);
-        return ok ? 0 : 3;
-#else
-        fprintf(stderr, "this build has no reader page\n");
-        return 2;
-#endif
-    }
-    if ((cells_path && (cell_columns < 8 || cell_rows < 0)) ||
-        (cells_path && (dump_dom || extract || render_path || template_path || viewer_path ||
-                        markdown_path || fetch_media_path))) {
-        usage(argv[0]); return 2;
-    }
-    if (!url || !*url || (dump_dom && (extract || render_path || template_path || viewer_path)) ||
-        (extract && (render_path || template_path || viewer_path)) ||
-        (template_path && viewer_path) || (render_path && viewer_path) ||
-        (save_media_path && !viewer_path) || media_index < 0 ||
-        (fetch_media_path && (dump_dom || extract || render_path || template_path || viewer_path)) ||
-        render_width <= 0 || render_height < 0 ||
-        zoom < READER_ZOOM_MIN || zoom > READER_ZOOM_MAX ||
-        (progress && (dump_dom || extract)) ||
-        ((request_data || request_data_file) && (!request_method || !d_ieq(request_method, "post"))) ||
-        (request_method && !d_ieq(request_method, "get") && !d_ieq(request_method, "post"))) {
-        usage(argv[0]); return 2;
-    }
-    if (request_data_file) {
-        owned_request_data = read_request_body(request_data_file);
-        if (!owned_request_data) return 2;
-        request_data = owned_request_data;
-    }
-    curl_global_init(CURL_GLOBAL_DEFAULT);
-    int result = run_page(url, cap_ms, memory_mb, max_scripts, dump_dom, extract,
-                          render_path, viewer_path, media_index, save_media_path,
-                          fetch_media_path,
-                          fetch_kind,
-                          render_width, render_height, font_dir, template_path,
-                          markdown_path, cells_path, cell_columns, cell_rows, theme,
-                          native_forms, zoom,
-                          request_method, request_data, session_file, progress,
-                          https_optional);
-    curl_global_cleanup();
-    /* The body may hold a password; do not leave it in freed-but-readable
-       heap longer than necessary. */
-    if (owned_request_data) {
-        memset(owned_request_data, 0, strlen(owned_request_data));
-        free(owned_request_data);
-    }
+    engine_callbacks = callbacks;
+    run_stats = (typeof(run_stats)){0};
+    run_stats.started = clock_ms();
+    int result = request && request->url && *request->url ? run_page(request) : D_ENGINE_FAILED;
+    write_run_stats(request ? request->url : "", result);
+    engine_callbacks = NULL;
     return result;
 }
+
+#ifdef DISTILL_READER
+int d_engine_markdown_from(const char *template_path, const char *url,
+                           const char *markdown_path, const DEngineCallbacks *callbacks)
+{
+    engine_callbacks = callbacks;
+    int result = D_ENGINE_OK;
+    size_t length = 0;
+    char *template = d_read_file(template_path, &length);
+    if (!template) {
+        note("unable to read reader page %s", template_path);
+        result = D_ENGINE_FAILED;
+    } else {
+        char *markdown = reader_markdown(template, url);
+        if (!*markdown || !write_file_bytes(markdown_path, markdown, strlen(markdown))) {
+            note("unable to write markdown %s", markdown_path);
+            result = D_ENGINE_RENDER_FAILED;
+        }
+        free(markdown);
+        free(template);
+    }
+    engine_callbacks = NULL;
+    return result;
+}
+
+int d_engine_cells_from(const char *template_path, int columns, int rows,
+                        const char *cells_path, const DEngineCallbacks *callbacks)
+{
+    engine_callbacks = callbacks;
+    int result = D_ENGINE_OK;
+    size_t length = 0;
+    char *template = d_read_file(template_path, &length);
+    if (!template) {
+        note("unable to read reader page %s", template_path);
+        result = D_ENGINE_FAILED;
+    } else {
+        if (!write_cells(template, columns, rows, cells_path)) {
+            note("unable to write cells %s", cells_path);
+            result = D_ENGINE_RENDER_FAILED;
+        }
+        free(template);
+    }
+    engine_callbacks = NULL;
+    return result;
+}
+#else
+int d_engine_markdown_from(const char *template_path, const char *url,
+                           const char *markdown_path, const DEngineCallbacks *callbacks)
+{
+    (void)template_path; (void)url; (void)markdown_path;
+    engine_callbacks = callbacks;
+    note("this build has no reader page");
+    engine_callbacks = NULL;
+    return D_ENGINE_FAILED;
+}
+
+int d_engine_cells_from(const char *template_path, int columns, int rows,
+                        const char *cells_path, const DEngineCallbacks *callbacks)
+{
+    (void)template_path; (void)columns; (void)rows; (void)cells_path;
+    engine_callbacks = callbacks;
+    note("this build has no reader page");
+    engine_callbacks = NULL;
+    return D_ENGINE_FAILED;
+}
+#endif

@@ -482,6 +482,31 @@ challenge still serializes and extracts its shell, so the run produces output,
 but the status separates it from a run that reached content. `check.py` treats
 any other status as a capture failure, as before.
 
+A page may assert what its run costs, checked by `--extract` through the
+engine's `DISTILL_STATS` line: `max_rss_mib` for peak memory, `max_run_ms`
+for wall time and `max_fetches_at_once` for transfers attached together. These regressions are invisible to every content assertion,
+because the output is identical and only the process is larger or slower.
+`42-stylesheet-scale` pins extraction memory (339 MiB before its fix, 45 MiB
+after) and `44-blocking-script-chain` pins the settle cap (15 s before, 5 s
+after), and `45-fetch-concurrency` pins the fetch queue (12 at once before, 8
+after). Keep a budget well above the measured value and well below the broken
+one, so it catches the defect and not the machine.
+
+## Other modes
+
+- `--in-process` runs the engine as a library, the whole corpus in one
+  `build/distill-host` process with each navigation on its own thread
+  (`src/engine_host.h`). With `--extract` it runs the golden gates. Budgets
+  report "pending" there, since they measure a process. A run that leaves
+  state behind for the next one fails the next one.
+- `--stack` models Muroxi's stacks: every gated page extracts with the engine
+  in an 8 MiB stack, and the terminal suite runs with the shell in 64 KiB.
+  Two negative controls must fail: the deep-recursion page with the JS limit
+  set to the whole stack, and the shell in 16 KiB.
+- The default mode also checks that an engine run writes no temporary files,
+  and that TLS refused under an untrusted clock (`DISTILL_TEST_UNTRUSTED_TIME=1`)
+  exits 5.
+
 ## Live rungs
 
 Five rungs in ascending difficulty, in `live.md` and `manifest.json`. **None is a

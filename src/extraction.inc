@@ -3,7 +3,6 @@
 #include <lexbor/html/interfaces/document.h>
 #include <lexbor/html/serialize.h>
 
-#include <dirent.h>
 
 #include "dom_util.h"
 
@@ -73,8 +72,41 @@ static bool declaration_has(const char *declarations, const char *property, cons
     return found;
 }
 
-static bool css_hides(lxb_dom_node_t *root, lxb_dom_node_t *target)
+/* The selectors of the page's own <style> rules that set display:none or
+   visibility:hidden. Visibility is asked of every element and every ancestor,
+   so these are read once per document rather than on every question: reading
+   them each time re-copied and re-parsed every stylesheet per element, which
+   on a 275 KB news front page cost 130 MiB and most of a second. Keyed by the
+   root and cleared when the document goes, since a new document can reuse the
+   old one's address. */
+typedef struct {
+    lxb_dom_node_t *root;
+    char **selectors;
+    size_t length;
+    size_t capacity;
+} HideRules;
+
+static HideRules hide_rules;
+
+static void hide_rules_clear(void)
 {
+    for (size_t i = 0; i < hide_rules.length; ++i) free(hide_rules.selectors[i]);
+    free(hide_rules.selectors);
+    hide_rules = (HideRules){0};
+}
+
+static void hide_rules_push(char *selector)
+{
+    d_vec_reserve((void **)&hide_rules.selectors, &hide_rules.capacity, hide_rules.length,
+                  sizeof(*hide_rules.selectors), hide_rules.length + 1);
+    hide_rules.selectors[hide_rules.length++] = selector;
+}
+
+static const HideRules *hide_rules_for(lxb_dom_node_t *root)
+{
+    if (hide_rules.root == root) return &hide_rules;
+    hide_rules_clear();
+    hide_rules.root = root;
     NodeVec styles = find_selector(root, "style");
     for (size_t i = 0; i < styles.length; ++i) {
         char *css = node_text(styles.items[i]);
@@ -84,26 +116,33 @@ static bool css_hides(lxb_dom_node_t *root, lxb_dom_node_t *target)
             if (!open) break;
             char *close = strchr(open + 1, '}');
             if (!close) break;
-            char *selectors = d_strndup(cursor, (size_t)(open - cursor));
             char *declarations = d_strndup(open + 1, (size_t)(close - open - 1));
             bool hides = declaration_has(declarations, "display", "none") || declaration_has(declarations, "visibility", "hidden");
+            free(declarations);
             if (hides) {
+                char *selectors = d_strndup(cursor, (size_t)(open - cursor));
                 char *part = selectors;
                 while (part) {
                     char *comma = strchr(part, ',');
                     if (comma) *comma = 0;
-                    char *clean = d_trim(part);
-                    if (selector_match(target, clean)) { free(clean); free(selectors); free(declarations); free(css); free(styles.items); return true; }
-                    free(clean);
+                    hide_rules_push(d_trim(part));
                     part = comma ? comma + 1 : NULL;
                 }
+                free(selectors);
             }
-            free(selectors); free(declarations);
             cursor = close + 1;
         }
         free(css);
     }
     free(styles.items);
+    return &hide_rules;
+}
+
+static bool css_hides(lxb_dom_node_t *root, lxb_dom_node_t *target)
+{
+    const HideRules *rules = hide_rules_for(root);
+    for (size_t i = 0; i < rules->length; ++i)
+        if (selector_match(target, rules->selectors[i])) return true;
     return false;
 }
 
@@ -406,7 +445,7 @@ static char *embedded_plain_text(const char *value)
         }
         if (space && out.length) dbuf_puts(&out, " ");
         space = false;
-        dbuf_append(&out, p, 1);
+        dbuf_append(&out, (const char *)p, 1);
     }
     char *text = dbuf_take(&out);
     char *trimmed = d_trim(text);
@@ -1071,18 +1110,18 @@ static char *readability_snapshot(const char *html)
 static ReadabilityFields run_readability(Engine *engine, const char *serialized)
 {
     ReadabilityFields fields = {0};
-    char *parser_path = d_cat3(DISTILL_SOURCE_DIR, "/external/src/readability/JSDOMParser.js", "");
-    char *readability_path = d_cat3(DISTILL_SOURCE_DIR, "/external/src/readability/Readability.js", "");
-    size_t parser_length = 0, readability_length = 0;
-    char *parser = d_read_file(parser_path, &parser_length);
-    char *readability = d_read_file(readability_path, &readability_length);
-    free(parser_path); free(readability_path);
-    if (!parser || !readability) { free(parser); free(readability); return fields; }
-    JSValue result = JS_Eval(engine->context, parser, parser_length, "JSDOMParser.js", JS_EVAL_TYPE_GLOBAL);
-    if (JS_IsException(result)) { note_exception(engine, "Readability parser"); JS_FreeValue(engine->context, result); free(parser); free(readability); return fields; }
+    /* Both compiled at build time (embedded_js.h): read, then run. */
+    uint64_t load_started = clock_ms();
+    ++run_stats.readability_loads;
+    JSValue code = JS_ReadObject(engine->context, distill_js_jsdomparser,
+                                 distill_js_jsdomparser_size, JS_READ_OBJ_BYTECODE);
+    JSValue result = JS_IsException(code) ? code : JS_EvalFunction(engine->context, code);
+    if (JS_IsException(result)) { note_exception(engine, "Readability parser"); JS_FreeValue(engine->context, result); return fields; }
     JS_FreeValue(engine->context, result);
-    result = JS_Eval(engine->context, readability, readability_length, "Readability.js", JS_EVAL_TYPE_GLOBAL);
-    free(parser); free(readability);
+    code = JS_ReadObject(engine->context, distill_js_readability,
+                         distill_js_readability_size, JS_READ_OBJ_BYTECODE);
+    result = JS_IsException(code) ? code : JS_EvalFunction(engine->context, code);
+    run_stats.readability_load_ms += clock_ms() - load_started;
     if (JS_IsException(result)) { note_exception(engine, "Readability"); JS_FreeValue(engine->context, result); return fields; }
     JS_FreeValue(engine->context, result);
     char *snapshot = readability_snapshot(serialized);
@@ -1442,15 +1481,38 @@ static char *main_content_profile_directory(void)
 {
     const char *configured = getenv("DISTILL_PROFILE_DIR");
     if (configured && *configured) return d_strdup(configured);
-    char *source = d_cat2(DISTILL_SOURCE_DIR, "/profiles");
-    if (access(source, R_OK) == 0) return source;
-    free(source);
-#ifdef DISTILL_INSTALL_PROFILE_DIR
-    char *installed = d_strdup(DISTILL_INSTALL_PROFILE_DIR);
-    if (access(installed, R_OK) == 0) return installed;
-    free(installed);
-#endif
-    return d_strdup("");
+    char *installed = d_data_path("profiles", NULL);
+    return installed ? installed : d_strdup("");
+}
+
+typedef struct {
+    Engine *engine;
+    const char *directory;
+    const char *url;
+    MainContentProfile *out;
+    bool found;
+} ProfileSearch;
+
+static bool profile_candidate(void *opaque, const char *name, bool is_directory)
+{
+    ProfileSearch *search = opaque;
+    size_t length = strlen(name);
+    if (is_directory || length < 6 || !d_ieq(name + length - 5, ".json")) return true;
+    char *path = d_cat3(search->directory, "/", name);
+    size_t body_length = 0;
+    char *body = d_read_file(path, &body_length);
+    free(path);
+    if (!body || !body_length) { free(body); return true; }
+    Engine *engine = search->engine;
+    JSValue parsed = JS_ParseJSON(engine->context, body, body_length, name);
+    if (JS_IsException(parsed)) {
+        JS_FreeValue(engine->context, JS_GetException(engine->context));
+    } else {
+        search->found = profile_from_json(engine, parsed, name, search->url, search->out);
+    }
+    JS_FreeValue(engine->context, parsed);
+    free(body);
+    return !search->found;
 }
 
 static bool main_content_profile_load(Engine *engine, const char *url,
@@ -1458,31 +1520,10 @@ static bool main_content_profile_load(Engine *engine, const char *url,
 {
     char *directory = main_content_profile_directory();
     if (!*directory) { free(directory); return false; }
-    DIR *handle = opendir(directory);
-    if (!handle) { free(directory); return false; }
-    bool found = false;
-    struct dirent *entry;
-    while (!found && (entry = readdir(handle))) {
-        const char *name = entry->d_name;
-        size_t length = strlen(name);
-        if (length < 6 || !d_ieq(name + length - 5, ".json")) continue;
-        char *path = d_cat3(directory, "/", name);
-        size_t body_length = 0;
-        char *body = d_read_file(path, &body_length);
-        free(path);
-        if (!body || !body_length) { free(body); continue; }
-        JSValue parsed = JS_ParseJSON(engine->context, body, body_length, name);
-        if (JS_IsException(parsed)) {
-            JS_FreeValue(engine->context, JS_GetException(engine->context));
-        } else {
-            found = profile_from_json(engine, parsed, name, url, out);
-        }
-        JS_FreeValue(engine->context, parsed);
-        free(body);
-    }
-    closedir(handle);
+    ProfileSearch search = {engine, directory, url, out, false};
+    d_fs_list(directory, profile_candidate, &search);
     free(directory);
-    return found;
+    return search.found;
 }
 
 static bool main_content_candidate_matches(lxb_dom_node_t *root, lxb_dom_node_t *candidate,
@@ -2389,5 +2430,5 @@ static char *run_extraction(Engine *engine, const char *serialized, bool include
         char *quoted = json_quote(embedded.unknown.items[i]); dbuf_puts(&out, quoted); free(quoted);
     }
     dbuf_printf(&out, "],\"sources\":%s,\"blocks\":%s,\"links\":%s,\"media\":%s,\"navigation\":%s},\"sanitization\":{\"allowed_schemes\":[\"http\",\"https\",\"mailto\",\"tel\"],\"rejected_uris\":%zu}}", embedded_sources, embedded_blocks, embedded_links, embedded_media, embedded_navigation, rejected);
-    free(qembedded_adapter); free(qembedded_version); free(qembedded_title); free(qurl); free(qbase); free(qtitle); free(page_title); free(qkind); free(qevidence); free(qselected); free(content); free(tables); free(search); free(forms); free(videos); free(audio); free(media); free(links); free(structured); free(blocks); free(dom_blocks); free(embedded_sources); free(embedded_blocks); free(embedded_links); free(embedded_media); free(embedded_navigation); free(shape.kind); free(shape.evidence); free(main_blocks_json); embedded_free(&embedded); free_main_content(&item); free_main_content_profile(&profile); free_readability(&readability); lxb_html_document_destroy(document); extraction_fast_visibility = previous_fast_visibility; return dbuf_take(&out);
+    free(qembedded_adapter); free(qembedded_version); free(qembedded_title); free(qurl); free(qbase); free(qtitle); free(page_title); free(qkind); free(qevidence); free(qselected); free(content); free(tables); free(search); free(forms); free(videos); free(audio); free(media); free(links); free(structured); free(blocks); free(dom_blocks); free(embedded_sources); free(embedded_blocks); free(embedded_links); free(embedded_media); free(embedded_navigation); free(shape.kind); free(shape.evidence); free(main_blocks_json); embedded_free(&embedded); free_main_content(&item); free_main_content_profile(&profile); free_readability(&readability); hide_rules_clear(); lxb_html_document_destroy(document); extraction_fast_visibility = previous_fast_visibility; return dbuf_take(&out);
 }

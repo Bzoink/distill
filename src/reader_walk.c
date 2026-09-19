@@ -1,5 +1,3 @@
-#define _POSIX_C_SOURCE 200809L
-
 #include "reader_walk.h"
 
 #include "dom_util.h"
@@ -199,10 +197,14 @@ static void walk_form(Walk *walk, lxb_dom_node_t *node)
 static void walk_node(Walk *walk, lxb_dom_node_t *node)
 {
     if (node->type == LXB_DOM_NODE_TYPE_TEXT) {
+        /* The text is a copy in the document's arena; hand it back, as
+           node_text() does, rather than let every text node's copy stand
+           until the document is destroyed. */
         size_t length = 0;
-        const lxb_char_t *data = lxb_dom_node_text_content(node, &length);
-        if (!data || !length) return;
-        EMIT(walk, text, (const char *)data, length);
+        lxb_char_t *data = lxb_dom_node_text_content(node, &length);
+        if (!data) return;
+        if (length) EMIT(walk, text, (const char *)data, length);
+        lxb_dom_document_destroy_text(node->owner_document, data);
         return;
     }
     if (!is_element(node)) return;

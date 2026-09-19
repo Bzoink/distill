@@ -1441,6 +1441,108 @@
           "expect": "distill-play:"
         }
       ]
+    },
+    {
+      "id": "42-stylesheet-scale",
+      "path": "42-stylesheet-scale.html",
+      "gate": true,
+      "plan_section": "Minimal computed style, at the size of a real page",
+      "exercises": [
+        "style-resolver",
+        "extraction-memory",
+        "hidden-by-stylesheet"
+      ],
+      "why": "Extraction asked every element whether the page's stylesheet hid it by copying and re-parsing every <style> element each time, and never returned the copies. The output was right and the cost was the stylesheet's size times the element count: a BBC front page took the engine from 24 to 152 MiB, and this page takes the old engine to 339 MiB against 45 MiB now. Only a budget sees this; every content assertion passes either way.",
+      "max_rss_mib": 64,
+      "assertions": [
+        {
+          "stage": "dom",
+          "selector": "#status",
+          "expect": "SCALE-BUILT-3000"
+        },
+        {
+          "stage": "extract",
+          "expect": "SCALE-BODY-0."
+        },
+        {
+          "stage": "extract",
+          "expect": "SCALE-BODY-2999",
+          "expect_absent": [
+            "CSSLEAK",
+            "QUIETLEAK"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "43-deep-recursion",
+      "path": "43-deep-recursion.html",
+      "gate": true,
+      "plan_section": "Phase 0 resource limits: a recursion the engine survives",
+      "exercises": [
+        "js-stack-limit",
+        "resource-limits"
+      ],
+      "why": "The JS stack limit was a flat 8 MiB, the whole of the process's default stack, so QuickJS's stack check never fired first: a page recursing about 4,600 calls deep killed the engine with SIGSEGV. The limit now comes from the real stack less a margin, and the page gets the RangeError a browser would give it.",
+      "assertions": [
+        {
+          "stage": "dom",
+          "selector": "#out",
+          "expect": "STACK-GUARDED RangeError"
+        },
+        {
+          "stage": "extract",
+          "expect": "RECURSION-BODY-OK"
+        }
+      ]
+    },
+    {
+      "id": "44-blocking-script-chain",
+      "path": "44-blocking-script-chain.html",
+      "gate": true,
+      "plan_section": "Settle policy",
+      "exercises": [
+        "settle-cap",
+        "blocking-script",
+        "hung-request"
+      ],
+      "why": "Blocking scripts are fetched before the settle loop that enforces the cap, and each fetch got the whole cap as its own timeout, even after the cap had passed. Three scripts that never arrive held the engine for three caps; X settled in 13 s against 5. The cap is hard, so the run must end near it however many fetches remain.",
+      "max_run_ms": 7000,
+      "assertions": [
+        {
+          "stage": "extract",
+          "expect": "CHAIN-BODY-OK"
+        }
+      ]
+    },
+    {
+      "id": "45-fetch-concurrency",
+      "path": "45-fetch-concurrency.html",
+      "gate": true,
+      "plan_section": "Network bridge: a limit on transfers at once",
+      "exercises": [
+        "fetch",
+        "fetch-queue",
+        "Promise.all"
+      ],
+      "why": "The engine attached every request as soon as it was made, 46 at once on one live page, and a platform whose network carries a few parallel transfers cannot take that. It now attaches up to --max-fetches (8 by default) and queues the rest, and a blocking script fetched while every slot is taken waits for one instead of opening a ninth (an engine without that measured 9). The page must still get every answer, which the DOM assertions check; the budget checks the limit is real.",
+      "max_fetches_at_once": 8,
+      "assertions": [
+        {
+          "stage": "dom",
+          "selector": "#status",
+          "expect": "ANSWERED-12"
+        },
+        {
+          "stage": "dom",
+          "selector": "#after",
+          "expect": "BLOCKING-AFTER-OK"
+        },
+        {
+          "stage": "extract",
+          "expect": "ANSWERED-12"
+        }
+      ]
     }
   ],
   "live": [

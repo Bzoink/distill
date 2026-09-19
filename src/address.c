@@ -1,16 +1,13 @@
-#define _POSIX_C_SOURCE 200809L
-
 #include "address.h"
 
 #include "cutil.h"
 #include "form_submit.h"
 
-#include <strings.h>
 
 static bool has_scheme(const char *uri, const char *scheme)
 {
     size_t length = strlen(scheme);
-    return uri && strncasecmp(uri, scheme, length) == 0 && uri[length] == ':';
+    return uri && d_ncasecmp(uri, scheme, length) == 0 && uri[length] == ':';
 }
 
 static bool ascii_alpha(char c)
@@ -43,7 +40,7 @@ bool d_address_looks_like_url(const char *text)
     char *host = d_strndup(text, host_len);
     if (colon && colon < text + host_len) host[colon - text] = '\0';
     bool ok = false;
-    if (strcasecmp(host, "localhost") == 0) {
+    if (d_casecmp(host, "localhost") == 0) {
         ok = true;
     } else {
         const char *dot = strrchr(host, '.');
@@ -100,8 +97,8 @@ char *d_address_resolve(const char *raw, bool *https_guessed)
         }
         /* Loopback names have no certificate to present, so asking for https
            there fails for a reason that has nothing to do with the request. */
-        bool loopback = strncasecmp(text, "localhost", 9) == 0 ||
-                        strncasecmp(text, "127.0.0.1", 9) == 0;
+        bool loopback = d_ncasecmp(text, "localhost", 9) == 0 ||
+                        d_ncasecmp(text, "127.0.0.1", 9) == 0;
         if (https_guessed) *https_guessed = !loopback;
         char *url = d_cat2(loopback ? "http://" : "https://", text);
         free(text);

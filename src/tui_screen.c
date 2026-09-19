@@ -1,5 +1,3 @@
-#define _POSIX_C_SOURCE 200809L
-
 #include "tui_screen.h"
 
 #include "reader_cells.h"

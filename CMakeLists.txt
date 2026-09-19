@@ -10,6 +10,11 @@ include(GNUInstallDirs)
 set(CMAKE_C_STANDARD 23)
 set(CMAKE_C_STANDARD_REQUIRED ON)
 set(CMAKE_C_EXTENSIONS OFF)
+# Strict ISO C, as the portability rules require (muroxi_compat.md): no GNU
+# extensions, and -- because no core file defines a feature-test macro --
+# no POSIX declaration is visible outside src/platform/<os>/. The GTK host is
+# the one exception; GLib's own idioms are not ISO C.
+add_compile_options($<$<COMPILE_LANGUAGE:C>:-pedantic-errors>)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -59,6 +64,47 @@ target_include_directories(distill-version INTERFACE "${CMAKE_BINARY_DIR}/genera
 function(distill_enable_assertions target)
     target_compile_options(${target} PRIVATE -UNDEBUG)
 endfunction()
+
+# The platform layer (src/documents/muroxi_compat.md). The core reaches the
+# operating system only through the headers in src/platform/, and each
+# platform supplies one source file per interface under src/platform/<os>/.
+# A port is a new directory here, chosen at configure time; nothing outside
+# src/platform/<os>/ includes an OS header (tools/platform_gate.py).
+set(DISTILL_PLATFORM "linux" CACHE STRING "Which src/platform/<os> backends to build")
+set(DISTILL_PLATFORM_DIR "${CMAKE_SOURCE_DIR}/src/platform/${DISTILL_PLATFORM}")
+add_library(distill-platform STATIC
+    ${DISTILL_PLATFORM_DIR}/clock.c
+    ${DISTILL_PLATFORM_DIR}/fs.c
+    ${DISTILL_PLATFORM_DIR}/proc.c
+    ${DISTILL_PLATFORM_DIR}/term.c
+    ${DISTILL_PLATFORM_DIR}/thread.c
+    src/datadir.c
+)
+target_include_directories(distill-platform PUBLIC src/platform src)
+# Where data is found (src/datadir.h). No binary refers to the source tree:
+# a build tree finds its data in build/share/distill, staged below, and an
+# installed one beside itself or in the configured data directory.
+target_compile_definitions(distill-platform PRIVATE
+    DISTILL_INSTALL_DATADIR="${CMAKE_INSTALL_FULL_DATADIR}/distill")
+set(DISTILL_STAGED_DATA "${CMAKE_BINARY_DIR}/share/distill")
+file(MAKE_DIRECTORY "${DISTILL_STAGED_DATA}")
+foreach(entry "fonts|external/fonts" "profiles|profiles" "welcome.html|share/welcome.html")
+    string(REPLACE "|" ";" pair "${entry}")
+    list(GET pair 0 staged_name)
+    list(GET pair 1 staged_source)
+    if(NOT EXISTS "${DISTILL_STAGED_DATA}/${staged_name}")
+        file(CREATE_LINK "${CMAKE_SOURCE_DIR}/${staged_source}"
+             "${DISTILL_STAGED_DATA}/${staged_name}" SYMBOLIC)
+    endif()
+endforeach()
+find_program(DISTILL_PYTHON3 python3)
+if(DISTILL_PYTHON3)
+    add_test(NAME distill-platform-gate
+             COMMAND ${DISTILL_PYTHON3} ${CMAKE_SOURCE_DIR}/tools/platform_gate.py)
+    add_test(NAME distill-platform-gate-self-test
+             COMMAND ${DISTILL_PYTHON3} ${CMAKE_SOURCE_DIR}/tools/platform_gate.py --self-test)
+endif()
+
 add_library(distill-shaper STATIC src/shaper.c)
 target_include_directories(distill-shaper PUBLIC src)
 target_link_libraries(distill-shaper PUBLIC PkgConfig::DISTILL_UNIBREAK)
@@ -77,12 +123,24 @@ target_link_libraries(distill-image-test PRIVATE distill-image)
 distill_enable_assertions(distill-image-test)
 add_test(NAME distill-image COMMAND distill-image-test)
 
+# Resource measurement for the Muroxi budgets, and the QuickJS allocator that
+# makes the JS memory limit count on a C library without malloc_usable_size.
+add_library(distill-measure STATIC src/measure.c)
+target_link_libraries(distill-measure PUBLIC distill-platform)
+add_executable(distill-measure-test tests/measure_test.c)
+target_include_directories(distill-measure-test PRIVATE src)
+target_link_libraries(distill-measure-test PRIVATE distill-measure)
+distill_enable_assertions(distill-measure-test)
+add_test(NAME distill-measure COMMAND distill-measure-test)
+
 # What every front end shares that is not the page: the rules a form is
 # submitted by, what a typed address means, the settings file, and fetching
 # media through the engine. Shared so that the terminal and the desktop send
 # the same request, go to the same place and read the same preferences.
-add_library(distill-shell STATIC src/form_submit.c src/address.c src/settings.c src/media_transfer.c)
+add_library(distill-shell STATIC src/form_submit.c src/address.c src/settings.c src/media_transfer.c
+            src/engine_request.c)
 target_include_directories(distill-shell PUBLIC src)
+target_link_libraries(distill-shell PUBLIC distill-platform)
 
 add_executable(distill-form-submit-test tests/form_submit_test.c)
 target_link_libraries(distill-form-submit-test PRIVATE distill-shell)
@@ -126,13 +184,16 @@ if(DISTILL_HAVE_RENDERER)
 endif()
 
 # The audio core. miniaudio is a single-source third-party header, vendored
-# under external/ like every other dependency, and compiled in exactly one
-# translation unit. Its warnings are not ours to fix, so they are quieted for
-# that file alone -- the C23 code around it keeps the project's warning level.
-add_library(distill-media-audio STATIC src/media_audio.c)
-target_include_directories(distill-media-audio PUBLIC src PRIVATE "${CMAKE_SOURCE_DIR}/external/src/miniaudio")
-target_compile_options(distill-media-audio PRIVATE -w)
-target_link_libraries(distill-media-audio PUBLIC Threads::Threads ${CMAKE_DL_LIBS} m)
+# under external/ like every other dependency. The core decodes with it; the
+# platform's audio backend plays what it decodes and is the one translation
+# unit that compiles miniaudio's implementation. Its warnings are not ours to
+# fix, so they are quieted for that file alone, and the header is a system
+# include -- the C23 code around it keeps the project's warning level.
+add_library(distill-media-audio STATIC src/media_audio.c ${DISTILL_PLATFORM_DIR}/audio.c)
+target_include_directories(distill-media-audio PUBLIC src)
+target_include_directories(distill-media-audio SYSTEM PRIVATE "${CMAKE_SOURCE_DIR}/external/src/miniaudio")
+set_source_files_properties(${DISTILL_PLATFORM_DIR}/audio.c PROPERTIES COMPILE_OPTIONS -w)
+target_link_libraries(distill-media-audio PUBLIC distill-platform Threads::Threads ${CMAKE_DL_LIBS} m)
 
 add_executable(distill-media-transfer-test tests/media_transfer_test.c)
 target_link_libraries(distill-media-transfer-test PRIVATE distill-shell)
@@ -146,7 +207,7 @@ add_test(NAME distill-media-audio COMMAND distill-media-audio-test)
 
 if(DISTILL_HAVE_RENDERER)
     add_library(distill-render-core STATIC src/render.c)
-    target_link_libraries(distill-render-core PUBLIC PkgConfig::DISTILL_RENDER distill-shaper distill-image)
+    target_link_libraries(distill-render-core PUBLIC PkgConfig::DISTILL_RENDER distill-shaper distill-image distill-platform)
 endif()
 
 # The reader-page walker and the front ends that are not litehtml: the
@@ -168,33 +229,70 @@ add_test(NAME distill-reader-cells COMMAND distill-reader-cells-test)
 # Markdown export, media fetches. DISTILL_RENDER: it can also lay that page
 # out and paint it. The first does not need the second, and a terminal
 # front end is exactly the build that has one without the other.
-add_executable(distill src/main.c)
-target_compile_definitions(distill PRIVATE
-    DISTILL_SOURCE_DIR="${CMAKE_SOURCE_DIR}"
-    DISTILL_INSTALL_PROFILE_DIR="${CMAKE_INSTALL_FULL_DATADIR}/distill/profiles"
+#
+# The engine is a library (src/engine.h): the distill command is a thin
+# wrapper around it, and an in-process host runs the same library on a
+# thread of its own.
+#
+# The engine's own JavaScript -- linkedom, Readability and its parser -- is
+# compiled to QuickJS bytecode at build time by distill-jsc, a build-machine
+# tool linked against the same libqjs, and embedded.
+add_executable(distill-jsc tools/distill_jsc.c)
+target_include_directories(distill-jsc PRIVATE "${EXTERNAL_PREFIX}/include")
+target_link_directories(distill-jsc PRIVATE "${EXTERNAL_PREFIX}/lib")
+target_link_libraries(distill-jsc PRIVATE qjs m)
+set_target_properties(distill-jsc PROPERTIES BUILD_RPATH "${EXTERNAL_PREFIX}/lib")
+set(DISTILL_JS_LINKEDOM "${CMAKE_SOURCE_DIR}/external/js/linkedom/node_modules/linkedom/worker.js")
+set(DISTILL_JS_READABILITY_DIR "${CMAKE_SOURCE_DIR}/external/src/readability")
+set(DISTILL_EMBEDDED_JS "${CMAKE_BINARY_DIR}/generated/embedded_js.c")
+add_custom_command(
+    OUTPUT "${DISTILL_EMBEDDED_JS}"
+    COMMAND distill-jsc "${DISTILL_EMBEDDED_JS}"
+        distill_js_linkedom module "${DISTILL_JS_LINKEDOM}" linkedom/worker.js
+        distill_js_jsdomparser script "${DISTILL_JS_READABILITY_DIR}/JSDOMParser.js" readability/JSDOMParser.js
+        distill_js_readability script "${DISTILL_JS_READABILITY_DIR}/Readability.js" readability/Readability.js
+    DEPENDS distill-jsc "${DISTILL_JS_LINKEDOM}"
+        "${DISTILL_JS_READABILITY_DIR}/JSDOMParser.js" "${DISTILL_JS_READABILITY_DIR}/Readability.js"
+    COMMENT "Compiling linkedom and Readability to QuickJS bytecode"
+    VERBATIM)
+set_source_files_properties("${DISTILL_EMBEDDED_JS}" PROPERTIES GENERATED TRUE)
+
+add_library(distill-engine STATIC src/engine.c src/engine_args.c src/engine_host.c
+            "${DISTILL_EMBEDDED_JS}")
+target_compile_definitions(distill-engine PRIVATE
     DISTILL_READER=1
 )
-target_include_directories(distill PRIVATE
+target_include_directories(distill-engine PUBLIC src PRIVATE
     "${EXTERNAL_PREFIX}/include"
     ${CURL_INCLUDE_DIRS}
 )
-target_link_directories(distill PRIVATE "${EXTERNAL_PREFIX}/lib")
-target_link_libraries(distill PRIVATE
+target_link_directories(distill-engine PUBLIC "${EXTERNAL_PREFIX}/lib")
+target_link_libraries(distill-engine PUBLIC
     qjs
     lexbor
     CURL::libcurl
     Threads::Threads
     distill-image
     distill-reader
+    distill-measure
     distill-version
     ${CMAKE_DL_LIBS}
     m
 )
 if(DISTILL_HAVE_RENDERER)
-    target_sources(distill PRIVATE src/litehtml_probe.cpp)
-    target_compile_definitions(distill PRIVATE DISTILL_RENDER=1)
-    target_link_libraries(distill PRIVATE litehtml gumbo distill-render-core)
+    target_sources(distill-engine PRIVATE src/litehtml_probe.cpp)
+    target_compile_definitions(distill-engine PRIVATE DISTILL_RENDER=1)
+    target_link_libraries(distill-engine PUBLIC litehtml gumbo distill-render-core)
 endif()
+
+add_executable(distill src/distill.c)
+target_link_libraries(distill PRIVATE distill-engine)
+
+# The engine in-process, many navigations in one process, each on a thread
+# with its own stack: what `check.py --in-process` drives.
+add_executable(distill-host src/distill_host.c)
+target_link_libraries(distill-host PRIVATE distill-engine)
+set_target_properties(distill-host PROPERTIES BUILD_RPATH "${EXTERNAL_PREFIX}/lib")
 set_target_properties(distill PROPERTIES
     BUILD_RPATH "${EXTERNAL_PREFIX}/lib"
     INSTALL_RPATH "${EXTERNAL_PREFIX}/lib"
@@ -218,16 +316,12 @@ if(EXISTS "${DISTILL_TERMBOX_DIR}/termbox2.h")
     target_link_libraries(distill-tui-core PUBLIC distill-reader distill-image)
 
     add_executable(distill-tui src/tui.c src/app_state.c)
-    target_compile_definitions(distill-tui PRIVATE
-        DISTILL_ENGINE_PATH="${CMAKE_BINARY_DIR}/distill"
-        DISTILL_SOURCE_DIR="${CMAKE_SOURCE_DIR}"
-        DISTILL_INSTALL_WELCOME_PAGE="${CMAKE_INSTALL_FULL_DATADIR}/distill/welcome.html"
-    )
     target_link_libraries(distill-tui PRIVATE
         distill-tui-core
         distill-shell
         distill-media-audio
         distill-termbox
+        distill-measure
         distill-version
     )
     set_target_properties(distill-tui PROPERTIES
@@ -241,15 +335,16 @@ endif()
 install(DIRECTORY profiles/ DESTINATION ${CMAKE_INSTALL_DATADIR}/distill/profiles
         FILES_MATCHING PATTERN "*.json")
 install(FILES share/welcome.html DESTINATION ${CMAKE_INSTALL_DATADIR}/distill)
+# The bundled faces (SIL OFL, with their licence), so an installed reader
+# draws in the same type as a build tree.
+install(DIRECTORY external/fonts/ DESTINATION ${CMAKE_INSTALL_DATADIR}/distill/fonts)
 
+# The GTK desktop shell. GLib is its platform -- it spawns, watches and
+# files through GLib -- so it lives with the Linux backends rather than in the
+# portable core. Whether it stays is an open decision (muroxi_compat.md).
 if(DISTILL_HAVE_RENDERER AND DISTILL_GTK_FOUND)
-    add_executable(distill-gtk src/app.c src/app_state.c src/litehtml_probe.cpp)
-    target_compile_definitions(distill-gtk PRIVATE
-        DISTILL_ENGINE_PATH="${CMAKE_BINARY_DIR}/distill"
-        DISTILL_FONT_DIR="${CMAKE_SOURCE_DIR}/external/fonts"
-        DISTILL_SOURCE_DIR="${CMAKE_SOURCE_DIR}"
-        DISTILL_INSTALL_WELCOME_PAGE="${CMAKE_INSTALL_FULL_DATADIR}/distill/welcome.html"
-    )
+    add_executable(distill-gtk src/platform/linux/app.c src/app_state.c src/litehtml_probe.cpp)
+    target_compile_options(distill-gtk PRIVATE $<$<COMPILE_LANGUAGE:C>:-Wno-pedantic>)
     target_include_directories(distill-gtk PRIVATE
         src
         "${EXTERNAL_PREFIX}/include"
@@ -273,11 +368,11 @@ else()
     message(STATUS "GTK3 or the renderer not found; skipping optional distill-gtk desktop shell")
 endif()
 
-add_executable(distill-arm-b src/main.c)
+add_executable(distill-arm-b src/distill.c src/engine.c src/engine_args.c "${DISTILL_EMBEDDED_JS}")
 target_compile_definitions(distill-arm-b PRIVATE DISTILL_NO_EXTRACT=1)
 target_include_directories(distill-arm-b PRIVATE "${EXTERNAL_PREFIX}/include" ${CURL_INCLUDE_DIRS})
 target_link_directories(distill-arm-b PRIVATE "${EXTERNAL_PREFIX}/lib")
-target_link_libraries(distill-arm-b PRIVATE qjs CURL::libcurl distill-version Threads::Threads ${CMAKE_DL_LIBS} m)
+target_link_libraries(distill-arm-b PRIVATE qjs CURL::libcurl distill-measure distill-version Threads::Threads ${CMAKE_DL_LIBS} m)
 set_target_properties(distill-arm-b PROPERTIES
     BUILD_RPATH "${EXTERNAL_PREFIX}/lib"
     INSTALL_RPATH "${EXTERNAL_PREFIX}/lib"
@@ -285,11 +380,11 @@ set_target_properties(distill-arm-b PROPERTIES
 install(TARGETS distill-arm-b RUNTIME DESTINATION bin)
 
 if(DISTILL_HAVE_RENDERER)
-    add_executable(distill-arm-b-pruned src/main.c src/litehtml_probe.cpp src/render.c src/shaper.c src/image.c)
+    add_executable(distill-arm-b-pruned src/distill.c src/engine.c src/engine_args.c "${DISTILL_EMBEDDED_JS}" src/litehtml_probe.cpp src/render.c src/shaper.c src/image.c)
     target_compile_definitions(distill-arm-b-pruned PRIVATE DISTILL_B_PRUNED=1 DISTILL_NO_EXTRACT=1)
     target_include_directories(distill-arm-b-pruned PRIVATE "${EXTERNAL_PREFIX}/include" ${CURL_INCLUDE_DIRS})
     target_link_directories(distill-arm-b-pruned PRIVATE "${EXTERNAL_PREFIX}/lib")
-    target_link_libraries(distill-arm-b-pruned PRIVATE qjs CURL::libcurl distill-version litehtml gumbo Threads::Threads PkgConfig::DISTILL_RENDER PkgConfig::DISTILL_UNIBREAK PkgConfig::DISTILL_IMAGE ${CMAKE_DL_LIBS} m)
+    target_link_libraries(distill-arm-b-pruned PRIVATE qjs CURL::libcurl distill-measure distill-version litehtml gumbo Threads::Threads PkgConfig::DISTILL_RENDER PkgConfig::DISTILL_UNIBREAK PkgConfig::DISTILL_IMAGE ${CMAKE_DL_LIBS} m)
     set_target_properties(distill-arm-b-pruned PROPERTIES
         BUILD_RPATH "${EXTERNAL_PREFIX}/lib"
         INSTALL_RPATH "${EXTERNAL_PREFIX}/lib"

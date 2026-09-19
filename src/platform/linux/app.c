@@ -15,6 +15,7 @@
    toolkit otherwise, which is not something to depend on. */
 #include <zlib.h>
 #include "cutil.h"
+#include "datadir.h"
 #include "distill_version.h"
 #include "render.h"
 
@@ -33,17 +34,18 @@
 #include <sys/wait.h>
 #include <unistd.h>
 
-#ifndef DISTILL_ENGINE_PATH
-#define DISTILL_ENGINE_PATH "distill"
-#endif
 
-#ifndef DISTILL_FONT_DIR
-#define DISTILL_FONT_DIR ""
-#endif
-
-#ifndef DISTILL_SOURCE_DIR
-#define DISTILL_SOURCE_DIR ""
-#endif
+/* The faces the reader is drawn in: a collection the user names, or the
+   bundled ones from the data directory. Looked up once. */
+static const char *shell_font_dir(void)
+{
+    static char *bundled = NULL;
+    static bool looked = false;
+    const char *configured = getenv("DISTILL_FONT_DIR");
+    if (configured && *configured) return configured;
+    if (!looked) { bundled = d_data_path("fonts", NULL); looked = true; }
+    return bundled;
+}
 
 /* The engine still uses a distinct process status for a recognised access
    challenge. The desktop shell can display the resulting checkpoint template
@@ -587,22 +589,17 @@ static void update_form_style(App *app, const char *theme, int zoom)
     g_free(css);
 }
 
-/* Where the welcome page is, looked for the way the engine looks for its
-   profiles: an override for a reader who wants their own, the source tree for
-   a build that has not been installed, the installed copy otherwise. */
+/* Where the welcome page is: an override for a reader who wants their own,
+   the data directory's copy otherwise (datadir.h). */
 static char *welcome_page_path(void)
 {
     const char *configured = getenv("DISTILL_WELCOME_PAGE");
     if (configured && *configured && access(configured, R_OK) == 0)
         return g_strdup(configured);
-    char *source = g_build_filename(DISTILL_SOURCE_DIR, "share", "welcome.html", NULL);
-    if (*DISTILL_SOURCE_DIR && access(source, R_OK) == 0) return source;
-    g_free(source);
-#ifdef DISTILL_INSTALL_WELCOME_PAGE
-    if (access(DISTILL_INSTALL_WELCOME_PAGE, R_OK) == 0)
-        return g_strdup(DISTILL_INSTALL_WELCOME_PAGE);
-#endif
-    return NULL;
+    char *installed = d_data_path("welcome.html", NULL);
+    char *path = installed ? g_strdup(installed) : NULL;
+    free(installed);
+    return path;
 }
 
 static char *browser_settings_path(void)
@@ -825,7 +822,7 @@ static char *engine_path(void)
 {
     const char *configured = getenv("DISTILL_ENGINE");
     if (configured && *configured && access(configured, X_OK) == 0) return g_strdup(configured);
-    if (access(DISTILL_ENGINE_PATH, X_OK) == 0) return g_strdup(DISTILL_ENGINE_PATH);
+    /* Beside this program: the build tree and an install both put it there. */
 
     char executable[PATH_MAX];
     ssize_t length = readlink("/proc/self/exe", executable, sizeof(executable) - 1);
@@ -2784,7 +2781,7 @@ static void build_document(App *app, const char *template)
     int page_width = reader_page_width(app);
 
     {
-        const char *font_dir = *DISTILL_FONT_DIR ? DISTILL_FONT_DIR : getenv("DISTILL_FONT_DIR");
+        const char *font_dir = shell_font_dir();
         int viewport = PAGE_HEIGHT;
         if (app->vertical_adjustment) {
             double size = gtk_adjustment_get_page_size(app->vertical_adjustment);
@@ -3884,7 +3881,7 @@ static bool run_media_self_test(void)
         close(descriptor);
         if (write_solid_test_png(source, 600, 400)) {
             char *html = viewer_html(&probe, "https://example.test/photo.png", source, NULL);
-            const char *font_dir = *DISTILL_FONT_DIR ? DISTILL_FONT_DIR : getenv("DISTILL_FONT_DIR");
+            const char *font_dir = shell_font_dir();
             int height = distill_litehtml_content_height(html, PAGE_WIDTH_DESIGN, font_dir);
             checked = true;
             if (height < 400) {

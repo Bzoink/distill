@@ -168,6 +168,26 @@ static inline bool d_eq(const char *a, const char *b)
     return strcmp(a ? a : "", b ? b : "") == 0;
 }
 
+/* ASCII case-insensitive ordering, as strcasecmp and strncasecmp give in the
+   C locale. Those are POSIX, not C; what is compared with these is protocol
+   text -- schemes, types, header names -- where ASCII folding is the rule. */
+static inline int d_ncasecmp(const char *a, const char *b, size_t n)
+{
+    for (size_t i = 0; i < n; ++i) {
+        unsigned char ca = (unsigned char)a[i], cb = (unsigned char)b[i];
+        if (ca >= 'A' && ca <= 'Z') ca = (unsigned char)(ca - 'A' + 'a');
+        if (cb >= 'A' && cb <= 'Z') cb = (unsigned char)(cb - 'A' + 'a');
+        if (ca != cb) return ca < cb ? -1 : 1;
+        if (!ca) return 0;
+    }
+    return 0;
+}
+
+static inline int d_casecmp(const char *a, const char *b)
+{
+    return d_ncasecmp(a, b, SIZE_MAX);
+}
+
 static inline bool d_ieq(const char *a, const char *b)
 {
     if (!a || !b) return a == b;

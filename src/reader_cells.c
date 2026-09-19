@@ -1,5 +1,3 @@
-#define _POSIX_C_SOURCE 200809L
-
 #include "reader_cells.h"
 
 #include "cell_width.h"

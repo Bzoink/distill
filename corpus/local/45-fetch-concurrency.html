@@ -1,0 +1,29 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>45 — Twelve requests at once</title>
+
+<!-- Pages fire their requests together and expect all of them answered.
+     The engine attached every request the moment it was made -- 46 at once
+     on one live page -- which a platform whose network carries only a few
+     parallel transfers cannot take. It now attaches up to its limit and
+     queues the rest, and the page must still get every answer. A blocking
+     script fetched while every slot is taken waits for one too, rather than
+     opening one more connection than the limit. -->
+
+<article id="content">
+  <h1>Every answer, however many were asked for at once</h1>
+  <p>This paragraph is the article; the list below is filled in by the
+  page's own requests. CONCURRENCY-BODY-OK.</p>
+  <p id="status">waiting for twelve answers</p>
+  <p id="after">waiting for the blocking script</p>
+</article>
+
+<script>
+  var asked = [];
+  for (var i = 0; i < 12; ++i) asked.push(fetch('/slow?ms=150&n=' + i).then(function (r) { return r.json(); }));
+  Promise.all(asked).then(function (answers) {
+    var ok = answers.filter(function (a) { return a.ok === 'ok'; }).length;
+    document.getElementById('status').textContent = 'ANSWERED-' + ok;
+  });
+</script>
+<script src="45-after.js"></script>

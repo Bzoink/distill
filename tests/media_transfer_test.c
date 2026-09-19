@@ -23,12 +23,19 @@ static void write_engine(void)
     snprintf(engine, sizeof(engine), "%s/engine.sh", directory);
     FILE *file = fopen(engine, "w");
     assert(file);
-    /* argv: --url URL --fetch-media PATH --fetch-kind KIND */
+    /* argv: --request FILE, whose lines are "url URL", "fetch-media PATH"
+       and "fetch-kind KIND" (engine_args.h). */
     fputs("#!/bin/sh\n"
-          "case \"$2\" in\n"
-          "  *ok*) printf 'bytes' > \"$4\"; echo \"fetched $6\" >&2; exit 0;;\n"
-          "  *fail*) printf 'partial' > \"$4\"; echo 'not audio this reader can decode: x' >&2; exit 2;;\n"
-          "  *hang*) printf 'partial' > \"$4\"; exec sleep 30;;\n"
+          "[ \"$1\" = --request ] || exit 2\n"
+          "while read -r name value; do\n"
+          "  case \"$name\" in\n"
+          "    url) url=$value;; fetch-media) out=$value;; fetch-kind) kind=$value;;\n"
+          "  esac\n"
+          "done < \"$2\"\n"
+          "case \"$url\" in\n"
+          "  *ok*) printf 'bytes' > \"$out\"; echo \"fetched $kind\" >&2; exit 0;;\n"
+          "  *fail*) printf 'partial' > \"$out\"; echo 'not audio this reader can decode: x' >&2; exit 2;;\n"
+          "  *hang*) printf 'partial' > \"$out\"; exec sleep 30;;\n"
           "esac\n", file);
     fclose(file);
     chmod(engine, 0700);

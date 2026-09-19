@@ -1,0 +1,20 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>44 — A chain of blocking scripts that never arrive</title>
+
+<!-- The settle cap is a hard cap on script time. Blocking <script src> is
+     fetched synchronously, before the settle loop that enforces the cap, and
+     each fetch used to get the whole cap as its own timeout and to go ahead
+     even after the cap had passed. Three scripts that never arrive therefore
+     held the engine for three caps instead of one; X, which loads a long
+     chain of modules this way, settled in 13 s against 5. -->
+
+<article id="content">
+  <h1>Content that was in the markup all along</h1>
+  <p>Nothing here needs the scripts below; the reader must get it within the
+  settle budget however many of them hang. CHAIN-BODY-OK.</p>
+</article>
+
+<script src="/hang?chain=1"></script>
+<script src="/hang?chain=2"></script>
+<script src="/hang?chain=3"></script>

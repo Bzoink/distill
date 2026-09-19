@@ -3,7 +3,7 @@
 *A small, C23-rooted stack that runs a page's real JavaScript against a real DOM, pulls out what actually matters, and renders it back — clearly, consistently, on our own terms.*
 
 **Status:** Phase 3 complete — Phase 4 not started
-**Drafted:** 2026-09-14 · **Revised:** 2026-09-17 (Phase 3 implementation)
+**Drafted:** 2026-09-14 · **Revised:** 2026-09-18 (portability requirements for Muroxi; see [muroxi_compat.md](muroxi_compat.md))
 **Origin:** NetSurf JS/rendering gap analysis (see `../netsurf`)
 **Rendered version:** https://claude.ai/code/artifact/fcbd8e5f-f6dc-4abd-a2a4-e7282070cf4a *(predates this revision)*
 
@@ -38,6 +38,10 @@ Decisions already made, recorded so they stop being re-litigated. Where the reas
 
 **Pango — rejected, and with it GLib, GObject and fontconfig.** Every capability Pango was chosen for is provided by something Pango itself delegates to: shaping to HarfBuzz, rasterization and metrics to FreeType, hyphenation to libhyphen. Pango's own contribution is itemization, line breaking, bidi integration, and font selection — of which font selection is fontconfig (droppable, since we ship our own fonts) and **line breaking is something we want to own anyway**, because the TUI target wraps in terminal cells, not pixels. So Pango's price — GLib, GObject, GModule, ~3.5 MB, and a runtime philosophy — buys integration we'd replace by Phase 6 regardless. Details and the replacement stack: [Typography](#typography--themes).
 
+**litehtml as a permanent dependency — reversed (2026-09-18).** litehtml was adopted because the alternative put our deliverable on the critical path beside the DOM↔JS layer, and libstdc++ was judged a price worth paying. Both reasons have expired. The DOM↔JS layer is built, and litehtml only ever lays out our own reader template — a closed vocabulary of seven block kinds, three inline styles, tables, cards and form controls — most of whose layout `reader_cells.c` already does for the TUI. Meanwhile the price turned out to be a blocker: Muroxi, the second platform this project targets, has no C++ runtime at all, so litehtml cannot be built there. litehtml and Gumbo are therefore replaced by our own `reader_layout`, one layout with a cell measurer and a pixel measurer. See [muroxi_compat.md](muroxi_compat.md#our-own-layout-in-place-of-litehtml).
+
+**Cairo, pixman and GTK in the core — rejected (2026-09-18).** Cairo does seven small things for us, all of which the framebuffer's software painter does too. Keeping it on the desktop alone means two painters and two sets of pixels. The software painter becomes the only painter; Cairo, pixman and GLib survive, if at all, only in a GTK host window (see [Open risks](#open-risks)).
+
 **WebSocket in the network bridge — cut.** `fetch` and `XMLHttpRequest` stay. WebSocket returns only if Phase 0/1 telemetry shows a target page actually needs it.
 
 **notcurses — not adopted; decided in Phase 6.** It's heavy for what we'd use it for (capability detection and escape output), and it brings an input model that would compete with ours. A kitty/sixel encoder plus a `$TERM` capability probe is a few hundred lines. Since the TUI is text-only first, this decision isn't needed until images arrive.
@@ -49,34 +53,56 @@ Decisions already made, recorded so they stop being re-litigated. Where the reas
 The hard constraint above makes footprint a *design input*, not something to measure later. Provisional targets, set now so Phase 0 and Phase 5 have something concrete to fail against — adjust them once real numbers exist, but don't delete them:
 
 **Runtime**
-- **≤ 150 MB peak RSS** for a loaded, extracted, rendered article page.
+- **≤ 150 MB peak RSS** for a loaded, extracted, rendered article page. *(M0, 2026-09-19: live pages measured a median of 44 MiB and a 90th percentile of 69 MiB for the engine; before M0's extraction fix, BBC reached 170 MiB.)*
 - **≤ 3 s** from fetch start to painted output for a typical article on broadband, including script execution.
 - **≤ 5 s** hard script-execution ceiling per page, enforced (see [Settle policy](#settle-policy)).
 
 **Size and dependencies** — the half of the stack the first draft never budgeted, and the half where "small and portable" actually gets tested:
 - **≤ 8 MB** total shared-library footprint on the framebuffer target, excluding bundled font data.
-- **Hard rule for framebuffer/TUI/minimal targets: no GLib, GObject, Pango, or fontconfig linked.** The Phase 3 desktop shell is the explicit GTK/GLib exception for native form widgets; fontconfig may still be `dlopen`ed on desktop as an optional convenience, never linked.
+- **Hard rule for every target: no GLib, GObject, Pango, Cairo, pixman or fontconfig linked into the engine, the core or the framebuffer and TUI shells.** A GTK desktop host window, if one is kept, is the only exception. Nothing is `dlopen`ed, fontconfig included.
+- **Everything but HarfBuzz is C.** HarfBuzz, if used, is built from its amalgamation with `-fno-exceptions -fno-rtti` and no C++ standard library. No dependency may need a C++ runtime.
+- **Every dependency builds from a plain list of sources and flags.** A platform that does not run CMake (Muroxi builds ports inside its own build script) must be able to consume the same list.
 - Every new dependency is named in the [Reuse ledger](#reuse-ledger) with its transitive tree understood, not just its own size.
 
 These are also tiebreakers in the Phase 0 A/B: an arm that can't meet them isn't the arm.
 
+### Portability
+
+*(Added 2026-09-18.)* Distill must build easily on a small hobby OS, not only on Linux. [Muroxi](muroxi_compat.md) is the platform that proves it: a static ELF64 target with a POSIX-subset libc (`libmxc`), no dynamic loader and no C++ runtime. Its limits become ours, checked on Linux by gates that model them, so that they bind before a port is attempted rather than during it:
+
+| Requirement | Why |
+|---|---|
+| **Links statically with no undefined symbols; no `dlopen`, NSS, `iconv` modules or plugins** | Muroxi has no dynamic loader |
+| **Strict C23** (`-std=c23 -pedantic-errors`): no GNU extensions, no VLAs, no `alloca`, no locale-dependent calls | `libmxc` is a named subset; a header existing does not prove the function exists |
+| **No OS header outside `src/platform/<os>/`.** The core reaches the OS through `dfetch`, `dfs`, `dclock`, `dproc`, `ddisplay` and `daudio`, chosen at link time | The Muroxi build swaps those files and nothing else |
+| **Shells stay within 64 KiB of stack.** No local buffer over 4 KiB, no recursion without a stated depth bound | Muroxi guarantees 64 KiB; growth past it can be refused, killing the shell with the user's state |
+| **The JS stack limit comes from the platform** and sits inside the real stack: the stack limit less 1 MiB (7 MiB on Muroxi) | QuickJS's own check must fire before the guard page |
+| **At most 32 descriptors open per process, and network sockets bounded by `dfetch`'s concurrency limit; at most 4 threads** | Muroxi's descriptor table and thread limit |
+| **Paths fit in 256 bytes; the request travels in a file or on stdin, not `argv`** | Muroxi's path limit, and 4096 bytes for the whole `argv` |
+| **Installing a signal handler may fail, and the program carries on** | Muroxi has no SIGPIPE, SIGSEGV, SIGBUS, SIGFPE, SIGILL or SIGABRT |
+| **No shipped binary refers to the source tree.** Data comes from a data directory; JavaScript is embedded as bytecode | A packaged program has no checkout beside it |
+| **Every limit is explicit and passed in** — fetch concurrency, JS heap, image pixels, decoded bytes, response size. Exceeding one is a refusal that names it, never a truncation | The package manifest sets them per platform |
+
+Nothing in the core knows it is running on Muroxi; a Muroxi-specific path outside `src/platform/muroxi/` is a defect. **Muroxi is developed alongside Distill and grows to meet it:** where Muroxi is narrower than an ordinary POSIX system or an ordinary libcurl — a missing libc function, a curl feature compiled out, a low limit — Muroxi adds it, and Distill does not work around it. The rules above are the ones that make Distill portable in general, and they stay on Distill's side. The delivery order, the Linux gates (`--stack`, `--static-link`, `--symbols`, `--budget`) and the work that belongs on the Muroxi side are in [muroxi_compat.md](muroxi_compat.md).
+
 ## The stack
 
-Every layer is an existing, small project — C23, except litehtml (C++) — other than the rows marked bespoke, which are the actual work. The C++ boundary is intentionally narrow: litehtml's adapter is the only production C++ component; the application, extraction pipeline, bridges, and paint backends are C23.
+Every layer is an existing, small project in C — except HarfBuzz, built as C++ with no C++ runtime — other than the rows marked bespoke, which are the actual work. *(Revised 2026-09-18: litehtml and its C++ adapter are being replaced by our own layout, and Cairo by our own painter; see [Portability](#portability).)*
 
 | Layer | Component | Status | Role |
 |---|---|---|---|
-| Network & TLS | libcurl | reused as-is | HTTP/HTTPS, redirects, cookies — no change needed |
+| Network & TLS | libcurl (+ Mbed TLS where the platform provides it) | reused as-is, behind `dfetch` | HTTP/HTTPS, redirects, cookies |
 | HTML parse & DOM | Lexbor | adopted as-is | Modern, actively-maintained HTML5 parser, DOM, CSS selectors, encoding detection, in pure C. **Its role depends on the Phase 0 outcome** — see the structural question below |
-| JavaScript engine | QuickJS (quickjs-ng) | adopted as-is | Real ES2020 — `Promise`, `async`/`await`, classes, modules — replaces Duktape. quickjs-ng over upstream for active maintenance, newer ES coverage, and a shorter fix backlog. *(Verify rather than assume: check its actual `Intl` coverage, and don't record internal string representation as a tiebreaker without confirming it — both engines index by UTF-16 code unit, as the spec requires.)* |
+| JavaScript engine | QuickJS (quickjs-ng) — core only: `quickjs.c`, `libregexp.c`, `libunicode.c`, `dtoa.c`, `cutils.c`; never `quickjs-libc.c` | adopted as-is | Real ES2020 — `Promise`, `async`/`await`, classes, modules — replaces Duktape. quickjs-ng over upstream for active maintenance, newer ES coverage, and a shorter fix backlog. *(Verify rather than assume: check its actual `Intl` coverage, and don't record internal string representation as a tiebreaker without confirming it — both engines index by UTF-16 code unit, as the spec requires.)* |
 | DOM ↔ JS | custom | **new, bespoke** | A DOM and a Window surface for QuickJS. Two candidate shapes — see Phase 0 |
 | Network ↔ JS bridge | custom over libcurl | **new, bespoke** | `fetch`/`XMLHttpRequest`, resolving real Promises from curl callbacks |
 | Scheduler | custom, `poll()` + `curl_multi` | **new, small** | Microtask drain, timer queue, socket readiness. A few hundred lines; see the libuv rejection above |
 | Style resolution | custom over Lexbor CSS | **new, minimal** | `display`/`visibility` only — see below |
 | Content extraction | Readability.js | runs unmodified | Mozilla's Reader View heuristic — one extractor among several, not the extraction stage itself |
-| Box layout | litehtml | adopted as-is | Lays out *our own* reader template/theme HTML+CSS — never a source site's. The only credible embeddable HTML/CSS engine in this weight class; libstdc++ is its price and worth paying, since the alternative puts our actual deliverable on the critical path beside the DOM↔JS layer |
-| Text shaping & breaking | HarfBuzz + FreeType + libunibreak, behind our own run shaper | **new, scoped small** | See [Typography](#typography--themes) |
-| Paint | backend interface | **new, small** | Cairo on desktop; direct ARGB32 blitter on framebuffer; no raster path at all on TUI |
+| Box layout | `reader_layout` (litehtml until it lands) | **new, bespoke** | Lays out *our own* reader page — never a source site's — to a box list, with a cell measurer for the TUI and a pixel measurer for everything else. Styles come from a C table that also generates the HTML export's `<style>`. Replaces litehtml, whose libstdc++ price no C++-less platform can pay; see [Considered and rejected](#considered-and-rejected) |
+| Text shaping & breaking | HarfBuzz (optional) + FreeType + libunibreak, behind our own run shaper | **new, scoped small** | See [Typography](#typography--themes). FreeType loads faces from memory; without HarfBuzz, text falls back to unshaped advances |
+| Paint | software painter + display backends | **new, small** | One XRGB8888 painter for every raster target; the display backend (memory, X11, fbdev, Muroxi's `libmxpresent`) only presents it. No raster path at all on TUI |
+| Platform layer | `src/platform/<os>/` | **new, small** | `dfetch`, `dfs`, `dclock`, `dproc`, `ddisplay`, `daudio`: one header each, one `.c` per OS. See [Portability](#portability) |
 
 ### The language boundary: does this stay a C23 project?
 
@@ -85,6 +111,8 @@ The Phase 0 A/B is usually described as choosing a binding shape. It isn't only 
 That may well be the right answer for "small and easy." But it is a different project from the one the tagline describes, and it should be chosen deliberately rather than arrived at in month four. Phase 0 therefore measures a **third, no-Lexbor baseline** explicitly, so the question asked is "does Lexbor earn its place," not merely "which binding shape wins."
 
 The implementation language is now explicit: bespoke production code is C23. litehtml stays because it is the selected box-layout engine, and its C++ adapter is an intentional exception at the rendering boundary. The Phase 0/1 application and extraction code has been ported to C23; the adapter exposes a C ABI so the C23 core never depends on C++ types.
+
+**Revised 2026-09-18:** the C++ exception goes away with litehtml. Once `reader_layout` replaces it, the adapter (`litehtml_probe.cpp`) is deleted and the only C++ left is HarfBuzz, built without a C++ runtime. No new C++ is written in the meantime.
 
 One thing that leaves with Lexbor, and is easy to forget: **character-encoding detection.** Real pages routinely declare the wrong charset or none at all. Whoever replaces Lexbor inherits that job.
 
@@ -154,7 +182,7 @@ Every page takes the same steps, regardless of what kind of site it came from.
        ↓
 5.  Template   Content is placed into our reader HTML/CSS
        ↓
-6.  Paint      litehtml lays out our template/theme, the paint backend draws it
+6.  Paint      reader_layout lays out our template/theme, the painter draws it
        ↓
     (a form submit or link click starts the loop over at step 1,
      against a new URL/request — see Interaction, below)
@@ -174,6 +202,7 @@ Reading is the common case, but a page isn't done being useful once it's rendere
 
 - **Forms.** A `<form>`'s fields, labels, method, action, enctype, and hidden inputs are extracted as data (step 4) and re-rendered as functional controls in our own styling (step 5) — hidden fields and existing values pass through untouched, since some carry CSRF tokens or session state the server checks. If the page's own script intercepts the submit event instead of a plain HTML submit, that's already covered — QuickJS + the `fetch`/XHR bridge run it like any other page script.
   - **Desktop uses native GTK widgets**, composited over the painted template rather than drawn into it. litehtml has no widget model — it lays out and paints boxes — so drawing our own text input means building caret, selection, clipboard, key repeat and IME handling from scratch. That's a mini-project with no payoff on a target that already ships GTK. The cost of this choice is honest: the desktop paint path is template-plus-overlay rather than one clean surface, and Phases 5 and 6 will each need their own answer for text entry.
+  - *(Revised 2026-09-18.)* Once `reader_layout` exists, **controls are drawn by us on every target**, including any desktop host. Their geometry comes from the same layout, so every shell gets the same focus order and form geometry. The framebuffer needs drawn controls regardless (FRAMEBUFFER_PLAN.md phase F); the work is done once and shared. The accepted cost above is then paid off rather than carried.
   - **v1 round-trips GET search and simple `x-www-form-urlencoded` POST only**, constructed via libcurl and fed back into step 1. Multi-step flows, per-step CSRF, `multipart/form-data`, and redirect chains are an unbounded tail — they move to Phase 4, driven by evidence rather than anticipated in full.
 - **Links.** A same-origin or `http(s)` link re-enters the pipeline at step 1, becoming a new history entry. A `mailto:` or `tel:` link isn't a page to render at all — it hands off to the OS's registered handler, after scheme validation (step 4c), the same mechanism as the video-player hand-off.
 
@@ -195,6 +224,8 @@ The reader template (steps 5–6) is where the project stops being a pipe and be
 - **We ship the fonts.** With fontconfig gone, the framebuffer target needs actual font files anyway — so bundle three or four SIL-OFL faces (a serif, a sans, a mono, and one with broad script coverage) and have the themes name them. That costs a couple of megabytes of data and buys something better than it costs: typography identical on every target and every machine, rather than inherited from whatever the host distro happens to have installed. That is closer to "on our own terms" than fontconfig ever was.
 
 ### The text stack
+
+*(Revised 2026-09-18: `reader_layout` replaces litehtml as the box layout, driving the same shaper through the same measurement callback. The paragraph below records why the Phase 2 text stack was shaped this way.)*
 
 litehtml does box layout; everything about *glyphs* is ours. This is deliberate and it is contained, because **litehtml already abstracts the font engine**: `document_container` hands back an opaque font handle from `create_font` and asks only for `text_width` and `draw_text`. Pango was an implementation detail of the container litehtml ships, never a requirement of litehtml. Plug our own engine in behind the same handle and nothing above the container changes.
 
@@ -219,11 +250,10 @@ The breaker earns its place twice: the TUI wraps in **cells**, not pixels, so a 
 
 Paint sits behind one interface, and the implementations behind it are decided now rather than in Phase 5:
 
-- **Desktop:** Cairo, already resident under GTK.
-- **Framebuffer:** our own ARGB32 blitter straight to the mmap'd surface — roughly 300 lines, and it keeps Cairo and pixman out of the minimal build entirely.
+- **Every raster target:** our own software painter into an XRGB8888 buffer, presented by a display backend — memory for gates, an X11 window for development, fbdev on a Linux console, `libmxpresent` on Muroxi. *(Revised 2026-09-18: Cairo was the desktop choice; one painter is how "typography identical on every target" extends to pixels, and Cairo does not build on Muroxi.)*
 - **TUI:** no raster path at all for the common case — layout only, emitted as escapes.
 
-Note what this doesn't solve: **libstdc++ stays as long as litehtml does.** If some future target can't take C++, litehtml is the blocker, not the paint layer. That dependency is isolated behind the C ABI adapter; the rest of the application remains C23.
+The note this section used to end on — **libstdc++ stays as long as litehtml does; if some future target can't take C++, litehtml is the blocker** — came true. Muroxi is that target, and `reader_layout` is the answer.
 
 ## Media presentation
 
@@ -253,8 +283,9 @@ Steps 1–5 are the same regardless of output; only step 6 is target-specific, b
 | **Desktop** (Cinnamon/X11) | Cairo into a GTK window; native GTK widgets composite over it for form entry | 3 |
 | **Framebuffer** | Own ARGB32 blitter to the mmap'd surface | 5 |
 | **TUI** | Styled terminal text; no raster path for the common case | 6 |
+| **Muroxi** | The TUI on the console, then the framebuffer shell through `libmxpresent` (console or compositor) | 7 |
 
-**Input** follows the same split, and every target must work by keyboard alone or by mouse alone — nothing assumes both are present. Desktop gets both from GTK. The other two are specified in their own phases.
+**Input** follows the same split, and every target must work by keyboard alone or by mouse alone — nothing assumes both are present. Desktop gets both from GTK. The other targets are specified in their own phases. Muroxi delivers keys and the pointer (SGR mouse reports) on one ANSI byte stream, so the decoder for that stream is shared core code, not a per-target piece.
 
 ## Build phases
 
@@ -462,6 +493,8 @@ now widen the interaction and binding surface from evidence.
 
 **Goal:** Same core, a different paint backend — no new pipeline, extraction, interaction, or theme work.
 
+The working plan is [FRAMEBUFFER_PLAN.md](FRAMEBUFFER_PLAN.md). It revises the input choice below (libinput links GLib as packaged) and adds headless and windowed development surfaces. [muroxi_compat.md](muroxi_compat.md) revises it in turn: the shell is built on `reader_layout`'s box list rather than litehtml's geometry, and its size check is the static link's `--symbols` gate rather than `ldd`.
+
 **Work, in order:**
 1. **The second paint backend** — an ARGB32 blitter to the mmap'd `/dev/fb0`. The surface is 32-bit host-order XRGB8888, the same format we composite in, so no conversion — but the surface stride and the fb's `line_length` can differ, so blit **row by row**, never one flat `memcpy`.
 2. **Surface lifecycle** — fb probing, mode information, teardown on exit and on VT switch.
@@ -490,9 +523,27 @@ NetSurf's fb frontend is **read-only reference** (GPL-2.0) throughout, never lif
 
 **Done when:** the same URL is navigable the same way as Phases 3 and 5, in a terminal.
 
+### Phase 7 — Portability, proven on Muroxi
+*Added 2026-09-18*
+
+**Goal:** Distill builds easily on a small platform that is not Linux, and Muroxi is the one that proves it. Most of the work is removal: litehtml, Gumbo, Cairo, pixman, fontconfig, GTK and GLib leave the core.
+
+The working plan is [muroxi_compat.md](muroxi_compat.md). Its phases M1–M5 need no Muroxi machine and keep the Linux build working and gated throughout.
+
+**Work, in order:**
+1. **M0 — measure** peak memory, JS heap, native stack, fetch concurrency and startup per corpus page, and choose the Muroxi package's budgets from them. *Done 2026-09-19* ([result](muroxi_compat.md#m0-result-2026-09-19)): a 64 MiB JS heap and a 96 MiB engine quota; the shell fits 16 MiB and 20 KiB of stack. Measuring found and fixed three engine defects: extraction's quadratic stylesheet memory, the JS stack limit crash, and the settle cap overrun.
+2. **M1 — the platform seams** under `src/platform/`, with every OS call behind them and a gate that greps for OS headers elsewhere. *Done 2026-09-19* ([result](muroxi_compat.md#m1-result-2026-09-19)): `dclock`, `dfs`, `dproc`, `dterm` and `daudio` with Linux backends; the core built as strict ISO C with no feature-test macro; a fetch concurrency limit.
+3. **M2 — the engine as a library:** `d_engine_run`, requests by file or stdin, cookies in the session file, embedded bytecode JavaScript, the JS stack limit from the platform. *Done 2026-09-19* ([result](muroxi_compat.md#m2-result-2026-09-19)): the command is a thin wrapper; an in-process host passes the golden gates; no binary reads the source tree; `--stack` models Muroxi's stacks; an untrusted clock has its own status.
+4. **M3 — the software painter**, which is FRAMEBUFFER_PLAN.md phase A.
+5. **M4 — `reader_layout`**, compared pixel for pixel with litehtml before litehtml, Gumbo and the C++ adapter are deleted.
+6. **M5 — the portable build:** a per-library source manifest that CMake and Muroxi's build both read, and the `--static-link` and `--symbols` gates.
+7. **M6–M8 on Muroxi:** the TUI, then the framebuffer shell through `libmxpresent`, then audio.
+
+**Done when:** on Muroxi under QEMU, a corpus article loads over the network, reads by keyboard and by mouse, and a form submits — gated by a Muroxi scenario, not by hand.
+
 ## Licensing position
 
-Everything linked is permissive and compatible: Lexbor and Readability.js (Apache-2.0), QuickJS (MIT), litehtml (BSD-3-Clause), libcurl (curl license), HarfBuzz (MIT), FreeType (FTL or GPLv2 — **take FTL**), libunibreak (zlib), SheenBidi (MIT), libpng/libjpeg/libwebp (each permissive), bundled fonts (SIL OFL).
+Everything linked is permissive and compatible: Lexbor and Readability.js (Apache-2.0), QuickJS (MIT), linkedom (ISC), litehtml (BSD-3-Clause, until `reader_layout` replaces it), libcurl (curl license), Mbed TLS (Apache-2.0), HarfBuzz (MIT), FreeType (FTL or GPLv2 — **take FTL**), libunibreak (zlib), SheenBidi (MIT), libpng/libjpeg/libwebp/zlib (each permissive), miniaudio (MIT-0 or public domain), termbox2 (MIT), bundled fonts (SIL OFL or Bitstream Vera). None of it is GPL, so Muroxi's rule excluding GPL code from its base image does not reach Distill; each licence is still recorded in the Muroxi package.
 
 **The GPL-2.0 line is NetSurf's browser, not NetSurf's libraries.** The framebuffer frontend is part of the browser and stays out — read it, don't lift it. But libdom and libcss are MIT and separate, and `dukky` (NetSurf's Duktape↔DOM glue) is directly relevant prior art for Arm A; reading them carries no licensing consequence at all. NetSurf remains the project's origin and a design reference.
 
@@ -508,7 +559,11 @@ FreeType's dual license needs the FTL election recorded explicitly, since the al
 - **[scope creep risk]** The run shaper is scoped small on the bet that our own template in our own fonts needs no bidi and no per-character fallback. If the corpus disagrees early, that's a real Phase 2 overrun, and the honest fallback is to narrow the theme's script coverage rather than grow the shaper mid-phase.
 - **[unproven]** Form round-tripping assumes hidden fields pass through untouched and libcurl's cookie jar carries session state across submit → refetch. v1's GET/simple-POST scope contains this; it doesn't answer it.
 - **[security, deferred]** We execute untrusted site JS in-process. The interrupt handler and memory cap bound runaway scripts, not exploitation — QuickJS has no JIT and is memory-safe-ish, but it has had CVEs. seccomp, or a separate process for the JS realm, is the answer if this ever faces hostile input deliberately. Recorded now so "later" is a decision rather than an oversight.
-- **[accepted cost]** Native GTK widgets composited over the painted template means the desktop paint path isn't one clean surface, and text entry is unsolved for Phases 5 and 6. Taken knowingly over building a text input from scratch.
+- **[accepted cost, being retired]** Native GTK widgets composited over the painted template means the desktop paint path isn't one clean surface, and text entry is unsolved for Phases 5 and 6. Taken knowingly over building a text input from scratch. Drawn controls from `reader_layout` retire it (Phase 7, M4).
+- **[unproven]** `reader_layout` must match litehtml closely enough on the render corpus before litehtml can go. M4 gates that with a pixel comparison, not a visual review.
+- **[measured]** The JS stack on Muroxi. M0 set it to the stack limit less 1 MiB, 7 MiB of the 8 MiB reservation; real pages used at most 345 KiB of native stack. A page that recurses deeper gets QuickJS's RangeError. Past the guaranteed 64 KiB, a refused stack growth can still kill the engine process; the shell survives because the engine is a separate process.
+- **[external, agreed]** Muroxi adds what Distill measurably lacks there: maths functions and timed condition waits for QuickJS-ng, `posix_spawnp`/`addopen`/`pipe2`/`realpath`/`strerror_r`, `poll` over all 32 descriptors, a curl profile with cookies (date parsing on), POST and plain http, and safe parallel transfers to a stated number. The measured list is in [muroxi_compat.md](muroxi_compat.md#what-muroxi-adds-for-distill). Until each lands, the Muroxi phases wait on it; Distill does not work around it.
+- **[open]** The desktop host. With our own layout and painter, the GTK shell can be retired for the framebuffer shell in a window, or kept as a thin host for the file chooser, clipboard, input methods and accessibility. Accessibility is the real loss of a raw pixel buffer; choose deliberately.
 - **[deferred]** Bot-challenge and login-gated pages have no plan and aren't meant to.
 - **[unset]** Lazy image fetch means the first activation of a placeholder has real network latency before viewer mode shows anything — needs a loading state, not assumed to be instant.
 
@@ -517,18 +572,20 @@ FreeType's dual license needs the FTL election recorded explicitly, since the al
 What this project is actually building, once the borrowed parts are set aside.
 
 **Taken as-is**
-- libcurl — networking & TLS
+- libcurl — networking; Mbed TLS for TLS where the platform provides it
 - Lexbor — HTML parsing, DOM, selectors, CSS, encoding detection *(role pending the Phase 0 outcome)*
 - QuickJS (quickjs-ng) — the JS engine itself
 - Readability.js — runs unmodified, as one extractor
-- litehtml — box layout for our own template
+- litehtml — box layout for our own template, **until `reader_layout` replaces it** (Phase 7)
 - HarfBuzz, FreeType, libunibreak — shaping, rasterization, break opportunities
 - SheenBidi, libhyphen — deferred until the corpus demands them
-- Cairo — desktop paint backend only
-- GTK3 — desktop window shell and native form widgets, desktop target only
+- Cairo — desktop paint backend, **until the software painter replaces it** (Phase 7)
+- GTK3 — desktop window shell; at most a thin host window once Phase 7 lands
+- miniaudio — audio decoding; device output only where the platform has no `daudio` backend of its own
+- termbox2 — terminal output for the TUI
 - libpng / libjpeg / libwebp — image decoding, linked directly
 - SIL OFL font faces — bundled, three or four
-- linkedom or domino — only if Phase 0 Arm B/B′ wins
+- linkedom or domino — the JS-side DOM surface, embedded as QuickJS bytecode
 
 **Built new**
 - The DOM ↔ JS layer (shape decided by the Phase 0 A/B)
@@ -545,6 +602,10 @@ What this project is actually building, once the borrowed parts are set aside.
 - Media-reference classification and lazy fetch on activation
 - The run shaper (scoped small) and the font matcher
 - The paint backend interface, and the framebuffer ARGB32 blitter
+- The software painter, shared by every raster target
+- `reader_layout`: one layout for cells and pixels, its C style table, and drawn form controls
+- The platform layer (`src/platform/`) and its Linux and Muroxi backends
+- The shared ANSI/SGR input decoder
 - Viewer mode across all three render targets
 - The test corpus, DOM-assertion harness, golden outputs, and call telemetry
 - The reader stylesheet & template

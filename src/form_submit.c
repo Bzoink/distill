@@ -1,15 +1,12 @@
-#define _POSIX_C_SOURCE 200809L
-
 #include "form_submit.h"
 
 #include "cutil.h"
 
-#include <strings.h>
 
 static bool has_scheme(const char *uri, const char *scheme)
 {
     size_t length = strlen(scheme);
-    return uri && strncasecmp(uri, scheme, length) == 0 && uri[length] == ':';
+    return uri && d_ncasecmp(uri, scheme, length) == 0 && uri[length] == ':';
 }
 
 bool d_page_uri_allowed(const char *uri)
@@ -70,7 +67,7 @@ static void append_pair(DBuffer *data, const char *name, const char *value)
 
 static bool type_is(const DFormField *field, const char *type)
 {
-    return field->type && strcasecmp(field->type, type) == 0;
+    return field->type && d_casecmp(field->type, type) == 0;
 }
 
 static bool is_choice(const DFormField *field)
@@ -141,7 +138,7 @@ DFormStatus d_form_build(const DFormField *fields, size_t count, size_t submitte
         dbuf_free(&data);
         return D_FORM_BLOCKED;
     }
-    bool post = method && strcasecmp(method, "post") == 0;
+    bool post = method && d_casecmp(method, "post") == 0;
     const char *body = data.data ? data.data : "";
     out->method = d_strdup(post ? "POST" : "GET");
     out->target = post ? d_strdup(action) : d_form_append_query(action, body);

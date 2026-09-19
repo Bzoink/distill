@@ -9,6 +9,7 @@
 
 #include "cutil.h"
 
+#include <lexbor/dom/interfaces/document.h>
 #include <lexbor/dom/interfaces/element.h>
 #include <lexbor/dom/interfaces/node.h>
 
@@ -30,11 +31,19 @@ static inline bool is_element(lxb_dom_node_t *node)
     return node && node->type == LXB_DOM_NODE_TYPE_ELEMENT;
 }
 
+/* lxb_dom_node_text_content() returns a fresh copy in the document's text
+   arena, which lives until the document is destroyed unless it is handed
+   back. Extraction asks for text inside loops over every element, so a copy
+   that is never returned costs the page's text many times over: a 275 KB BBC
+   front page grew the engine by 130 MiB this way. */
 static inline char *node_text(lxb_dom_node_t *node)
 {
     size_t length = 0;
     lxb_char_t *value = lxb_dom_node_text_content(node, &length);
-    return value ? d_strndup((const char *)value, length) : d_strdup("");
+    if (!value) return d_strdup("");
+    char *text = d_strndup((const char *)value, length);
+    lxb_dom_document_destroy_text(node->owner_document, value);
+    return text;
 }
 
 static inline char *node_tag(lxb_dom_node_t *node)

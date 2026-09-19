@@ -1,0 +1,49 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>42 — A large stylesheet on a long page</title>
+
+<!-- Extraction asks, for every element, whether the page's own stylesheet
+     hides it. It used to answer by copying and re-parsing every <style>
+     element on each question, and never handed the copies back: the cost was
+     the stylesheet's size times the number of elements. A real news front
+     page (BBC, 275 KB) drove the engine from 24 to 152 MiB that way, with an
+     identical result.
+
+     This page builds a 3000-paragraph article and a stylesheet of 2000 rules
+     from its own script. The rules that matter are the few that hide: their
+     text must stay out of the extraction, however the answer is computed. -->
+
+<article id="content">
+  <h1>Scale is a property of the page, not of the fixture</h1>
+  <p id="status">waiting for the script</p>
+</article>
+
+<script>
+  var css = [];
+  for (var i = 0; i < 2000; ++i)
+    css.push('.tone-' + i + ' { color: #' + (100000 + i) + '; margin: 0 0 ' + (i % 7) + 'px 0; }');
+  css.splice(700, 0, '.gone, .also-gone { display: none; }');
+  css.splice(1400, 0, 'p.quiet { visibility: hidden; }');
+  var style = document.createElement('style');
+  style.textContent = css.join('\n');
+  document.head.appendChild(style);
+
+  var article = document.getElementById('content');
+  for (var p = 0; p < 3000; ++p) {
+    var paragraph = document.createElement('p');
+    paragraph.className = 'tone-' + (p % 2000);
+    paragraph.textContent = 'Paragraph ' + p + ' of a long article, written so that a reader ' +
+      'has something to read and an extractor has something to weigh. SCALE-BODY-' + p + '.';
+    article.appendChild(paragraph);
+  }
+  var gone = document.createElement('p');
+  gone.className = 'gone';
+  gone.textContent = 'CSSLEAK if this text reaches the extractor.';
+  article.appendChild(gone);
+  var quiet = document.createElement('p');
+  quiet.className = 'quiet';
+  quiet.textContent = 'QUIETLEAK if this text reaches the extractor.';
+  article.appendChild(quiet);
+
+  document.getElementById('status').textContent = 'SCALE-BUILT-3000';
+</script>

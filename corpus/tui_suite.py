@@ -27,6 +27,12 @@ import tempfile
 import termios
 import time
 
+import resource
+
+# check.py --stack runs the suite with the shell held to the stack Muroxi
+# guarantees; None leaves the limit alone.
+SHELL_STACK_KIB = None
+
 try:
     import pyte
 except ImportError:  # the caller reports this; the suite cannot run without it
@@ -54,10 +60,19 @@ class Terminal:
             "DISTILL_TUI_COLORS": "16",
             "DISTILL_AUDIO_BACKEND": "null",
         }
+        # tools/measure_budgets.py measures the shell through this suite, and
+        # check.py --stack hands it an engine with a stack of its own; these
+        # reach the shell and every engine the shell spawns.
+        for name in ("DISTILL_STATS", "DISTILL_STACK_PROBE", "DISTILL_ENGINE"):
+            if os.environ.get(name):
+                environment[name] = os.environ[name]
         environment.update(env or {})
         pid, fd = pty.fork()
         if pid == 0:
             fcntl.ioctl(0, termios.TIOCSWINSZ, struct.pack("HHHH", rows, columns, 0, 0))
+            if SHELL_STACK_KIB:
+                hard = resource.getrlimit(resource.RLIMIT_STACK)[1]
+                resource.setrlimit(resource.RLIMIT_STACK, (SHELL_STACK_KIB * 1024, hard))
             os.execve(binary, [binary] + ([url] if url else []), environment)
         self.pid, self.fd = pid, fd
         fcntl.ioctl(fd, termios.TIOCSWINSZ, struct.pack("HHHH", rows, columns, 0, 0))

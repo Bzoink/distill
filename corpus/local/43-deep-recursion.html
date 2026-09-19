@@ -1,0 +1,28 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>43 — Recursion deeper than the stack</title>
+
+<!-- A page may recurse without bound -- by accident, or to probe the engine.
+     A browser throws a RangeError the page can catch. This engine told
+     QuickJS it could use 8 MiB of stack, which was the whole of the process's
+     stack, so QuickJS's own check never fired: at about 4,600 calls the
+     process met the guard page and died with SIGSEGV, and the reader got a
+     failed navigation instead of the article below. -->
+
+<article id="content">
+  <h1>A page that asks too much of the stack</h1>
+  <p>The article still has to read normally when one of its scripts recurses
+  far past any sensible depth. RECURSION-BODY-OK.</p>
+  <p id="out">waiting for the script</p>
+</article>
+
+<script>
+  function down(n) { return n === 0 ? 0 : 1 + down(n - 1); }
+  var result;
+  try {
+    result = 'reached ' + down(100000);
+  } catch (e) {
+    result = 'STACK-GUARDED ' + e.name;
+  }
+  document.getElementById('out').textContent = result;
+</script>

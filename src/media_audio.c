@@ -4,7 +4,7 @@
  *
  * The threading contract, which is the part that bites:
  *
- *   The data callback runs on a real-time audio thread this process does not
+ *   The fill callback runs on a real-time audio thread this process does not
  *   control. It allocates nothing, locks nothing, and calls nothing belonging
  *   to a front end. Everything the front end reads is published through
  *   atomics and collected by media_audio_snapshot on the front end's own tick.
@@ -18,22 +18,16 @@
  *   rather than streaming it.
  */
 
-#define MA_NO_ENCODING
-#define MA_NO_GENERATION
-#define MA_NO_RESOURCE_MANAGER
-#define MA_NO_NODE_GRAPH
-#define MA_NO_ENGINE
-#define MA_ENABLE_ONLY_SPECIFIC_BACKENDS
-#define MA_ENABLE_PULSEAUDIO
-#define MA_ENABLE_ALSA
-#define MA_ENABLE_NULL
-
-#define MINIAUDIO_IMPLEMENTATION
+/* miniaudio decodes here; the device that plays what it decodes belongs to
+   the platform (daudio.h), which also compiles miniaudio's implementation. */
+#include "miniaudio_config.h"
 #include "miniaudio.h"
 
+#include "daudio.h"
 #include "media_audio.h"
 
 #include <stdatomic.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -43,11 +37,8 @@
 
 static struct {
     bool open;            /* a decoder is loaded */
-    bool device_ready;    /* a real device is attached */
-    ma_context context;   /* only for DISTILL_AUDIO_BACKEND=null */
-    bool context_ready;
+    DAudioOutput *output; /* a device is attached */
     ma_decoder decoder;
-    ma_device device;
     unsigned long long total_frames;
     unsigned sample_rate;
     char item[MEDIA_AUDIO_ITEM_MAX];
@@ -131,15 +122,15 @@ static size_t fill_frames(float *out, size_t frames)
     return (size_t)read;
 }
 
-static void data_callback(ma_device *device, void *output, const void *input, ma_uint32 frames)
+static void on_fill(void *opaque, float *out, size_t frames)
 {
-    (void)device; (void)input;
-    fill_frames((float *)output, frames);
+    (void)opaque;
+    fill_frames(out, frames);
 }
 
 static void release(void)
 {
-    if (core.device_ready) { ma_device_uninit(&core.device); core.device_ready = false; }
+    if (core.output) { d_audio_close(core.output); core.output = NULL; }
     if (core.open) { ma_decoder_uninit(&core.decoder); core.open = false; }
     core.total_frames = 0;
     core.sample_rate = 0;
@@ -177,31 +168,18 @@ static bool open_decoder(const char *path, const char *item)
 bool media_audio_open(const char *path, const char *item)
 {
     if (!open_decoder(path, item)) return false;
-    ma_device_config config = ma_device_config_init(ma_device_type_playback);
-    config.playback.format = MEDIA_AUDIO_FORMAT;
-    config.playback.channels = MEDIA_AUDIO_CHANNELS;
-    config.sampleRate = core.sample_rate;
-    config.dataCallback = data_callback;
-    /* DISTILL_AUDIO_BACKEND=null plays into nothing, in real time: position,
-       seeking and end of track all behave as they do on a device, with no
-       sound and no device needed. It exists for the terminal suite, which
-       must exercise playback on machines with no sound card and must not
-       make a noise on ones that have one. */
-    const char *backend = getenv("DISTILL_AUDIO_BACKEND");
-    ma_context *context = NULL;
-    if (backend && !strcmp(backend, "null")) {
-        ma_backend null_backend = ma_backend_null;
-        if (!core.context_ready && ma_context_init(&null_backend, 1, NULL, &core.context) == MA_SUCCESS)
-            core.context_ready = true;
-        if (core.context_ready) context = &core.context;
-    }
-    if (ma_device_init(context, &config, &core.device) != MA_SUCCESS) {
+    /* DISTILL_AUDIO_BACKEND=null, honoured by every platform's output, plays
+       into nothing in real time: position, seeking and end of track all
+       behave as they do on a device, with no sound and no device needed. */
+    char *error = NULL;
+    core.output = d_audio_open(core.sample_rate, MEDIA_AUDIO_CHANNELS, on_fill, NULL, &error);
+    if (!core.output) {
         /* No device is a reportable condition, not a crash: the file stays
            open so the front end can still offer a download. */
-        set_error("no audio device is available");
+        set_error(error ? error : "no audio device is available");
+        free(error);
         return false;
     }
-    core.device_ready = true;
     set_phase(MEDIA_AUDIO_PAUSED);
     return true;
 }
@@ -219,7 +197,7 @@ bool media_audio_play(void)
         atomic_store_explicit(&core.position_frames, 0, memory_order_release);
     }
     set_phase(MEDIA_AUDIO_PLAYING);
-    if (core.device_ready && ma_device_start(&core.device) != MA_SUCCESS) {
+    if (core.output && !d_audio_start(core.output)) {
         set_error("the audio device would not start");
         return false;
     }
@@ -230,14 +208,14 @@ void media_audio_pause(void)
 {
     if (!core.open || phase_now() != MEDIA_AUDIO_PLAYING) return;
     set_phase(MEDIA_AUDIO_PAUSED);
-    if (core.device_ready) ma_device_stop(&core.device);
+    if (core.output) d_audio_stop(core.output);
 }
 
 void media_audio_stop(void)
 {
     if (!core.open) return;
     set_phase(MEDIA_AUDIO_STOPPED);
-    if (core.device_ready) ma_device_stop(&core.device);
+    if (core.output) d_audio_stop(core.output);
     atomic_store_explicit(&core.position_frames, 0, memory_order_release);
     atomic_store_explicit(&core.seek_request, 0, memory_order_release);
 }
@@ -254,7 +232,7 @@ bool media_audio_seek(double seconds)
     atomic_store_explicit(&core.position_frames, frame, memory_order_release);
     atomic_store_explicit(&core.seek_request, frame, memory_order_release);
     if (phase_now() == MEDIA_AUDIO_FINISHED) set_phase(MEDIA_AUDIO_PAUSED);
-    if (!core.device_ready || phase_now() != MEDIA_AUDIO_PLAYING) {
+    if (!core.output || phase_now() != MEDIA_AUDIO_PLAYING) {
         /* With no device running nothing will honour the request, so do it
            here -- the decoder is idle and nobody else can be touching it. */
         unsigned long long pending = atomic_exchange_explicit(&core.seek_request, SEEK_NONE,
@@ -298,7 +276,7 @@ void media_audio_close(void)
 
 bool media_audio_available(void)
 {
-    return core.device_ready;
+    return core.output != NULL;
 }
 
 size_t media_audio_pull(size_t frames)

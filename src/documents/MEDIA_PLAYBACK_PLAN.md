@@ -115,7 +115,7 @@ do not exist and proposed work that is already done.
 
 **Already present, and not to be rebuilt:**
 
-- **External hand-off.** `open_external` in [src/app.c](../app.c) spawns
+- **External hand-off.** `open_external` in [src/platform/linux/app.c](../platform/linux/app.c) spawns
   `xdg-open` with an argument vector and no shell, gated by
   `external_uri_allowed`, covered by `--self-test`. The first draft's proposed
   "safe argument-vector launch" is this, already written.
@@ -421,6 +421,13 @@ the media core. Backends are chosen per target — PulseAudio or ALSA on Linux,
 the native backend elsewhere — without the C23 API changing. Documentation
 records the formats that actually play and states plainly that video is
 downloaded or handed off, never decoded.
+
+*(Revised 2026-09-18 by [muroxi_compat.md](muroxi_compat.md).)* PCM output goes
+through the platform layer's `daudio` interface. On a platform miniaudio has no
+device backend for, miniaudio is built for **decoding only**
+(`MA_NO_DEVICE_IO`), since its device backends load libraries with `dlopen`,
+and `daudio` writes the PCM to the platform's own service — `mx_sio_*` on
+Muroxi, at 44.1 or 48 kHz. The media core and its controls do not change.
 
 ## Non-goals
 

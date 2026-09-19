@@ -1,5 +1,3 @@
-#define _POSIX_C_SOURCE 200809L
-
 /* Markdown export: the reader walk, written as a document.
 
    The conversion reads the reader page rather than the extraction JSON, so

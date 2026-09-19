@@ -1,13 +1,9 @@
-#define _POSIX_C_SOURCE 200809L
-
 #include "settings.h"
 
 #include "cutil.h"
+#include "dfs.h"
 
 #include <errno.h>
-#include <fcntl.h>
-#include <sys/stat.h>
-#include <unistd.h>
 
 /* The file is kept as its lines. Reading one finds it; writing one replaces
    it in place, or adds it at the end of its group. */
@@ -207,19 +203,14 @@ void d_settings_set_int(DSettings *settings, const char *group, const char *key,
     d_settings_set(settings, group, key, number);
 }
 
+/* The directory the file goes in, made private if it is missing. */
 static bool make_directories(const char *path)
 {
     char *copy = d_strdup(path);
     char *slash = strrchr(copy, '/');
     if (!slash) { free(copy); return true; }
     *slash = '\0';
-    for (char *at = copy + 1; *at; ++at) {
-        if (*at != '/') continue;
-        *at = '\0';
-        if (mkdir(copy, 0700) != 0 && errno != EEXIST) { free(copy); return false; }
-        *at = '/';
-    }
-    bool ok = mkdir(copy, 0700) == 0 || errno == EEXIST;
+    bool ok = d_fs_make_directories(copy);
     free(copy);
     return ok;
 }
@@ -227,29 +218,15 @@ static bool make_directories(const char *path)
 bool d_settings_save(const DSettings *settings)
 {
     if (!settings || !make_directories(settings->path)) return false;
-    char *temporary = d_cat2(settings->path, ".XXXXXX");
-    int fd = mkstemp(temporary);
-    if (fd < 0) { free(temporary); return false; }
     DBuffer out;
     dbuf_init(&out);
     for (size_t i = 0; i < settings->count; ++i) {
         dbuf_puts(&out, settings->lines[i]);
         dbuf_puts(&out, "\n");
     }
-    bool ok = true;
-    const char *data = out.data ? out.data : "";
-    size_t left = out.length;
-    while (ok && left) {
-        ssize_t written = write(fd, data, left);
-        if (written <= 0) { if (written < 0 && errno == EINTR) continue; ok = false; break; }
-        data += written;
-        left -= (size_t)written;
-    }
-    ok = ok && fsync(fd) == 0;
-    ok = close(fd) == 0 && ok;
-    ok = ok && rename(temporary, settings->path) == 0;
-    if (!ok) unlink(temporary);
+    /* Replaced whole, never rewritten in place: a crash mid-save must leave
+       the old settings, not half of the new ones. */
+    bool ok = d_fs_replace(settings->path, out.data ? out.data : "", out.length);
     dbuf_free(&out);
-    free(temporary);
     return ok;
 }

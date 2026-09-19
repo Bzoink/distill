@@ -276,7 +276,7 @@ here and on the framebuffer.
 A gap this plan missed on its first pass. The media plan's whole answer for
 video is **download**, and the audio core opens a file on disk
 (`media_audio_open(const char *path, ...)`), so both paths run through a
-transfer. The only transfer that exists is `MediaTransfer` in `src/app.c`,
+transfer. The only transfer that exists is `MediaTransfer` in `src/app.c` (now `src/platform/linux/app.c`),
 which allocates with `g_new0` and reports progress through GTK idle callbacks.
 A front end that links no GLib therefore has no audio hand-off, and no video
 story at all.

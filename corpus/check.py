@@ -25,6 +25,7 @@ look identical, and these fixtures are written to be hard.
 import argparse
 import json
 import os
+import select
 import shutil
 import socket
 import subprocess
@@ -95,6 +96,80 @@ def element_text(html, selector):
     p = IdText(selector[1:])
     p.feed(html)
     return (p.text if p.found else None)
+
+
+# The flags the engine takes without a value; every other option has one.
+ENGINE_FLAGS = {"--dump-dom", "--extract", "--native-forms", "--progress", "--https-optional"}
+
+
+class EngineHost:
+    """The engine in-process: one distill-host, every navigation on a thread
+    of its own inside it (src/engine_host.h). Runs that leave state behind
+    for the next fail the next one, which is part of what this tests."""
+
+    def __init__(self, binary):
+        self.binary = binary
+        self.scratch = tempfile.mkdtemp(prefix="distill-host-")
+        self.process = None
+        self.count = 0
+
+    def _start(self):
+        self.process = subprocess.Popen([self.binary], stdin=subprocess.PIPE,
+                                        stdout=subprocess.PIPE, text=True, bufsize=1)
+
+    def run(self, cmd, timeout_s):
+        if self.process is None or self.process.poll() is not None:
+            self._start()
+        self.count += 1
+        base = os.path.join(self.scratch, str(self.count))
+        lines, i = [], 1
+        while i < len(cmd):
+            name = cmd[i][2:]
+            if cmd[i] in ENGINE_FLAGS or i + 1 >= len(cmd):
+                lines.append(name)
+                i += 1
+            else:
+                lines.append(f"{name} {cmd[i + 1]}")
+                i += 2
+        with open(base + ".request", "w", encoding="utf-8") as fh:
+            fh.write("\n".join(lines) + "\n")
+        self.process.stdin.write(f"{base}.request\t{base}.out\t{base}.err\n")
+        self.process.stdin.flush()
+        ready, _, _ = select.select([self.process.stdout], [], [], timeout_s)
+        reply = self.process.stdout.readline() if ready else ""
+        if not reply.startswith("status "):
+            # A hang or a crash takes the host down with it: that is the cost
+            # of in-process, and exactly what this mode is here to show.
+            self.process.kill()
+            self.process.wait()
+            self.process = None
+            raise subprocess.TimeoutExpired(cmd, timeout_s) if not ready else \
+                OSError(f"the in-process host died on {cmd[2] if len(cmd) > 2 else cmd}")
+        status = int(reply.split()[1])
+
+        def read(path):
+            try:
+                with open(path, encoding="utf-8", errors="replace") as fh:
+                    return fh.read()
+            except OSError:
+                return ""
+        return subprocess.CompletedProcess(cmd, status, read(base + ".out"), read(base + ".err"))
+
+    def close(self):
+        if self.process and self.process.poll() is None:
+            self.process.stdin.close()
+            self.process.wait(timeout=10)
+        shutil.rmtree(self.scratch, ignore_errors=True)
+
+
+ENGINE_HOST = None
+
+
+def run_engine(cmd, timeout_s, env=None):
+    """Run the engine as the command, or in-process with --in-process."""
+    if ENGINE_HOST is not None and env is None:
+        return ENGINE_HOST.run(cmd, timeout_s)
+    return subprocess.run(cmd, capture_output=True, text=True, timeout=timeout_s, env=env)
 
 
 def free_port():
@@ -204,7 +279,7 @@ def run_session_steps(engine, base, steps, session_path, cap_ms, timeout_s):
             os.chmod(body_path, 0o600)
             cmd += ["--request-data-file", body_path]
         try:
-            r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout_s)
+            r = run_engine(cmd, timeout_s)
         except subprocess.TimeoutExpired:
             return f"session step {step['path']} timed out after {timeout_s}s"
         finally:
@@ -229,7 +304,7 @@ def dump_engine(engine, url, cap_ms, timeout_s, expect_exit=0, session_path=None
     if session_path:
         cmd += ["--session-file", session_path]
     try:
-        r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout_s)
+        r = run_engine(cmd, timeout_s)
     except subprocess.TimeoutExpired:
         return None, f"engine timed out after {timeout_s}s"
     if r.returncode != expect_exit:
@@ -240,17 +315,34 @@ def dump_engine(engine, url, cap_ms, timeout_s, expect_exit=0, session_path=None
     return r.stdout, None
 
 
-def dump_extract(engine, url, cap_ms, timeout_s, expect_exit=0):
+def dump_extract(engine, url, cap_ms, timeout_s, expect_exit=0, stats=None):
     """Structured extraction JSON for a URL, or (None, reason).
 
     As with dump_engine, a page may declare a non-zero expected status: a
     recognised challenge shell is still extracted, under its own status.
+
+    Pass a dict as stats to have it filled with the engine's DISTILL_STATS
+    line: what the run cost, for pages that assert a budget.
     """
     cmd = [engine, "--url", url, "--extract", "--script-cap-ms", str(cap_ms)]
+    env = None
+    stats_file = None
+    # In-process there is no process to measure; the budgets say so.
+    if stats is not None and ENGINE_HOST is None:
+        handle, stats_file = tempfile.mkstemp(prefix="distill-stats-", suffix=".jsonl")
+        os.close(handle)
+        env = dict(os.environ, DISTILL_STATS=stats_file)
     try:
-        r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout_s)
+        r = run_engine(cmd, timeout_s, env)
     except subprocess.TimeoutExpired:
         return None, f"extractor timed out after {timeout_s}s"
+    finally:
+        if stats_file:
+            with open(stats_file, encoding="utf-8") as fh:
+                lines = [json.loads(line) for line in fh if line.strip()]
+            os.unlink(stats_file)
+            if lines:
+                stats.update(lines[-1])
     if r.returncode != expect_exit:
         return None, (f"extractor exit {r.returncode}, expected {expect_exit}: "
                       f"{r.stderr.strip()[:300]}")
@@ -320,7 +412,7 @@ def dump_markdown(engine, url, cap_ms, timeout_s):
         path = fh.name
     cmd = [engine, "--url", url, "--markdown", path, "--script-cap-ms", str(cap_ms)]
     try:
-        r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout_s)
+        r = run_engine(cmd, timeout_s)
         if r.returncode != 0:
             return None, f"markdown exit {r.returncode}: {r.stderr.strip()[:200]}"
         with open(path, encoding="utf-8") as fh:
@@ -349,7 +441,7 @@ def dump_template(engine, url, cap_ms, timeout_s):
         path = fh.name
     cmd = [engine, "--url", url, "--template", path, "--script-cap-ms", str(cap_ms)]
     try:
-        r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout_s)
+        r = run_engine(cmd, timeout_s)
         if r.returncode != 0:
             return None, f"template exit {r.returncode}: {r.stderr.strip()[:200]}"
         with open(path, encoding="utf-8") as fh:
@@ -405,6 +497,23 @@ def check_transport(engine, port, cap_ms, timeout_s):
     except (subprocess.TimeoutExpired, OSError) as exc:
         failures.append(f"https to an http-only host: {exc}")
 
+    # An untrusted clock: TLS refusing is then the clock's fault, which the
+    # user can fix, and it has its own status (5) and message -- also when the
+    # scheme was only a guess, which must not be stepped down to plaintext to
+    # get round it. DISTILL_TEST_UNTRUSTED_TIME is the platform's test seam.
+    clockless = dict(os.environ, DISTILL_TEST_UNTRUSTED_TIME="1")
+    for extra, label in (([], "https"), (["--https-optional"], "a guessed https")):
+        try:
+            r = subprocess.run([engine, "--url", secure, "--extract",
+                                "--script-cap-ms", str(cap_ms)] + extra,
+                               capture_output=True, text=True, timeout=timeout_s, env=clockless)
+            if r.returncode != 5:
+                failures.append(f"{label} with an untrusted clock exited {r.returncode}, expected 5")
+            elif "clock" not in r.stderr:
+                failures.append(f"{label} with an untrusted clock did not say the clock was the cause")
+        except (subprocess.TimeoutExpired, OSError) as exc:
+            failures.append(f"{label} with an untrusted clock: {exc}")
+
     with tempfile.NamedTemporaryFile(suffix=".html", delete=False) as fh:
         path = fh.name
     try:
@@ -431,6 +540,128 @@ def check_transport(engine, port, cap_ms, timeout_s):
             os.unlink(path)
         except OSError:
             pass
+    return failures
+
+
+def run_stack_gate(engine, port, manifest, timeout_s):
+    """Muroxi's stacks, modelled on Linux (muroxi_compat.md, --stack).
+
+    Muroxi reserves 8 MiB for a process's main stack but guarantees only the
+    first 64 KiB; growth past that can be refused, which kills the process.
+    The engine may go deep -- a separate process pays for its own failure --
+    but a shell holds the user's history, forms and playback and must stay
+    within the guarantee. So:
+
+      engine  every corpus page under an 8 MiB stack, with the JS limit the
+              engine derives from it; a page may only fail by QuickJS's own
+              RangeError, which is a result, not a crash
+      shell   the whole terminal suite with the shell in 64 KiB, each engine
+              it starts given 8 MiB of its own
+
+    Each half has a negative control that must fail, or it models nothing:
+    the deep-recursion page with the JS limit set to the whole 8 MiB must
+    crash, and the shell must not run in 16 KiB.
+    """
+    import resource
+    import tui_suite
+    cap_ms = manifest.get("settle_cap_ms", 5000)
+    base = f"http://127.0.0.1:{port}"
+    hard = resource.getrlimit(resource.RLIMIT_STACK)[1]
+    resource.setrlimit(resource.RLIMIT_STACK, (8 * 1024 * 1024, hard))
+    failures = []
+    pages = [p for p in manifest["pages"] if p.get("gate") and p.get("path")]
+    for page in pages:
+        extraction, err = dump_extract(engine, f"{base}/{page['path']}", cap_ms, timeout_s,
+                                       page.get("expect_exit", 0))
+        if err:
+            failures.append(f"engine  {page['id']}: {err}")
+    print(f"  engine in 8 MiB: {len(pages) - len([f for f in failures if f.startswith('engine')])}"
+          f" of {len(pages)} pages")
+
+    r = subprocess.run([engine, "--url", f"{base}/43-deep-recursion.html", "--dump-dom",
+                        "--js-stack-kib", "8192", "--script-cap-ms", str(cap_ms)],
+                       capture_output=True, text=True, timeout=timeout_s)
+    if r.returncode >= 0:
+        failures.append("negative control: a JS limit of the whole 8 MiB stack did not crash "
+                        f"(exit {r.returncode}), so the engine run models nothing")
+    else:
+        print(f"  negative control: the whole stack as the JS limit crashed (signal {-r.returncode})")
+
+    with tempfile.TemporaryDirectory(prefix="distill-stack-") as scratch:
+        wrapper = os.path.join(scratch, "engine")
+        with open(wrapper, "w", encoding="utf-8") as fh:
+            fh.write(f'#!/bin/sh\nulimit -s 8192\nexec "{engine}" "$@"\n')
+        os.chmod(wrapper, 0o700)
+        os.environ["DISTILL_ENGINE"] = wrapper
+        tui = find_tui()
+        try:
+            tui_suite.SHELL_STACK_KIB = 64
+            results = tui_suite.run(tui, base)
+            broken = [label for status, label, _ in results if status != "pass"]
+            for label in broken:
+                failures.append(f"shell in 64 KiB: {label}")
+            print(f"  shell in 64 KiB: {len(results) - len(broken)} of {len(results)} terminal checks")
+
+            tui_suite.SHELL_STACK_KIB = 16
+            home = tempfile.mkdtemp(prefix="distill-stack-home-", dir=scratch)
+            os.makedirs(os.path.join(home, "config"), exist_ok=True)
+            terminal = tui_suite.Terminal(tui, f"{base}/09-article.html", home=home)
+            rendered = terminal.wait_for("A careful reader", 5)
+            terminal.send("q")
+            status = terminal.finish()
+            if rendered:
+                failures.append("negative control: the shell ran in 16 KiB of stack, "
+                                "so the 64 KiB run models nothing")
+            else:
+                print(f"  negative control: the shell did not run in 16 KiB (status {status})")
+        finally:
+            tui_suite.SHELL_STACK_KIB = None
+            del os.environ["DISTILL_ENGINE"]
+    print()
+    for failure in failures:
+        print(f"  {RED}FAIL{RESET}  {failure}")
+    if failures:
+        print(f"{RED}FAILED{RESET}  {len(failures)} stack check(s)")
+        return 1
+    print(f"{GREEN}OK{RESET}  the engine runs in Muroxi's reservation and the shell in its guarantee")
+    return 0
+
+
+def check_engine_files(engine, port, cap_ms, timeout_s):
+    """The engine writes nothing of its own to disk.
+
+    Cookies are kept in memory, and in the session file when there is one;
+    no run makes a temporary cookie jar. A jar in /tmp outlived any run that
+    crashed, and Muroxi's /tmp is volatile besides. The old jar was removed at
+    exit, so this looks during the run: 03b-hang holds it open for the whole
+    settle budget.
+    """
+    failures = []
+
+    def in_tmp():
+        # An engine that ignores TMPDIR writes to /tmp itself.
+        try:
+            return {name for name in os.listdir("/tmp") if name.startswith("distill")}
+        except OSError:
+            return set()
+
+    with tempfile.TemporaryDirectory(prefix="distill-files-") as scratch:
+        env = dict(os.environ, TMPDIR=scratch)
+        tmp_before = in_tmp()
+        try:
+            child = subprocess.Popen([engine, "--url", f"http://127.0.0.1:{port}/03b-hang.html",
+                                      "--extract", "--script-cap-ms", str(cap_ms)],
+                                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, env=env)
+            time.sleep(min(1.5, cap_ms / 2000))
+            during = os.listdir(scratch) + sorted(in_tmp() - tmp_before)
+            child.wait(timeout=timeout_s)
+            after = os.listdir(scratch)
+        except (subprocess.TimeoutExpired, OSError) as exc:
+            return [f"engine run: {exc}"]
+        if during:
+            failures.append(f"the engine made temporary files during a run: {', '.join(sorted(during))}")
+        if after:
+            failures.append(f"the engine left files behind: {', '.join(sorted(after))}")
     return failures
 
 
@@ -478,7 +709,7 @@ def dump_cells(engine, url, columns, cap_ms, timeout_s):
     cmd = [engine, "--url", url, "--dump-cells", path, "--columns", str(columns),
            "--script-cap-ms", str(cap_ms)]
     try:
-        r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout_s)
+        r = run_engine(cmd, timeout_s)
         if r.returncode != 0:
             return None, f"cells exit {r.returncode}: {r.stderr.strip()[:200]}"
         with open(path, encoding="utf-8") as fh:
@@ -530,6 +761,44 @@ def check_cells_fit(cells):
         results.append(("pass" if ok else "fail", f"cells@{columns} fits the terminal",
                         "" if ok else f"line {where} is {widest} cells"))
         failed += 0 if ok else 1
+    return results, failed
+
+
+def check_budgets(page, stats):
+    if ENGINE_HOST is not None:
+        return [("pending", "budgets measure a process; not checked in-process", "")], 0
+    return check_process_budgets(page, stats)
+
+
+def check_process_budgets(page, stats):
+    """A page may assert what its extraction run costs: max_rss_mib for peak
+    memory, max_run_ms for wall time, max_fetches_at_once for concurrency. Both regressions are invisible to every
+    content assertion -- the output is identical, only the process is larger
+    or slower -- so they need their own."""
+    results, failed = [], 0
+    checks = []
+    if page.get("max_rss_mib"):
+        rss = stats.get("rss_peak_kib")
+        checks.append((f"peak RSS within {page['max_rss_mib']} MiB",
+                       None if rss is None else rss <= page["max_rss_mib"] * 1024,
+                       None if rss is None else f"{rss / 1024:.1f} MiB"))
+    if page.get("max_run_ms"):
+        total = (stats.get("ms") or {}).get("total")
+        checks.append((f"run within {page['max_run_ms']} ms",
+                       None if total is None else total <= page["max_run_ms"],
+                       None if total is None else f"{total} ms"))
+    if page.get("max_fetches_at_once"):
+        at_once = stats.get("fetches_at_once")
+        checks.append((f"at most {page['max_fetches_at_once']} fetches at once",
+                       None if at_once is None else at_once <= page["max_fetches_at_once"],
+                       None if at_once is None else f"{at_once} at once, {stats.get('fetches')} in all"))
+    for label, ok, detail in checks:
+        if ok is None:
+            results.append(("fail", label, "the engine wrote no stats line"))
+            failed += 1
+        else:
+            results.append(("pass" if ok else "fail", label, detail))
+            failed += 0 if ok else 1
     return results, failed
 
 
@@ -678,6 +947,10 @@ def main():
                     help="render the gallery fixture through the Phase 2 media viewer")
     ap.add_argument("--app", action="store_true",
                     help="run the Phase 3 desktop-shell model smoke test")
+    ap.add_argument("--stack", action="store_true",
+                    help="model Muroxi's stacks: engine in 8 MiB, shell in 64 KiB")
+    ap.add_argument("--in-process", action="store_true",
+                    help="run the engine in-process, every page in one distill-host")
     ap.add_argument("--tui", action="store_true",
                     help="Phase 6: drive the terminal shell through a pty")
     ap.add_argument("--bundles", action="store_true",
@@ -732,6 +1005,14 @@ def main():
         ap.error("--render and --viewer are mutually exclusive")
     browser = find_browser() if args.baseline else None
     engine = find_engine() if not args.baseline and args.arm == "a" else None
+    if args.in_process:
+        if args.baseline or args.arm != "a" or args.render or args.viewer or args.tui:
+            ap.error("--in-process runs the engine's DOM and extraction gates")
+        global ENGINE_HOST
+        host = os.path.join(os.path.dirname(HERE), "build", "distill-host")
+        if not os.access(host, os.X_OK):
+            sys.exit("no distill-host found; build it first (cmake --build build)")
+        ENGINE_HOST = EngineHost(host)
     arm_b = find_arm_b(args.arm == "b-pruned") if not args.baseline and args.arm in ("b", "b-pruned") else None
     port = free_port()
 
@@ -753,6 +1034,9 @@ def main():
                 time.sleep(0.1)
         else:
             sys.exit("corpus server did not come up")
+
+        if args.stack:
+            return run_stack_gate(engine, port, manifest, args.timeout)
 
         if args.tui:
             import tui_suite
@@ -817,8 +1101,11 @@ def main():
                 html = None
                 extraction = None
             elif args.extract:
+                run_stats = {} if any(page.get(k) for k in
+                                      ("max_rss_mib", "max_run_ms", "max_fetches_at_once")) else None
                 extraction, err = dump_extract(engine, url, manifest.get("settle_cap_ms", 5000),
-                                               args.timeout, page.get("expect_exit", 0))
+                                               args.timeout, page.get("expect_exit", 0),
+                                               stats=run_stats)
                 html = None
                 # The reader template is produced in the same pass, so a page
                 # that asserts on it costs one extra engine run and only when
@@ -903,6 +1190,10 @@ def main():
                 golden_results, golden_failed = check_golden(page, extraction)
                 results.extend(golden_results)
                 failed += golden_failed
+                if run_stats is not None:
+                    budget_results, budget_failed = check_budgets(page, run_stats)
+                    results.extend(budget_results)
+                    failed += budget_failed
             for status, label, detail in results:
                 mark = {"pass": f"{GREEN}pass{RESET}",
                         "fail": f"{RED}FAIL{RESET}",
@@ -944,6 +1235,17 @@ def main():
                     print(f"    {RED}{problem}{RESET}")
             else:
                 print(f"  {label}  {GREEN}pass{RESET}\n")
+            problems = check_engine_files(engine, port,
+                                          manifest.get("settle_cap_ms", 5000), args.timeout)
+            label = "engine     No temporary files"
+            if problems:
+                total_failed += len(problems)
+                gates_failed.append("engine-files")
+                print(f"  {label}  {RED}fail{RESET}")
+                for problem in problems:
+                    print(f"    {RED}{problem}{RESET}")
+            else:
+                print(f"  {label}  {GREEN}pass{RESET}\n")
 
         if args.live:
             print(f"{DIM}--- live rungs: recorded, never gates ---{RESET}")
@@ -958,6 +1260,8 @@ def main():
         print(f"{GREEN}OK{RESET}  all gate assertions pass")
         return 0
     finally:
+        if ENGINE_HOST is not None:
+            ENGINE_HOST.close()
         server.terminate()
         try:
             server.wait(timeout=5)

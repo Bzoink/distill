@@ -1,11 +1,11 @@
-#define _POSIX_C_SOURCE 200809L
-
 #include "render.h"
+
+#include "cutil.h"
+#include "dfs.h"
 #include "shaper.h"
 
 #include <cairo/cairo.h>
 #include <ctype.h>
-#include <dirent.h>
 #include <errno.h>
 #include <ft2build.h>
 #include FT_FREETYPE_H
@@ -17,8 +17,6 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <strings.h>
-#include <sys/stat.h>
 
 #ifndef M_PI
 #define M_PI 3.14159265358979323846
@@ -71,8 +69,8 @@ static bool has_font_extension(const char *name)
 {
     const char *dot = strrchr(name, '.');
     if (!dot) return false;
-    return strcasecmp(dot, ".ttf") == 0 || strcasecmp(dot, ".otf") == 0 ||
-           strcasecmp(dot, ".ttc") == 0;
+    return d_casecmp(dot, ".ttf") == 0 || d_casecmp(dot, ".otf") == 0 ||
+           d_casecmp(dot, ".ttc") == 0;
 }
 
 static bool contains_case_insensitive(const char *text, const char *needle)
@@ -80,7 +78,7 @@ static bool contains_case_insensitive(const char *text, const char *needle)
     if (!text || !needle || !*needle) return false;
     size_t needle_length = strlen(needle);
     for (const char *cursor = text; *cursor; ++cursor) {
-        if (strncasecmp(cursor, needle, needle_length) == 0) return true;
+        if (d_ncasecmp(cursor, needle, needle_length) == 0) return true;
     }
     return false;
 }
@@ -125,27 +123,31 @@ static void add_font_file(DRenderContext *context, const char *path)
     FT_Done_Face(face);
 }
 
+static void scan_font_directory(DRenderContext *context, const char *directory, int depth);
+
+typedef struct {
+    DRenderContext *context;
+    const char *directory;
+    int depth;
+} FontScan;
+
+static bool font_entry(void *opaque, const char *name, bool is_directory)
+{
+    FontScan *scan = opaque;
+    if (name[0] == '.') return true;
+    char *path = d_cat3(scan->directory, "/", name);
+    if (is_directory) scan_font_directory(scan->context, path, scan->depth + 1);
+    else if (has_font_extension(name)) add_font_file(scan->context, path);
+    free(path);
+    return true;
+}
+
+/* Recursion bounded by depth: a font collection is at most a few levels. */
 static void scan_font_directory(DRenderContext *context, const char *directory, int depth)
 {
     if (!directory || depth > 3) return;
-    DIR *dir = opendir(directory);
-    if (!dir) return;
-    struct dirent *entry = NULL;
-    while ((entry = readdir(dir))) {
-        if (entry->d_name[0] == '.') continue;
-        size_t path_length = strlen(directory) + strlen(entry->d_name) + 2;
-        char *path = malloc(path_length);
-        if (!path) continue;
-        snprintf(path, path_length, "%s/%s", directory, entry->d_name);
-        struct stat info;
-        if (stat(path, &info) == 0) {
-            if (S_ISDIR(info.st_mode)) scan_font_directory(context, path, depth + 1);
-            else if (S_ISREG(info.st_mode) && has_font_extension(entry->d_name))
-                add_font_file(context, path);
-        }
-        free(path);
-    }
-    closedir(dir);
+    FontScan scan = {context, directory, depth};
+    d_fs_list(directory, font_entry, &scan);
 }
 
 static void load_fonts(DRenderContext *context, const char *font_dir)
@@ -181,7 +183,7 @@ static bool family_token_is(const char *begin, const char *end, const char *valu
 {
     trim_family_token(&begin, &end);
     size_t length = (size_t)(end - begin);
-    return strlen(value) == length && strncasecmp(begin, value, length) == 0;
+    return strlen(value) == length && d_ncasecmp(begin, value, length) == 0;
 }
 
 static bool family_token_contains(const char *begin, const char *end, const char *value)
@@ -190,7 +192,7 @@ static bool family_token_contains(const char *begin, const char *end, const char
     size_t value_length = strlen(value);
     if (!value_length || (size_t)(end - begin) < value_length) return false;
     for (const char *cursor = begin; cursor + value_length <= end; ++cursor) {
-        if (strncasecmp(cursor, value, value_length) == 0) return true;
+        if (d_ncasecmp(cursor, value, value_length) == 0) return true;
     }
     return false;
 }

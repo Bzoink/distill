@@ -1,5 +1,3 @@
-#define _GNU_SOURCE
-
 /* Distill in a terminal.
 
    The same process model as the desktop shell: the engine runs once per
@@ -17,10 +15,17 @@
 #include "address.h"
 #include "app_state.h"
 #include "cutil.h"
+#include "datadir.h"
+#include "dclock.h"
+#include "dfs.h"
 #include "distill_version.h"
+#include "dproc.h"
+#include "dterm.h"
+#include "engine_request.h"
 #include "form_submit.h"
 #include "image.h"
 #include "media_audio.h"
+#include "measure.h"
 #include "media_transfer.h"
 #include "reader_cells.h"
 #include "settings.h"
@@ -30,27 +35,9 @@
 #include "termbox2.h"
 
 #include <errno.h>
-#include <fcntl.h>
 #include <limits.h>
-#include <poll.h>
-#include <signal.h>
-#include <spawn.h>
-#include <strings.h>
-#include <sys/ioctl.h>
-#include <sys/stat.h>
-#include <sys/wait.h>
-#include <termios.h>
 #include <time.h>
-#include <unistd.h>
 
-#ifndef DISTILL_ENGINE_PATH
-#define DISTILL_ENGINE_PATH ""
-#endif
-#ifndef DISTILL_SOURCE_DIR
-#define DISTILL_SOURCE_DIR ""
-#endif
-
-extern char **environ;
 
 #define SECTION_SCHEME "distill-section:"
 #define MEDIA_SCHEME "distill-media:"
@@ -98,13 +85,13 @@ typedef struct {
 
 typedef enum { NAV_NEW, NAV_RELOAD } NavKind;
 typedef struct {
-    pid_t pid;
-    int out_fd, err_fd;
+    DProc *engine;
     DBuffer pending;
     DBuffer diagnostics;
     char *url;
     char *template_path;
     char *body_path;
+    char *request_path;
     char *location;
     int percent;
     char phase[16];
@@ -135,7 +122,6 @@ typedef struct {
 
 typedef struct {
     int tty;
-    struct termios saved;
     bool terminal_ready;
     int width, height;
     DScreen screen;
@@ -166,7 +152,7 @@ typedef struct {
     int transport_row, bar_start, bar_end;
     bool seeking;
 
-    pid_t externals[16];
+    DProc *externals[16];
     size_t external_count;
 
     char *status;
@@ -189,10 +175,9 @@ static void set_status(const char *format, ...)
 
 /* ---- the terminal, and putting it back ---------------------------------- */
 
-/* What a crash must undo, written with nothing but write(2) and tcsetattr:
-   both are safe in a signal handler, and a terminal left in raw mode on the
-   alternate screen with mouse reporting on is the failure a reader notices
-   before any other. */
+/* What a crash must undo, and only with calls safe in a signal handler: a
+   terminal left in raw mode on the alternate screen with mouse reporting on
+   is the failure a reader notices before any other. */
 static const char terminal_reset[] =
     "\033[0m\033[?25h\033[?7h\033[?1000l\033[?1002l\033[?1003l\033[?1006l\033[?1015l\033[?1049l";
 
@@ -200,42 +185,24 @@ static const char terminal_reset[] =
    bodies, fetched media -- goes in one private directory. A clean exit
    removes it; a crash cannot walk a directory safely, but it can unlink the
    one file that matters most, the live cookies, by a path fixed in advance. */
-static char run_directory[PATH_MAX];
-static char session_path[PATH_MAX];
+static char run_directory[D_FS_PATH_MAX];
+static char session_path[D_FS_PATH_MAX];
 
-static void emergency_restore(int signal_number)
+static void emergency_restore(void)
 {
-    if (session_path[0]) unlink(session_path);
-    if (tui.terminal_ready) {
-        ssize_t ignored = write(tui.tty, terminal_reset, sizeof(terminal_reset) - 1);
-        (void)ignored;
-        tcsetattr(tui.tty, TCSAFLUSH, &tui.saved);
-    }
-    signal(signal_number, SIG_DFL);
-    raise(signal_number);
-}
-
-static void install_emergency_restore(void)
-{
-    int signals[] = {SIGTERM, SIGHUP, SIGINT, SIGQUIT, SIGSEGV, SIGBUS, SIGFPE, SIGILL, SIGABRT};
-    for (size_t i = 0; i < sizeof(signals) / sizeof(signals[0]); ++i) {
-        struct sigaction action = {0};
-        action.sa_handler = emergency_restore;
-        sigemptyset(&action.sa_mask);
-        sigaction(signals[i], &action, NULL);
-    }
-    signal(SIGPIPE, SIG_IGN);
+    if (session_path[0]) d_fs_remove(session_path);
+    if (tui.terminal_ready) d_term_emergency_restore(terminal_reset, sizeof(terminal_reset) - 1);
 }
 
 static void cell_pixels(void)
 {
-    struct winsize size = {0};
+    DTermSize size;
     tui.cell_width = 8;
     tui.cell_height = 16;
-    if (ioctl(tui.tty, TIOCGWINSZ, &size) == 0 && size.ws_xpixel && size.ws_ypixel &&
-        size.ws_col && size.ws_row) {
-        tui.cell_width = size.ws_xpixel / size.ws_col;
-        tui.cell_height = size.ws_ypixel / size.ws_row;
+    if (d_term_size(tui.tty, &size) && size.pixel_width && size.pixel_height &&
+        size.columns && size.rows) {
+        tui.cell_width = size.pixel_width / size.columns;
+        tui.cell_height = size.pixel_height / size.rows;
     }
 }
 
@@ -252,21 +219,16 @@ static Graphics probe_graphics(void)
         return GRAPHICS_NONE;
     }
     const char query[] = "\033_Gi=31,s=1,v=1,a=q,t=d,f=24;AAAA\033\\\033[c";
-    if (write(tui.tty, query, sizeof(query) - 1) < 0) return GRAPHICS_NONE;
+    if (!d_term_write(tui.tty, query, sizeof(query) - 1)) return GRAPHICS_NONE;
     char reply[512];
     size_t used = 0;
-    struct timespec start;
-    clock_gettime(CLOCK_MONOTONIC, &start);
+    uint64_t start = d_clock_ms();
     for (;;) {
-        struct timespec now;
-        clock_gettime(CLOCK_MONOTONIC, &now);
-        long elapsed = (now.tv_sec - start.tv_sec) * 1000 + (now.tv_nsec - start.tv_nsec) / 1000000;
+        uint64_t elapsed = d_clock_ms() - start;
         if (elapsed > 400 || used >= sizeof(reply) - 1) break;
-        struct pollfd fd = {tui.tty, POLLIN, 0};
-        if (poll(&fd, 1, (int)(400 - elapsed)) <= 0) break;
-        ssize_t got = read(tui.tty, reply + used, sizeof(reply) - 1 - used);
-        if (got <= 0) break;
-        used += (size_t)got;
+        size_t got = d_term_read(tui.tty, reply + used, sizeof(reply) - 1 - used, (int)(400 - elapsed));
+        if (!got) break;
+        used += got;
         reply[used] = '\0';
         char *attributes = strstr(reply, "\033[?");
         if (attributes && strchr(attributes, 'c')) break;
@@ -303,16 +265,16 @@ static DScreenColors detect_colors(void)
 
 static bool terminal_open(void)
 {
-    tui.tty = open("/dev/tty", O_RDWR | O_CLOEXEC);
+    char *error = NULL;
+    tui.tty = d_term_open(&error);
     if (tui.tty < 0) {
-        fprintf(stderr, "distill-tui: no terminal to run in (%s)\n", strerror(errno));
+        fprintf(stderr, "distill-tui: %s\n", error ? error : "no terminal");
+        free(error);
         return false;
     }
-    if (tcgetattr(tui.tty, &tui.saved) != 0) {
-        fprintf(stderr, "distill-tui: not a terminal\n");
-        return false;
-    }
-    install_emergency_restore();
+    /* Where the platform cannot catch a crash, the shell still runs; it
+       just cannot tidy up after one. */
+    d_proc_on_fatal_signal(emergency_restore);
     if (tb_init_fd(tui.tty) != TB_OK) {
         fprintf(stderr, "distill-tui: unable to set up the terminal\n");
         return false;
@@ -344,8 +306,7 @@ static void terminal_close(void)
     tb_present();
     tb_shutdown();
     tui.terminal_ready = false;
-    tcsetattr(tui.tty, TCSAFLUSH, &tui.saved);
-    close(tui.tty);
+    d_term_close(tui.tty);
     d_screen_free(&tui.screen);
 }
 
@@ -353,33 +314,20 @@ static void terminal_close(void)
 
 static char *private_temp(const char *prefix)
 {
-    const char *directory = getenv("TMPDIR");
-    char *path = d_cat3(directory && *directory ? directory : "/tmp", "/", prefix);
-    char *full = d_cat2(path, "-XXXXXX");
-    free(path);
-    int fd = mkstemp(full);
-    if (fd < 0) { free(full); return NULL; }
-    fchmod(fd, S_IRUSR | S_IWUSR);
-    close(fd);
-    return full;
+    return d_fs_private_file(NULL, prefix);
 }
 
 static char *engine_path(void)
 {
     const char *configured = getenv("DISTILL_ENGINE");
-    if (configured && *configured && access(configured, X_OK) == 0) return d_strdup(configured);
-    if (*DISTILL_ENGINE_PATH && access(DISTILL_ENGINE_PATH, X_OK) == 0) return d_strdup(DISTILL_ENGINE_PATH);
-    char executable[PATH_MAX];
-    ssize_t length = readlink("/proc/self/exe", executable, sizeof(executable) - 1);
-    if (length > 0) {
-        executable[length] = '\0';
-        char *slash = strrchr(executable, '/');
-        if (slash) {
-            *slash = '\0';
-            char *candidate = d_cat2(executable, "/distill");
-            if (access(candidate, X_OK) == 0) return candidate;
-            free(candidate);
-        }
+    if (configured && *configured && d_fs_executable(configured)) return d_strdup(configured);
+    /* Beside this program: the build tree and an install both put it there. */
+    char *directory = d_proc_executable_directory();
+    if (directory) {
+        char *candidate = d_cat2(directory, "/distill");
+        free(directory);
+        if (d_fs_executable(candidate)) return candidate;
+        free(candidate);
     }
     return d_strdup("distill");
 }
@@ -387,16 +335,12 @@ static char *engine_path(void)
 static char *welcome_page(void)
 {
     const char *configured = getenv("DISTILL_WELCOME_PAGE");
-    if (configured && *configured && access(configured, R_OK) == 0) return d_cat2("file://", configured);
-    if (*DISTILL_SOURCE_DIR) {
-        char *source = d_cat2(DISTILL_SOURCE_DIR, "/share/welcome.html");
-        if (access(source, R_OK) == 0) { char *url = d_cat2("file://", source); free(source); return url; }
-        free(source);
-    }
-#ifdef DISTILL_INSTALL_WELCOME_PAGE
-    if (access(DISTILL_INSTALL_WELCOME_PAGE, R_OK) == 0) return d_cat2("file://", DISTILL_INSTALL_WELCOME_PAGE);
-#endif
-    return NULL;
+    if (configured && *configured && d_fs_readable(configured)) return d_cat2("file://", configured);
+    char *installed = d_data_path("welcome.html", NULL);
+    if (!installed) return NULL;
+    char *url = d_cat2("file://", installed);
+    free(installed);
+    return url;
 }
 
 /* ---- settings ------------------------------------------------------------ */
@@ -610,31 +554,28 @@ static bool show_page_file(const char *url, const char *template_path)
 
 static void dispose_history_page(DAppPage *page)
 {
-    if (page->template_path) unlink(page->template_path);
+    if (page->template_path) d_fs_remove(page->template_path);
 }
 
 static void nav_cleanup(void)
 {
-    if (tui.nav.out_fd >= 0) close(tui.nav.out_fd);
-    if (tui.nav.err_fd >= 0) close(tui.nav.err_fd);
-    if (tui.nav.body_path) { unlink(tui.nav.body_path); free(tui.nav.body_path); }
+    d_proc_free(tui.nav.engine);
+    if (tui.nav.body_path) { d_fs_remove(tui.nav.body_path); free(tui.nav.body_path); }
+    if (tui.nav.request_path) { d_fs_remove(tui.nav.request_path); free(tui.nav.request_path); }
     dbuf_free(&tui.nav.pending);
     dbuf_free(&tui.nav.diagnostics);
     free(tui.nav.url);
     free(tui.nav.template_path);
     free(tui.nav.location);
-    tui.nav = (Navigation){.out_fd = -1, .err_fd = -1};
+    tui.nav = (Navigation){0};
     tui.loading = false;
 }
 
 static void nav_cancel(void)
 {
     if (!tui.loading) return;
-    if (tui.nav.pid > 0) {
-        kill(tui.nav.pid, SIGTERM);
-        while (waitpid(tui.nav.pid, NULL, 0) < 0 && errno == EINTR) {}
-    }
-    if (tui.nav.template_path) unlink(tui.nav.template_path);
+    d_proc_terminate(tui.nav.engine);
+    if (tui.nav.template_path) d_fs_remove(tui.nav.template_path);
     nav_cleanup();
     set_status("Stopped");
 }
@@ -645,17 +586,7 @@ static char *write_private_body(const char *data)
 {
     char *path = private_temp("distill-body");
     if (!path) return NULL;
-    int fd = open(path, O_WRONLY | O_TRUNC | O_CLOEXEC);
-    bool ok = fd >= 0;
-    size_t left = strlen(data);
-    while (ok && left) {
-        ssize_t written = write(fd, data, left);
-        if (written <= 0) { if (written < 0 && errno == EINTR) continue; ok = false; break; }
-        data += written;
-        left -= (size_t)written;
-    }
-    if (fd >= 0) close(fd);
-    if (!ok) { unlink(path); free(path); return NULL; }
+    if (!d_fs_overwrite(path, data, strlen(data))) { d_fs_remove(path); free(path); return NULL; }
     return path;
 }
 
@@ -669,7 +600,7 @@ static void start_navigation(const char *url, const char *method, const char *bo
     if (body && *body) {
         body_path = write_private_body(body);
         if (!body_path) {
-            unlink(template_path);
+            d_fs_remove(template_path);
             free(template_path);
             set_status("Unable to stage the request body");
             return;
@@ -677,49 +608,34 @@ static void start_navigation(const char *url, const char *method, const char *bo
     }
     char zoom[16];
     snprintf(zoom, sizeof(zoom), "%d", tui.zoom);
-    const char *argv[32];
-    int argc = 0;
-    argv[argc++] = tui.engine;
-    argv[argc++] = "--url"; argv[argc++] = url;
-    argv[argc++] = "--template"; argv[argc++] = template_path;
-    argv[argc++] = "--theme"; argv[argc++] = tui.theme;
-    argv[argc++] = "--zoom"; argv[argc++] = zoom;
-    argv[argc++] = "--progress";
-    if (https_guessed) argv[argc++] = "--https-optional";
-    if (method && *method) { argv[argc++] = "--request-method"; argv[argc++] = method; }
-    if (body_path) { argv[argc++] = "--request-data-file"; argv[argc++] = body_path; }
-    if (tui.session_file) { argv[argc++] = "--session-file"; argv[argc++] = tui.session_file; }
-    argv[argc++] = "--script-cap-ms"; argv[argc++] = "5000";
-    argv[argc] = NULL;
-
-    int out[2], err[2];
-    if (pipe2(out, O_CLOEXEC) != 0 || pipe2(err, O_CLOEXEC) != 0) {
-        set_status("Unable to start the engine: %s", strerror(errno));
-        unlink(template_path); free(template_path);
-        if (body_path) { unlink(body_path); free(body_path); }
+    DRequestFile request;
+    d_request_file_init(&request);
+    d_request_file_add(&request, "url", url);
+    d_request_file_add(&request, "template", template_path);
+    d_request_file_add(&request, "theme", tui.theme);
+    d_request_file_add(&request, "zoom", zoom);
+    d_request_file_add(&request, "progress", NULL);
+    if (https_guessed) d_request_file_add(&request, "https-optional", NULL);
+    if (method && *method) d_request_file_add(&request, "request-method", method);
+    if (body_path) d_request_file_add(&request, "request-data-file", body_path);
+    if (tui.session_file) d_request_file_add(&request, "session-file", tui.session_file);
+    d_request_file_add(&request, "script-cap-ms", "5000");
+    char *request_path = d_request_file_write(&request);
+    char *error = NULL;
+    const char *argv[] = {tui.engine, "--request", request_path, NULL};
+    DProc *engine = request_path ? d_proc_spawn(argv, D_PROC_PIPE, D_PROC_PIPE, &error) : NULL;
+    if (!engine) {
+        set_status("Unable to start the engine %s", error ? error : request_path ? tui.engine
+                                                                 : "(no request file)");
+        free(error);
+        d_fs_remove(template_path); free(template_path);
+        if (body_path) { d_fs_remove(body_path); free(body_path); }
+        if (request_path) { d_fs_remove(request_path); free(request_path); }
         return;
     }
-    posix_spawn_file_actions_t actions;
-    posix_spawn_file_actions_init(&actions);
-    posix_spawn_file_actions_addopen(&actions, STDIN_FILENO, "/dev/null", O_RDONLY, 0);
-    posix_spawn_file_actions_adddup2(&actions, out[1], STDOUT_FILENO);
-    posix_spawn_file_actions_adddup2(&actions, err[1], STDERR_FILENO);
-    pid_t pid = 0;
-    int spawned = posix_spawnp(&pid, tui.engine, &actions, NULL, (char *const *)argv, environ);
-    posix_spawn_file_actions_destroy(&actions);
-    close(out[1]);
-    close(err[1]);
-    if (spawned != 0) {
-        close(out[0]); close(err[0]);
-        set_status("Unable to start the engine %s: %s", tui.engine, strerror(spawned));
-        unlink(template_path); free(template_path);
-        if (body_path) { unlink(body_path); free(body_path); }
-        return;
-    }
-    fcntl(out[0], F_SETFL, fcntl(out[0], F_GETFL) | O_NONBLOCK);
-    fcntl(err[0], F_SETFL, fcntl(err[0], F_GETFL) | O_NONBLOCK);
-    tui.nav = (Navigation){.pid = pid, .out_fd = out[0], .err_fd = err[0], .url = d_strdup(url),
-                           .template_path = template_path, .body_path = body_path, .kind = kind};
+    tui.nav = (Navigation){.engine = engine, .url = d_strdup(url),
+                           .template_path = template_path, .body_path = body_path,
+                           .request_path = request_path, .kind = kind};
     dbuf_init(&tui.nav.pending);
     dbuf_init(&tui.nav.diagnostics);
     snprintf(tui.nav.phase, sizeof(tui.nav.phase), "fetch");
@@ -761,19 +677,21 @@ static void consume_progress(void)
     tui.nav.pending.length = rest;
 }
 
-static bool drain(int *fd, DBuffer *into)
+/* Read what one of the engine's streams has said. False once it has ended,
+   and the stream is then closed. */
+static bool drain(bool errors, DBuffer *into)
 {
+    int handle = errors ? d_proc_errors(tui.nav.engine) : d_proc_output(tui.nav.engine);
     char buffer[4096];
     for (;;) {
-        ssize_t got = read(*fd, buffer, sizeof(buffer));
+        long got = d_handle_read(handle, buffer, sizeof(buffer));
         if (got > 0) {
             if (into->length < 256 * 1024) dbuf_append(into, buffer, (size_t)got);
             continue;
         }
-        if (got < 0 && errno == EINTR) continue;
-        if (got < 0) return true;        /* EAGAIN: still open */
-        close(*fd);
-        *fd = -1;
+        if (got == D_READ_EMPTY) return true;
+        if (errors) d_proc_close_errors(tui.nav.engine);
+        else d_proc_close_output(tui.nav.engine);
         return false;
     }
 }
@@ -797,10 +715,8 @@ static char *last_line(const DBuffer *text)
 
 static void nav_finished(void)
 {
-    int status = 0;
-    while (waitpid(tui.nav.pid, &status, 0) < 0 && errno == EINTR) {}
-    tui.nav.pid = 0;
-    int code = WIFEXITED(status) ? WEXITSTATUS(status) : -1;
+    DProcStatus status = d_proc_wait(tui.nav.engine);
+    int code = status.exited ? status.code : -1;
     const char *final_url = tui.nav.location && d_page_uri_allowed(tui.nav.location)
                           ? tui.nav.location : tui.nav.url;
     if (code == 0 || code == 4) {
@@ -826,7 +742,7 @@ static void nav_finished(void)
         char *why = last_line(&tui.nav.diagnostics);
         set_status("Could not load %s: %s", tui.nav.url, why);
         free(why);
-        if (tui.nav.template_path) unlink(tui.nav.template_path);
+        if (tui.nav.template_path) d_fs_remove(tui.nav.template_path);
     }
     nav_cleanup();
 }
@@ -834,12 +750,12 @@ static void nav_finished(void)
 static void nav_service(void)
 {
     if (!tui.loading) return;
-    if (tui.nav.out_fd >= 0) {
-        drain(&tui.nav.out_fd, &tui.nav.pending);
+    if (d_proc_output(tui.nav.engine) >= 0) {
+        drain(false, &tui.nav.pending);
         consume_progress();
     }
-    if (tui.nav.err_fd >= 0) drain(&tui.nav.err_fd, &tui.nav.diagnostics);
-    if (tui.nav.out_fd < 0 && tui.nav.err_fd < 0) nav_finished();
+    if (d_proc_errors(tui.nav.engine) >= 0) drain(true, &tui.nav.diagnostics);
+    if (d_proc_output(tui.nav.engine) < 0 && d_proc_errors(tui.nav.engine) < 0) nav_finished();
 }
 
 static void show_history_current(void)
@@ -854,7 +770,8 @@ static void show_history_current(void)
 static void reap_externals(void)
 {
     for (size_t i = 0; i < tui.external_count;) {
-        if (waitpid(tui.externals[i], NULL, WNOHANG) != 0) {
+        if (d_proc_poll_exit(tui.externals[i], NULL)) {
+            d_proc_free(tui.externals[i]);
             tui.externals[i] = tui.externals[--tui.external_count];
             continue;
         }
@@ -871,24 +788,14 @@ static void open_external(const char *uri)
         set_status("Blocked: not an address that can be handed to the system");
         return;
     }
-    const char *display = getenv("DISPLAY");
-    const char *wayland = getenv("WAYLAND_DISPLAY");
-    if ((display && *display) || (wayland && *wayland)) {
-        posix_spawn_file_actions_t actions;
-        posix_spawn_file_actions_init(&actions);
-        posix_spawn_file_actions_addopen(&actions, STDIN_FILENO, "/dev/null", O_RDONLY, 0);
-        posix_spawn_file_actions_addopen(&actions, STDOUT_FILENO, "/dev/null", O_WRONLY, 0);
-        posix_spawn_file_actions_addopen(&actions, STDERR_FILENO, "/dev/null", O_WRONLY, 0);
-        pid_t pid = 0;
-        char *argv[] = {"xdg-open", (char *)uri, NULL};
-        int spawned = posix_spawnp(&pid, "xdg-open", &actions, NULL, argv, environ);
-        posix_spawn_file_actions_destroy(&actions);
-        if (spawned == 0) {
-            if (tui.external_count < sizeof(tui.externals) / sizeof(tui.externals[0]))
-                tui.externals[tui.external_count++] = pid;
-            set_status("Opened with the system handler: %s", uri);
-            return;
-        }
+    DProc *handler = d_proc_open_with_system(uri);
+    if (handler) {
+        if (tui.external_count < sizeof(tui.externals) / sizeof(tui.externals[0]))
+            tui.externals[tui.external_count++] = handler;
+        else
+            d_proc_free(handler);   /* not waited for; it outlives nothing */
+        set_status("Opened with the system handler: %s", uri);
+        return;
     }
     set_status("Open outside the terminal: %s", uri);
 }
@@ -960,7 +867,7 @@ static char *track_title(size_t link, const char *url)
 static void audio_release(void)
 {
     media_audio_close();
-    if (tui.audio_file) { unlink(tui.audio_file); free(tui.audio_file); tui.audio_file = NULL; }
+    if (tui.audio_file) { d_fs_remove(tui.audio_file); free(tui.audio_file); tui.audio_file = NULL; }
     free(tui.audio_title);
     tui.audio_title = NULL;
 }
@@ -992,8 +899,7 @@ static char *suggested_path(const char *url)
     if (!*name || name[0] == '.') { char *safe = d_cat2("download", name); free(name); name = safe; }
     const char *home = getenv("HOME");
     char *directory = home && *home ? d_cat2(home, "/Downloads") : d_strdup(".");
-    struct stat info;
-    if (stat(directory, &info) != 0 || !S_ISDIR(info.st_mode)) { free(directory); directory = d_strdup("."); }
+    if (!d_fs_is_directory(directory)) { free(directory); directory = d_strdup("."); }
     char *path = d_cat3(directory, "/", name);
     free(directory);
     free(name);
@@ -1033,7 +939,7 @@ static void viewer_free_image(void)
 {
     if (tui.viewer.loaded) d_image_free(&tui.viewer.image);
     tui.viewer.loaded = false;
-    if (tui.viewer.file) { unlink(tui.viewer.file); free(tui.viewer.file); tui.viewer.file = NULL; }
+    if (tui.viewer.file) { d_fs_remove(tui.viewer.file); free(tui.viewer.file); tui.viewer.file = NULL; }
     free(tui.viewer.failure);
     tui.viewer.failure = NULL;
 }
@@ -1139,7 +1045,7 @@ static void transfer_service(void)
         tui.viewer.drawn = false;
         d_screen_invalidate(&tui.screen);
     } else {
-        unlink(d_media_transfer_path(transfer));
+        d_fs_remove(d_media_transfer_path(transfer));
     }
     d_media_transfer_free(transfer);
 }
@@ -1170,7 +1076,7 @@ static void follow_link(size_t index)
     else if (d_starts(uri, DOWNLOAD_SCHEME)) download(uri + strlen(DOWNLOAD_SCHEME));
     else if (d_starts(uri, OPEN_SCHEME)) open_external(uri + strlen(OPEN_SCHEME));
     else if (d_starts(uri, "distill-")) { /* a desktop affordance with nothing to do here */ }
-    else if (!strncasecmp(uri, "mailto:", 7) || !strncasecmp(uri, "tel:", 4)) open_external(uri);
+    else if (!d_ncasecmp(uri, "mailto:", 7) || !d_ncasecmp(uri, "tel:", 4)) open_external(uri);
     else if (d_page_uri_allowed(uri)) navigate(uri, NULL, NULL, false);
     else open_external(uri);
     free(unwrapped);
@@ -1180,7 +1086,7 @@ static void follow_link(size_t index)
 
 static bool control_type(const ReaderLayoutControl *control, const char *type)
 {
-    return !strcasecmp(control->type, type);
+    return !d_casecmp(control->type, type);
 }
 
 static bool control_is_button(const ReaderLayoutControl *control)
@@ -1906,9 +1812,8 @@ static void prompt_commit(bool submit, bool advance)
     } else if (kind == PROMPT_SAVE_AS) {
         char *url = tui.prompt.url ? d_strdup(tui.prompt.url) : NULL;
         char *path = d_strdup(text);
-        struct stat info;
         if (!*path) { free(url); free(path); return; }
-        if (stat(path, &info) == 0) {
+        if (d_fs_exists(path)) {
             set_status("%s exists; choose another name", path);
             free(url); free(path);
             return;
@@ -2220,6 +2125,7 @@ static void usage(const char *program)
 
 int main(int argc, char **argv)
 {
+    d_measure_begin(argv);
     const char *url_argument = NULL;
     for (int i = 1; i < argc; ++i) {
         if (!strcmp(argv[i], "--help") || !strcmp(argv[i], "-h")) { usage(argv[0]); return 0; }
@@ -2229,17 +2135,25 @@ int main(int argc, char **argv)
     }
     tui.transport_row = -1;
     tui.page.focus = -1;
-    tui.nav = (Navigation){.out_fd = -1, .err_fd = -1};
+    tui.nav = (Navigation){0};
     d_app_history_init(&tui.history);
     char *start = NULL;
     load_settings(&start);
     tui.engine = engine_path();
     /* Cookies for this run only, in a file only this user can read: the
        engine runs once per navigation, so a session has to live on disk. */
-    const char *outer = getenv("TMPDIR");
-    snprintf(run_directory, sizeof(run_directory), "%s/distill-tui-XXXXXX", outer && *outer ? outer : "/tmp");
-    if (!mkdtemp(run_directory)) { fprintf(stderr, "distill-tui: no private directory: %s\n", strerror(errno)); return 1; }
-    setenv("TMPDIR", run_directory, 1);
+    char *directory = d_fs_private_directory(NULL, "distill-tui");
+    if (!directory || strlen(directory) >= sizeof(run_directory)) {
+        fprintf(stderr, "distill-tui: no private directory: %s\n", strerror(errno));
+        free(directory);
+        return 1;
+    }
+    /* Kept in a fixed buffer: the crash handler may need it, and a handler
+       cannot rely on the heap. */
+    snprintf(run_directory, sizeof(run_directory), "%s", directory);
+    free(directory);
+    /* The engine and media transfers put their temporary files here too. */
+    d_proc_set_environment("TMPDIR", run_directory);
     tui.session_file = private_temp("distill-session");
     if (tui.session_file) snprintf(session_path, sizeof(session_path), "%s", tui.session_file);
     if (!terminal_open()) { free(start); return 1; }
@@ -2260,22 +2174,30 @@ int main(int argc, char **argv)
     tb_get_fds(&tty_fd, &resize_fd);
     while (!tui.quit) {
         render();
-        struct pollfd fds[5];
-        int count = 0;
-        fds[count++] = (struct pollfd){tty_fd, POLLIN, 0};
-        fds[count++] = (struct pollfd){resize_fd, POLLIN, 0};
+        DPollItem items[5];
+        size_t count = 0;
+        items[count++] = (DPollItem){tty_fd, false};
+        items[count++] = (DPollItem){resize_fd, false};
         int nav_out = -1, nav_err = -1, transfer = -1;
-        if (tui.loading && tui.nav.out_fd >= 0) { nav_out = count; fds[count++] = (struct pollfd){tui.nav.out_fd, POLLIN, 0}; }
-        if (tui.loading && tui.nav.err_fd >= 0) { nav_err = count; fds[count++] = (struct pollfd){tui.nav.err_fd, POLLIN, 0}; }
-        if (tui.transfer) { transfer = count; fds[count++] = (struct pollfd){d_media_transfer_fd(tui.transfer), POLLIN, 0}; }
+        if (tui.loading && d_proc_output(tui.nav.engine) >= 0) {
+            nav_out = (int)count;
+            items[count++] = (DPollItem){d_proc_output(tui.nav.engine), false};
+        }
+        if (tui.loading && d_proc_errors(tui.nav.engine) >= 0) {
+            nav_err = (int)count;
+            items[count++] = (DPollItem){d_proc_errors(tui.nav.engine), false};
+        }
+        if (tui.transfer) {
+            transfer = (int)count;
+            items[count++] = (DPollItem){d_media_transfer_fd(tui.transfer), false};
+        }
         MediaAudioState state;
         media_audio_snapshot(&state);
         int timeout = state.phase == MEDIA_AUDIO_PLAYING ? 250 : tui.external_count ? 1000 : -1;
-        int ready = poll(fds, (nfds_t)count, timeout);
-        if (ready < 0 && errno != EINTR) break;
-        if ((nav_out >= 0 && fds[nav_out].revents) || (nav_err >= 0 && fds[nav_err].revents)) nav_service();
-        if (transfer >= 0 && fds[transfer].revents) transfer_service();
-        if (fds[0].revents || fds[1].revents) {
+        if (d_poll(items, count, timeout) < 0) break;
+        if ((nav_out >= 0 && items[nav_out].ready) || (nav_err >= 0 && items[nav_err].ready)) nav_service();
+        if (transfer >= 0 && items[transfer].ready) transfer_service();
+        if (items[0].ready || items[1].ready) {
             /* A terminal sends Alt+key as Escape and the key in one write, and
                a pressed Escape on its own: an Escape with a key right behind
                it in the same batch is the Alt chord. */
@@ -2300,13 +2222,14 @@ int main(int argc, char **argv)
     terminal_close();
     page_free_state(&tui.page);
     d_app_history_clear(&tui.history, dispose_history_page);
-    if (tui.session_file) { unlink(tui.session_file); free(tui.session_file); }
+    if (tui.session_file) { d_fs_remove(tui.session_file); free(tui.session_file); }
     session_path[0] = '\0';
     /* Empty by now if nothing leaked; a failure here is a leak to find. */
-    if (rmdir(run_directory) != 0)
+    if (!d_fs_remove_directory(run_directory))
         fprintf(stderr, "distill-tui: %s was not empty on exit\n", run_directory);
     free(tui.engine);
     free(tui.theme);
     free(tui.status);
+    d_measure_finish("tui", NULL);
     return 0;
 }
