@@ -1033,9 +1033,9 @@ static void execute_jobs(Engine *engine)
     }
 }
 
-static int interrupt_handler(JSRuntime *runtime, void *opaque)
+static int interrupt_handler(JSContext *ctx, void *opaque)
 {
-    (void)runtime;
+    (void)ctx;
     Engine *engine = opaque;
     if (clock_ms() - engine->started >= engine->cap_ms) {
         engine->cap_hit = true;

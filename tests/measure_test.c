@@ -23,10 +23,21 @@ static char **stack_top;
 
 /* Each level keeps FRAME_BYTES live on the stack. The volatile writes and the
    use of the result stop the compiler from shrinking or merging the frames. */
-static unsigned recurse(unsigned levels)
+/* Each level keeps FRAME_BYTES live on the stack, and every 8-byte word of
+   the frame is written: the probe compares whole words, and an untouched
+   word inside a frame would stop its scan above the frame's deepest byte.
+   A sparser stride also invites the optimizer to strip the unwritten part
+   of the array and allocate frames far smaller than FRAME_BYTES, which
+   would make the probe's arithmetic lie. The call goes through a volatile
+   pointer so the optimizer cannot see that the callee is the function
+   itself and turn accumulation-minus-call into an iterative loop over one
+   shared frame, which would likewise collapse the levels. */
+static unsigned (*volatile recurse)(unsigned levels);
+
+static unsigned real_recurse(unsigned levels)
 {
     volatile unsigned char frame[FRAME_BYTES];
-    for (unsigned i = 0; i < FRAME_BYTES; i += 64) frame[i] = (unsigned char)levels;
+    for (unsigned i = 0; i < FRAME_BYTES; i += 8) frame[i] = (unsigned char)levels;
     if (levels == 0) return frame[0];
     return recurse(levels - 1) + frame[FRAME_BYTES - 64];
 }
@@ -101,6 +112,7 @@ int main(int argc, char **argv)
     (void)argc;
     setenv("DISTILL_STACK_PROBE", "1024", 1);
     stack_top = argv;
+    recurse = real_recurse;
     d_measure_begin(argv);
     check_stack();
     check_heap();
