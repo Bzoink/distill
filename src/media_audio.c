@@ -149,7 +149,13 @@ static bool open_decoder(const char *path, const char *item)
         atomic_store_explicit(&core.volume_milli, 1000, memory_order_release);
     set_phase(MEDIA_AUDIO_LOADING);
     ma_decoder_config config = ma_decoder_config_init(MEDIA_AUDIO_FORMAT, MEDIA_AUDIO_CHANNELS, 0);
-    if (ma_decoder_init_file(path ? path : "", &config, &core.decoder) != MA_SUCCESS) {
+#ifdef DISTILL_WINDOWS
+    ma_result d_win_decoder_init(const char *, const ma_decoder_config *, ma_decoder *);
+    ma_result result = d_win_decoder_init(path ? path : "", &config, &core.decoder);
+#else
+    ma_result result = ma_decoder_init_file(path ? path : "", &config, &core.decoder);
+#endif
+    if (result != MA_SUCCESS) {
         set_error("this file could not be decoded");
         return false;
     }

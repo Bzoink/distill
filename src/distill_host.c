@@ -91,8 +91,8 @@ int main(void)
         }
         *output_path++ = '\0';
         *errors_path++ = '\0';
-        FILE *output = fopen(output_path, "w");
-        FILE *errors = fopen(errors_path, "w");
+        FILE *output = d_fopen(output_path, "w");
+        FILE *errors = d_fopen(errors_path, "w");
         int status = output && errors ? run_one(line, output, errors) : 2;
         if (output) fclose(output);
         if (errors) fclose(errors);

@@ -96,6 +96,7 @@ static void consume_progress(DShellNav *nav)
     char *newline;
     while ((newline = memchr(start, '\n', (size_t)(nav->pending.data + nav->pending.length - start)))) {
         *newline = '\0';
+        if (newline > start && newline[-1] == '\r') newline[-1] = '\0';
         int percent = 0;
         char phase[16] = "";
         if (sscanf(start, "progress %d %15s", &percent, phase) == 2) {

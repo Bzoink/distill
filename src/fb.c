@@ -2934,7 +2934,11 @@ static char *engine_path(void)
     if (configured && *configured && d_fs_executable(configured)) return d_strdup(configured);
     char *directory = d_proc_executable_directory();
     if (directory) {
+#ifdef DISTILL_DISPLAY_WINDOWS
+        char *candidate = d_cat2(directory, "/distill.exe");
+#else
         char *candidate = d_cat2(directory, "/distill");
+#endif
         free(directory);
         if (d_fs_executable(candidate)) return candidate;
         free(candidate);
@@ -2956,21 +2960,32 @@ static void usage(const char *program, const char *default_display)
     fprintf(stderr,
             "usage: %s [--display SPEC] [--version] [URL]\n"
             "  Distill on a framebuffer. With no URL, opens the start page from settings.\n"
+#ifdef DISTILL_DISPLAY_WINDOWS
+            "  --display windows[:WxH] a Windows window (default 1050x760)\n"
+#else
             "  --display console        the Linux console: /dev/fb0 (or $FRAMEBUFFER), keys from\n"
             "                           this virtual console's tty, the mouse from evdev\n"
+#endif
             "  --display memory:WxH[,cell=CWxCH][,script=FILE]\n"
             "                           no screen: a buffer driven by a script (the --fb gate)\n"
 #ifdef DISTILL_DISPLAY_X11
             "  --display x11[:WxH]      a window (default 1920x1080)\n"
 #endif
+#ifdef DISTILL_DISPLAY_WINDOWS
+            "  The default display is %s.\n",
+#else
             "  The default is %s. If a crash leaves the console blank, switch VT and back,\n"
-            "  or type blind: kbd_mode -u; chvt N.\n", program, default_display);
+            "  or type blind: kbd_mode -u; chvt N.\n",
+#endif
+            program, default_display);
 }
 
 int main(int argc, char **argv)
 {
     d_measure_begin(argv);
-#ifdef DISTILL_DISPLAY_X11
+#if defined(DISTILL_DISPLAY_WINDOWS)
+    const char *display_spec = "windows";
+#elif defined(DISTILL_DISPLAY_X11)
     const char *display_spec = "x11";
 #else
     const char *display_spec = "console";

@@ -112,7 +112,7 @@ static int memory_wait_ms(DDisplay *display)
 
 static void write_screenshot(const MemoryDisplay *m, const char *path)
 {
-    FILE *file = fopen(path, "wb");
+    FILE *file = d_fopen(path, "wb");
     if (!file) { fprintf(stderr, "distill-fb: script line %d: cannot write %s\n", m->line, path); return; }
     fprintf(file, "P6\n%d %d\n255\n", m->width, m->height);
     unsigned char row[3 * 1024];
@@ -134,7 +134,7 @@ static void write_screenshot(const MemoryDisplay *m, const char *path)
 
 static void write_state(const MemoryDisplay *m, const char *path)
 {
-    FILE *file = fopen(path, "ab");
+    FILE *file = d_fopen(path, "ab");
     if (!file) { fprintf(stderr, "distill-fb: script line %d: cannot write %s\n", m->line, path); return; }
     fprintf(file, "%s\n", m->state ? m->state : "{}");
     fclose(file);

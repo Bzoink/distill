@@ -42,6 +42,7 @@ struct DRenderContext {
 struct DRenderFont {
     DRenderContext *context;
     FT_Face face;
+    char *font_bytes;
     hb_font_t *harfbuzz;
     int size;
     int ascent;
@@ -93,10 +94,30 @@ static bool style_italic(const char *style, FT_Long face_style_flags)
            contains_case_insensitive(style, "italic") || contains_case_insensitive(style, "oblique");
 }
 
+static bool open_face(FT_Library library, const char *path, FT_Face *face, char **bytes)
+{
+    *bytes = NULL;
+#ifdef DISTILL_WINDOWS
+    /* FreeType's filename API uses narrow stdio. Open the UTF-8 path through
+       Distill and keep the file bytes alive until FreeType releases the face. */
+    size_t length;
+    *bytes = d_read_file(path, &length);
+    if (*bytes && length <= LONG_MAX &&
+        FT_New_Memory_Face(library, (const FT_Byte *)*bytes, (FT_Long)length, 0, face) == 0)
+        return true;
+    free(*bytes);
+    *bytes = NULL;
+    return false;
+#else
+    return FT_New_Face(library, path, 0, face) == 0;
+#endif
+}
+
 static void add_font_file(DRenderContext *context, const char *path)
 {
     FT_Face face = NULL;
-    if (FT_New_Face(context->freetype, path, 0, &face) != 0) return;
+    char *font_bytes;
+    if (!open_face(context->freetype, path, &face, &font_bytes)) return;
     const char *family = face->family_name ? face->family_name : "";
     const char *style = face->style_name ? face->style_name : "";
     if (context->file_count == context->file_capacity) {
@@ -104,6 +125,7 @@ static void add_font_file(DRenderContext *context, const char *path)
         DFontFile *files = realloc(context->files, capacity * sizeof(*files));
         if (!files) {
             FT_Done_Face(face);
+            free(font_bytes);
             return;
         }
         context->files = files;
@@ -117,6 +139,7 @@ static void add_font_file(DRenderContext *context, const char *path)
     file->italic = style_italic(style, face->style_flags);
     file->monospace = (face->face_flags & FT_FACE_FLAG_FIXED_WIDTH) != 0;
     FT_Done_Face(face);
+    free(font_bytes);
 }
 
 static void scan_font_directory(DRenderContext *context, const char *directory, int depth);
@@ -315,19 +338,18 @@ DRenderFont *d_render_font_create(DRenderContext *context, const char *face_name
     const DFontFile *file = select_font_file(context, face_name, weight, italic);
     if (!file) return NULL;
     DRenderFont *font = calloc(1, sizeof(*font));
-    if (!font || FT_New_Face(context->freetype, file->path, 0, &font->face) != 0) {
+    if (!font) return NULL;
+    if (!open_face(context->freetype, file->path, &font->face, &font->font_bytes)) {
         free(font);
         return NULL;
     }
     if (FT_Set_Pixel_Sizes(font->face, 0, (FT_UInt)size) != 0) {
-        FT_Done_Face(font->face);
-        free(font);
+        d_render_font_destroy(font);
         return NULL;
     }
     font->harfbuzz = hb_ft_font_create_referenced(font->face);
     if (!font->harfbuzz) {
-        FT_Done_Face(font->face);
-        free(font);
+        d_render_font_destroy(font);
         return NULL;
     }
     font->context = context;
@@ -356,6 +378,7 @@ void d_render_font_destroy(DRenderFont *font)
     if (!font) return;
     if (font->harfbuzz) hb_font_destroy(font->harfbuzz);
     if (font->face) FT_Done_Face(font->face);
+    free(font->font_bytes);
     free(font);
 }
 

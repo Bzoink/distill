@@ -9,6 +9,7 @@
 #define _POSIX_C_SOURCE 200809L
 
 #include "measure.h"
+#include "dproc.h"
 
 #include <assert.h>
 #include <stdalign.h>
@@ -110,8 +111,13 @@ static void check_heap(void)
 int main(int argc, char **argv)
 {
     (void)argc;
-    setenv("DISTILL_STACK_PROBE", "1024", 1);
+    assert(d_proc_set_environment("DISTILL_STACK_PROBE", "1024"));
+#ifdef DISTILL_WINDOWS
+    uintptr_t d_win_stack_top(void);
+    stack_top = (char **)d_win_stack_top();
+#else
     stack_top = argv;
+#endif
     recurse = real_recurse;
     d_measure_begin(argv);
     check_stack();

@@ -14,6 +14,8 @@
    Bytecode belongs to the QuickJS it was made with. This tool links the same
    libqjs as the engine, so the two cannot disagree. */
 
+#include "cutil.h"
+
 #include <quickjs.h>
 
 #include <stdio.h>
@@ -22,7 +24,7 @@
 
 static char *read_file(const char *path, size_t *length)
 {
-    FILE *file = fopen(path, "rb");
+    FILE *file = d_fopen(path, "rb");
     if (!file) return NULL;
     size_t capacity = 1 << 16, used = 0;
     char *data = malloc(capacity + 1);
@@ -58,7 +60,7 @@ int main(int argc, char **argv)
         fprintf(stderr, "usage: %s OUT.c SYMBOL module|script FILE NAME [...]\n", argv[0]);
         return 2;
     }
-    FILE *out = fopen(argv[1], "w");
+    FILE *out = d_fopen(argv[1], "w");
     if (!out) { fprintf(stderr, "distill-jsc: cannot write %s\n", argv[1]); return 2; }
     JSRuntime *runtime = JS_NewRuntime();
     JSContext *context = runtime ? JS_NewContext(runtime) : NULL;

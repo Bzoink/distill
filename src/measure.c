@@ -17,7 +17,7 @@
    calls while it writes, and never read until the program is finishing. */
 
 static const uint64_t probe_pattern = 0x5a17c0de5a17c0deu;
-static uintptr_t probe_top;     /* the initial stack pointer: argv */
+static uintptr_t probe_top;     /* the initial stack pointer or the reservation top */
 static uintptr_t probe_high;    /* the first word painted, just below this frame */
 static uintptr_t probe_low;     /* the last word painted */
 
@@ -42,7 +42,22 @@ void d_measure_begin(char **argv)
     if (kib > PROBE_MAX_KIB) kib = PROBE_MAX_KIB;
     volatile unsigned char marker = 0;
     uintptr_t here = (uintptr_t)&marker;
+#ifdef DISTILL_WINDOWS
+    /* Windows builds argv on the heap. Paint inside the main thread's
+       reserved stack and leave room for its guard and exception handling. */
+    uintptr_t d_win_stack_top(void);
+    uintptr_t top = d_win_stack_top();
+    size_t reservation = d_proc_stack_limit();
+    size_t margin = 64 * 1024 + PROBE_GAP;
+    if (!reservation || top < here || top - here >= reservation) return;
+    size_t available = reservation - (top - here);
+    if (available <= margin) return;
+    if (kib > (available - margin) / 1024) kib = (available - margin) / 1024;
+    if (!kib) return;
+    probe_top = top;
+#else
     probe_top = (uintptr_t)argv;
+#endif
     probe_high = (here - PROBE_GAP) & ~(uintptr_t)(sizeof(uint64_t) - 1);
     probe_low = probe_high - (uintptr_t)kib * 1024u;
     for (volatile uint64_t *word = (volatile uint64_t *)probe_high;

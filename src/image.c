@@ -1,4 +1,5 @@
 #include "image.h"
+#include "cutil.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -246,7 +247,7 @@ bool d_image_load_file(const char *path, DImage *out)
 {
     if (out) *out = (DImage){0};
     if (!path || !*path) { set_error("no image path"); return false; }
-    FILE *file = fopen(path, "rb");
+    FILE *file = d_fopen(path, "rb");
     if (!file) { set_error("cannot open the image file"); return false; }
     if (fseek(file, 0, SEEK_END) != 0) { fclose(file); set_error("cannot read the image file"); return false; }
     long size = ftell(file);

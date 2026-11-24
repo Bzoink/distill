@@ -60,7 +60,7 @@ if(DISTILL_RENDERER)
     endif()
 endif()
 message(STATUS "Distill renderer: ${DISTILL_HAVE_RENDERER}")
-if(DISTILL_HAVE_RENDERER)
+if(DISTILL_HAVE_RENDERER AND NOT WIN32)
     pkg_check_modules(DISTILL_GTK IMPORTED_TARGET gtk+-3.0)
     pkg_check_modules(DISTILL_CAIRO IMPORTED_TARGET cairo)
 endif()
@@ -85,7 +85,15 @@ endfunction()
 # platform supplies one source file per interface under src/platform/<os>/.
 # A port is a new directory here, chosen at configure time; nothing outside
 # src/platform/<os>/ includes an OS header (tools/platform_gate.py).
-set(DISTILL_PLATFORM "linux" CACHE STRING "Which src/platform/<os> backends to build")
+if(WIN32)
+    set(DISTILL_DEFAULT_PLATFORM windows)
+else()
+    set(DISTILL_DEFAULT_PLATFORM linux)
+endif()
+set(DISTILL_PLATFORM "${DISTILL_DEFAULT_PLATFORM}" CACHE STRING "Which src/platform/<os> backends to build")
+if(DISTILL_PLATFORM STREQUAL "windows")
+    add_compile_definitions(DISTILL_WINDOWS=1)
+endif()
 set(DISTILL_PLATFORM_DIR "${CMAKE_SOURCE_DIR}/src/platform/${DISTILL_PLATFORM}")
 
 # Keep production source ownership in a format the Muroxi build can consume
@@ -143,7 +151,11 @@ function(distill_manifest_includes target output)
     endif()
     set(result)
     foreach(include IN LISTS ${key})
-        list(APPEND result "${CMAKE_SOURCE_DIR}/${include}")
+        if(include STREQUAL "external/install/include")
+            list(APPEND result "${EXTERNAL_PREFIX}/include")
+        else()
+            list(APPEND result "${CMAKE_SOURCE_DIR}/${include}")
+        endif()
     endforeach()
     set(${output} "${result}" PARENT_SCOPE)
 endfunction()
@@ -154,8 +166,22 @@ list(REMOVE_ITEM DISTILL_PLATFORM_DEFINES DISTILL_INSTALL_DATADIR)
 list(APPEND DISTILL_PLATFORM_DEFINES
      "DISTILL_INSTALL_DATADIR=\"${CMAKE_INSTALL_FULL_DATADIR}/distill\"")
 distill_manifest_includes(distill-platform DISTILL_PLATFORM_INCLUDES)
+if(DISTILL_PLATFORM STREQUAL "windows")
+    list(FILTER DISTILL_PLATFORM_SOURCES EXCLUDE REGEX "/term[.]c$")
+endif()
 add_library(distill-platform STATIC ${DISTILL_PLATFORM_SOURCES})
 target_include_directories(distill-platform PUBLIC ${DISTILL_PLATFORM_INCLUDES})
+if(DISTILL_PLATFORM STREQUAL "windows")
+    target_link_libraries(distill-platform PUBLIC advapi32 bcrypt psapi shell32 user32)
+endif()
+
+function(distill_windows_entry target)
+    if(DISTILL_PLATFORM STREQUAL "windows")
+        target_sources(${target} PRIVATE src/platform/windows/entry.c)
+        target_compile_definitions(${target} PRIVATE main=distill_main)
+        target_link_options(${target} PRIVATE -municode "-Wl,--stack,8388608")
+    endif()
+endfunction()
 # Where data is found (src/datadir.h). No binary refers to the source tree:
 # a build tree finds its data in build/share/distill, staged below, and an
 # installed one beside itself or in the configured data directory.
@@ -167,7 +193,9 @@ foreach(entry "fonts|external/fonts" "profiles|profiles" "welcome.html|share/wel
     string(REPLACE "|" ";" pair "${entry}")
     list(GET pair 0 staged_name)
     list(GET pair 1 staged_source)
-    if(NOT EXISTS "${DISTILL_STAGED_DATA}/${staged_name}")
+    if(DISTILL_PLATFORM STREQUAL "windows")
+        file(COPY "${CMAKE_SOURCE_DIR}/${staged_source}" DESTINATION "${DISTILL_STAGED_DATA}")
+    elseif(NOT EXISTS "${DISTILL_STAGED_DATA}/${staged_name}")
         file(CREATE_LINK "${CMAKE_SOURCE_DIR}/${staged_source}"
              "${DISTILL_STAGED_DATA}/${staged_name}" SYMBOLIC)
     endif()
@@ -200,6 +228,9 @@ distill_manifest_includes(distill-image DISTILL_IMAGE_INCLUDES)
 add_library(distill-image STATIC ${DISTILL_IMAGE_SOURCES})
 target_include_directories(distill-image PUBLIC ${DISTILL_IMAGE_INCLUDES})
 target_link_libraries(distill-image PUBLIC PkgConfig::DISTILL_IMAGE)
+if(DISTILL_PLATFORM STREQUAL "windows")
+    target_link_libraries(distill-image PUBLIC distill-platform)
+endif()
 
 add_executable(distill-shaper-test tests/shaper_test.c)
 target_link_libraries(distill-shaper-test PRIVATE distill-shaper)
@@ -221,6 +252,9 @@ target_link_libraries(distill-measure PUBLIC distill-platform)
 add_executable(distill-measure-test tests/measure_test.c)
 target_include_directories(distill-measure-test PRIVATE src)
 target_link_libraries(distill-measure-test PRIVATE distill-measure)
+if(DISTILL_PLATFORM STREQUAL "windows")
+    target_link_options(distill-measure-test PRIVATE "-Wl,--stack,8388608")
+endif()
 distill_enable_assertions(distill-measure-test)
 add_test(NAME distill-measure COMMAND distill-measure-test)
 
@@ -275,10 +309,13 @@ target_include_directories(distill-media-audio SYSTEM PRIVATE "${CMAKE_SOURCE_DI
 set_source_files_properties(${DISTILL_PLATFORM_DIR}/audio.c PROPERTIES COMPILE_OPTIONS -w)
 target_link_libraries(distill-media-audio PUBLIC distill-platform Threads::Threads ${CMAKE_DL_LIBS} m)
 
-add_executable(distill-media-transfer-test tests/media_transfer_test.c)
-target_link_libraries(distill-media-transfer-test PRIVATE distill-shell)
-distill_enable_assertions(distill-media-transfer-test)
-add_test(NAME distill-media-transfer COMMAND distill-media-transfer-test)
+# The stand-in engine is a POSIX shell script and the test checks mode bits.
+if(NOT WIN32)
+    add_executable(distill-media-transfer-test tests/media_transfer_test.c)
+    target_link_libraries(distill-media-transfer-test PRIVATE distill-shell)
+    distill_enable_assertions(distill-media-transfer-test)
+    add_test(NAME distill-media-transfer COMMAND distill-media-transfer-test)
+endif()
 
 add_executable(distill-media-audio-test tests/media_audio_test.c)
 target_link_libraries(distill-media-audio-test PRIVATE distill-media-audio m)
@@ -381,23 +418,33 @@ add_test(NAME distill-reader-cells COMMAND distill-reader-cells-test)
 # The engine's own JavaScript -- linkedom, Readability and its parser -- is
 # compiled to QuickJS bytecode at build time by distill-jsc, a build-machine
 # tool linked against the same libqjs, and embedded.
-distill_manifest_sources(distill-jsc DISTILL_JSC_SOURCES)
-distill_manifest_includes(distill-jsc DISTILL_JSC_INCLUDES)
-add_executable(distill-jsc ${DISTILL_JSC_SOURCES})
-target_include_directories(distill-jsc PRIVATE ${DISTILL_JSC_INCLUDES})
-target_link_directories(distill-jsc PRIVATE "${EXTERNAL_PREFIX}/lib")
-target_link_libraries(distill-jsc PRIVATE qjs m)
-set_target_properties(distill-jsc PROPERTIES BUILD_RPATH "${EXTERNAL_PREFIX}/lib")
+set(DISTILL_HOST_JSC "" CACHE FILEPATH "Build-host distill-jsc using the target's QuickJS version")
+if(DISTILL_HOST_JSC)
+    set(DISTILL_JSC_COMMAND "${DISTILL_HOST_JSC}")
+else()
+    distill_manifest_sources(distill-jsc DISTILL_JSC_SOURCES)
+    distill_manifest_includes(distill-jsc DISTILL_JSC_INCLUDES)
+    add_executable(distill-jsc ${DISTILL_JSC_SOURCES})
+    target_include_directories(distill-jsc PRIVATE ${DISTILL_JSC_INCLUDES})
+    target_link_directories(distill-jsc PRIVATE "${EXTERNAL_PREFIX}/lib")
+    target_link_libraries(distill-jsc PRIVATE qjs m)
+    if(DISTILL_PLATFORM STREQUAL "windows")
+        target_link_libraries(distill-jsc PRIVATE distill-platform)
+        distill_windows_entry(distill-jsc)
+    endif()
+    set_target_properties(distill-jsc PROPERTIES BUILD_RPATH "${EXTERNAL_PREFIX}/lib")
+    set(DISTILL_JSC_COMMAND distill-jsc)
+endif()
 set(DISTILL_JS_LINKEDOM "${CMAKE_SOURCE_DIR}/external/js/linkedom/node_modules/linkedom/worker.js")
 set(DISTILL_JS_READABILITY_DIR "${CMAKE_SOURCE_DIR}/external/src/readability")
 set(DISTILL_EMBEDDED_JS "${CMAKE_BINARY_DIR}/generated/embedded_js.c")
 add_custom_command(
     OUTPUT "${DISTILL_EMBEDDED_JS}"
-    COMMAND distill-jsc "${DISTILL_EMBEDDED_JS}"
+    COMMAND ${DISTILL_JSC_COMMAND} "${DISTILL_EMBEDDED_JS}"
         distill_js_linkedom module "${DISTILL_JS_LINKEDOM}" linkedom/worker.js
         distill_js_jsdomparser script "${DISTILL_JS_READABILITY_DIR}/JSDOMParser.js" readability/JSDOMParser.js
         distill_js_readability script "${DISTILL_JS_READABILITY_DIR}/Readability.js" readability/Readability.js
-    DEPENDS distill-jsc "${DISTILL_JS_LINKEDOM}"
+    DEPENDS ${DISTILL_JSC_COMMAND} "${DISTILL_JS_LINKEDOM}"
         "${DISTILL_JS_READABILITY_DIR}/JSDOMParser.js" "${DISTILL_JS_READABILITY_DIR}/Readability.js"
     COMMENT "Compiling linkedom and Readability to QuickJS bytecode"
     VERBATIM)
@@ -434,6 +481,7 @@ distill_manifest_includes(distill-command DISTILL_COMMAND_INCLUDES)
 add_executable(distill ${DISTILL_COMMAND_SOURCES})
 target_include_directories(distill PRIVATE ${DISTILL_COMMAND_INCLUDES})
 target_link_libraries(distill PRIVATE distill-engine)
+distill_windows_entry(distill)
 
 # The engine in-process, many navigations in one process, each on a thread
 # with its own stack: what `check.py --in-process` drives.
@@ -442,6 +490,7 @@ distill_manifest_includes(distill-host DISTILL_HOST_INCLUDES)
 add_executable(distill-host ${DISTILL_HOST_SOURCES})
 target_include_directories(distill-host PRIVATE ${DISTILL_HOST_INCLUDES})
 target_link_libraries(distill-host PRIVATE distill-engine)
+distill_windows_entry(distill-host)
 set_target_properties(distill-host PROPERTIES BUILD_RPATH "${EXTERNAL_PREFIX}/lib")
 set_target_properties(distill PROPERTIES
     BUILD_RPATH "${EXTERNAL_PREFIX}/lib"
@@ -457,7 +506,7 @@ install(TARGETS distill RUNTIME DESTINATION bin)
 #   termbox2 master cdf62e9990d8b200768780080fb10a4e2f680051 (2026-09-03)
 #   sha256 edfa22b227c1a82a4a33ffcd1699b2903a7bff46075a210be2e8849127c63f62
 set(DISTILL_TERMBOX_DIR "${CMAKE_SOURCE_DIR}/external/src/termbox2")
-if(EXISTS "${DISTILL_TERMBOX_DIR}/termbox2.h")
+if(NOT WIN32 AND EXISTS "${DISTILL_TERMBOX_DIR}/termbox2.h")
     distill_manifest_sources(distill-termbox DISTILL_TERMBOX_SOURCES)
     distill_manifest_includes(distill-termbox DISTILL_TERMBOX_INCLUDES)
     add_library(distill-termbox STATIC ${DISTILL_TERMBOX_SOURCES})
@@ -487,7 +536,7 @@ if(EXISTS "${DISTILL_TERMBOX_DIR}/termbox2.h")
         INSTALL_RPATH "${EXTERNAL_PREFIX}/lib"
     )
     install(TARGETS distill-tui RUNTIME DESTINATION bin)
-else()
+elseif(NOT WIN32)
     message(STATUS "termbox2 not found under external/src/termbox2; skipping distill-tui")
 endif()
 # The framebuffer shell (FRAMEBUFFER_PLAN.md). distill-fb is the target: the
@@ -509,7 +558,16 @@ if(DISTILL_HAVE_RENDERER)
         distill-version
         m
     )
+    if(DISTILL_PLATFORM STREQUAL "windows")
+        list(FILTER DISTILL_FB_SOURCES EXCLUDE REGEX "/display_console[.]c$")
+    endif()
     add_executable(distill-fb ${DISTILL_FB_SOURCES})
+    if(DISTILL_PLATFORM STREQUAL "windows")
+        target_compile_definitions(distill-fb PRIVATE DISTILL_DISPLAY_WINDOWS=1 DISTILL_WINDOW_ENTRY=1)
+        set_target_properties(distill-fb PROPERTIES WIN32_EXECUTABLE TRUE)
+        target_link_libraries(distill-fb PRIVATE gdi32)
+        distill_windows_entry(distill-fb)
+    endif()
     target_include_directories(distill-fb PRIVATE ${DISTILL_FB_INCLUDES})
     target_link_libraries(distill-fb PRIVATE ${DISTILL_FB_LIBRARIES})
     set_target_properties(distill-fb PROPERTIES
@@ -518,27 +576,29 @@ if(DISTILL_HAVE_RENDERER)
     )
     install(TARGETS distill-fb RUNTIME DESTINATION bin)
 
-    add_executable(distill-fb-defect ${DISTILL_FB_SOURCES})
-    target_include_directories(distill-fb-defect PRIVATE ${DISTILL_FB_INCLUDES})
-    target_compile_definitions(distill-fb-defect PRIVATE DISTILL_DISPLAY_DEFECT=1)
-    target_link_libraries(distill-fb-defect PRIVATE ${DISTILL_FB_LIBRARIES})
-    set_target_properties(distill-fb-defect PROPERTIES BUILD_RPATH "${EXTERNAL_PREFIX}/lib")
+    if(NOT WIN32)
+        add_executable(distill-fb-defect ${DISTILL_FB_SOURCES})
+        target_include_directories(distill-fb-defect PRIVATE ${DISTILL_FB_INCLUDES})
+        target_compile_definitions(distill-fb-defect PRIVATE DISTILL_DISPLAY_DEFECT=1)
+        target_link_libraries(distill-fb-defect PRIVATE ${DISTILL_FB_LIBRARIES})
+        set_target_properties(distill-fb-defect PROPERTIES BUILD_RPATH "${EXTERNAL_PREFIX}/lib")
 
-    pkg_check_modules(DISTILL_X11 IMPORTED_TARGET x11 xext)
-    if(DISTILL_X11_FOUND)
-        add_executable(distill-fb-x11 ${DISTILL_FB_SOURCES}
-            src/platform/${DISTILL_PLATFORM}/display_x11.c)
-        target_include_directories(distill-fb-x11 PRIVATE ${DISTILL_FB_INCLUDES})
-        target_compile_definitions(distill-fb-x11 PRIVATE DISTILL_DISPLAY_X11=1)
-        target_compile_options(distill-fb-x11 PRIVATE $<$<COMPILE_LANGUAGE:C>:-Wno-pedantic>)
-        target_link_libraries(distill-fb-x11 PRIVATE ${DISTILL_FB_LIBRARIES} PkgConfig::DISTILL_X11)
-        set_target_properties(distill-fb-x11 PROPERTIES
-            BUILD_RPATH "${EXTERNAL_PREFIX}/lib"
-            INSTALL_RPATH "${EXTERNAL_PREFIX}/lib"
-        )
-        install(TARGETS distill-fb-x11 RUNTIME DESTINATION bin)
-    else()
-        message(STATUS "libX11 or libXext not found; skipping the distill-fb-x11 development build")
+        pkg_check_modules(DISTILL_X11 IMPORTED_TARGET x11 xext)
+        if(DISTILL_X11_FOUND)
+            add_executable(distill-fb-x11 ${DISTILL_FB_SOURCES}
+                src/platform/${DISTILL_PLATFORM}/display_x11.c)
+            target_include_directories(distill-fb-x11 PRIVATE ${DISTILL_FB_INCLUDES})
+            target_compile_definitions(distill-fb-x11 PRIVATE DISTILL_DISPLAY_X11=1)
+            target_compile_options(distill-fb-x11 PRIVATE $<$<COMPILE_LANGUAGE:C>:-Wno-pedantic>)
+            target_link_libraries(distill-fb-x11 PRIVATE ${DISTILL_FB_LIBRARIES} PkgConfig::DISTILL_X11)
+            set_target_properties(distill-fb-x11 PROPERTIES
+                BUILD_RPATH "${EXTERNAL_PREFIX}/lib"
+                INSTALL_RPATH "${EXTERNAL_PREFIX}/lib"
+            )
+            install(TARGETS distill-fb-x11 RUNTIME DESTINATION bin)
+        else()
+            message(STATUS "libX11 or libXext not found; skipping the distill-fb-x11 development build")
+        endif()
     endif()
 endif()
 
@@ -586,6 +646,7 @@ target_compile_definitions(distill-arm-b PRIVATE DISTILL_NO_EXTRACT=1)
 target_include_directories(distill-arm-b PRIVATE ${DISTILL_ARM_B_INCLUDES} ${CURL_INCLUDE_DIRS})
 target_link_directories(distill-arm-b PRIVATE "${EXTERNAL_PREFIX}/lib")
 target_link_libraries(distill-arm-b PRIVATE qjs CURL::libcurl distill-measure distill-version Threads::Threads ${CMAKE_DL_LIBS} m)
+distill_windows_entry(distill-arm-b)
 set_target_properties(distill-arm-b PROPERTIES
     BUILD_RPATH "${EXTERNAL_PREFIX}/lib"
     INSTALL_RPATH "${EXTERNAL_PREFIX}/lib"

@@ -15,9 +15,21 @@ static bool ascii_alpha(char c)
     return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z');
 }
 
+#ifdef DISTILL_WINDOWS
+static bool windows_path(const char *text)
+{
+    return (ascii_alpha(text[0]) && text[1] == ':' &&
+            (text[2] == '/' || text[2] == '\\')) ||
+           d_starts(text, "\\\\") || d_starts(text, ".\\") || d_starts(text, "..\\");
+}
+#endif
+
 bool d_address_looks_like_url(const char *text)
 {
     if (!text || !*text) return false;
+#ifdef DISTILL_WINDOWS
+    if (windows_path(text)) return true;
+#endif
     if (has_scheme(text, "http") || has_scheme(text, "https") || has_scheme(text, "file")) return true;
     for (const char *p = text; *p; ++p) {
         if (*p == ' ' || *p == '\t') return false;
@@ -89,6 +101,9 @@ char *d_address_resolve(const char *raw, bool *https_guessed)
     if (https_guessed) *https_guessed = false;
     char *text = trimmed(raw);
     if (!*text) { free(text); return NULL; }
+#ifdef DISTILL_WINDOWS
+    if (windows_path(text)) return text;
+#endif
     if (d_address_looks_like_url(text)) {
         if (has_scheme(text, "http") || has_scheme(text, "https") || has_scheme(text, "file") ||
             text[0] == '/' || text[0] == '~' ||

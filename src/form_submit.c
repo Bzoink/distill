@@ -13,6 +13,10 @@ bool d_page_uri_allowed(const char *uri)
 {
     if (!uri || !*uri) return false;
     if (has_scheme(uri, "http") || has_scheme(uri, "https") || has_scheme(uri, "file")) return true;
+#ifdef DISTILL_WINDOWS
+    if (((uri[0] >= 'A' && uri[0] <= 'Z') || (uri[0] >= 'a' && uri[0] <= 'z')) &&
+        uri[1] == ':' && (uri[2] == '/' || uri[2] == '\\')) return true;
+#endif
     return !strchr(uri, ':');
 }
 

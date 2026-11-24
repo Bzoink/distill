@@ -244,9 +244,17 @@ static inline double d_strtod(const char *text, char **end)
     return negative ? -value : value;
 }
 
+/* Keep paths UTF-8 at shared call sites and translate at the Windows CRT boundary. */
+#ifdef DISTILL_WINDOWS
+FILE *d_win_fopen(const char *path, const char *mode);
+#define d_fopen d_win_fopen
+#else
+#define d_fopen fopen
+#endif
+
 static inline char *d_read_file(const char *path, size_t *length)
 {
-    FILE *file = fopen(path, "rb");
+    FILE *file = d_fopen(path, "rb");
     if (!file) return NULL;
     if (fseek(file, 0, SEEK_END) != 0) { fclose(file); return NULL; }
     long size = ftell(file);

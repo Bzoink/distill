@@ -526,6 +526,11 @@ static char *file_from_url(const char *url)
     if (!d_starts(url, "file://")) return d_strdup(url);
     char *out = d_xmalloc(strlen(url) + 1);
     percent_decode(out, url + 7);
+#ifdef DISTILL_WINDOWS
+    /* file:///C:/... is a URI path, whereas the Windows CRT needs C:/... */
+    if (out[0] == '/' && isalpha((unsigned char)out[1]) && out[2] == ':')
+        memmove(out, out + 1, strlen(out));
+#endif
     return out;
 }
 
@@ -606,6 +611,11 @@ static struct curl_slist *default_request_headers(const char *referer,
 static void configure_curl_common(Engine *engine, CURL *easy, const char *referer)
 {
     curl_easy_setopt(easy, CURLOPT_SHARE, engine->share);
+#if defined(DISTILL_WINDOWS) && defined(CURLSSLOPT_NATIVE_CA)
+    const char *ca_bundle = getenv("CURL_CA_BUNDLE");
+    curl_easy_setopt(easy, CURLOPT_SSL_OPTIONS, (long)CURLSSLOPT_NATIVE_CA);
+    curl_easy_setopt(easy, CURLOPT_CAINFO, ca_bundle && *ca_bundle ? ca_bundle : NULL);
+#endif
     /* An empty COOKIEFILE enables libcurl's in-memory cookie engine. The
        share handle makes it common to the main request and all subresources.
        No file is named: a session file is read and written by the engine
@@ -3592,7 +3602,7 @@ static bool save_media_file(Engine *engine, const char *json, int media_index,
     long status = 0;
     if (ok) ok = fetch_sync(engine, url, &body, &status, NULL);
     if (ok) {
-        FILE *file = fopen(path, "wb");
+        FILE *file = d_fopen(path, "wb");
         if (!file) ok = false;
         else {
             ok = fwrite(body.data, 1, body.length, file) == body.length;
@@ -3629,7 +3639,7 @@ static bool write_cells(const char *template, int columns, int rows, const char 
 static bool write_file_bytes(const char *path, const char *data, size_t length)
 {
     if (!path || !data) return false;
-    FILE *file = fopen(path, "wb");
+    FILE *file = d_fopen(path, "wb");
     if (!file) return false;
     bool ok = fwrite(data, 1, length, file) == length;
     if (fclose(file) != 0) ok = false;
@@ -3684,9 +3694,13 @@ static bool prepare_session_file(Engine *engine, const char *path)
         note("session file %s is not a regular file\n", path);
         return false;
     case D_FS_PRIVATE_SHARED:
+#ifdef DISTILL_WINDOWS
+        note("refusing session file %s: Windows permissions allow access by other users\n", path);
+#else
         note("refusing session file %s: mode %04o is accessible to other users; "
                 "run chmod 600 on it\n",
                 path, mode);
+#endif
         return false;
     case D_FS_PRIVATE_FAILED:
         note("unable to create session file %s: %s\n", path, strerror(errno));
