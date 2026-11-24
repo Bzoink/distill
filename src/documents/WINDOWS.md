@@ -1,11 +1,16 @@
 # Distill on Windows
 
-On Windows 10 or later (x64), extract the portable ZIP and open `Distill/bin/distill-fb.exe`. The
-`distill.exe` in the same directory is the command-line engine. Keep `bin`
-and `share` together so the reader can find its fonts, site profiles and
-welcome page. The reader opens PNG, JPEG and WebP images and plays MP3, WAV
-and FLAC through WASAPI. For a list of engine options run
-`distill.exe --help` from PowerShell.
+On Windows 10 or later (x64), run `distill-<version>-windows-x64-setup.exe`.
+Setup runs without administrator privileges and defaults to
+`%LOCALAPPDATA%\Programs\Distill`. Open **Distill** from the Start menu.
+Remove it from **Settings → Apps** or run `Uninstall.exe` in the install folder.
+Uninstalling keeps your Distill settings.
+
+For a portable copy, extract the ZIP and open `Distill/bin/distill-fb.exe`.
+Keep `bin` and `share` together so the reader can find its fonts, site profiles
+and welcome page. The reader opens PNG, JPEG and WebP images and plays MP3,
+WAV and FLAC through WASAPI. `bin/distill.exe` is the command-line engine.
+For a list of engine options, run `distill.exe --help` from PowerShell.
 
 ## Build
 
@@ -41,3 +46,6 @@ python3 tools/package_windows.py --build build/windows --prefix "$prefix" \
 Pass `--prefix` more than once if the DLLs are installed into several prefixes.
 The packager uses `llvm-objdump` to follow PE imports. Use `--objdump` to
 select a different compatible executable.
+
+With NSIS 3 (`makensis`) installed, add `--installer build/distill-setup.exe`
+and `--version <version>` to make the installer from the same files.

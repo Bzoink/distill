@@ -32,6 +32,14 @@ add_compile_options($<$<COMPILE_LANGUAGE:C>:-pedantic-errors>)
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(EXTERNAL_PREFIX "${CMAKE_SOURCE_DIR}/external/install" CACHE PATH "Distill external dependency prefix")
+set(DISTILL_VENDOR_DIR "${CMAKE_SOURCE_DIR}/external" CACHE PATH "Directory containing vendored sources")
+option(DISTILL_STATIC_LEXBOR "Use the static Lexbor library from EXTERNAL_PREFIX" OFF)
+set(DISTILL_LEXBOR lexbor)
+if(DISTILL_STATIC_LEXBOR)
+    find_package(lexbor CONFIG REQUIRED PATHS "${EXTERNAL_PREFIX}/lib/cmake/lexbor"
+                 NO_DEFAULT_PATH NO_CMAKE_FIND_ROOT_PATH)
+    set(DISTILL_LEXBOR lexbor::lexbor_static)
+endif()
 
 find_package(CURL REQUIRED)
 find_package(Threads REQUIRED)
@@ -87,6 +95,12 @@ endfunction()
 # src/platform/<os>/ includes an OS header (tools/platform_gate.py).
 if(WIN32)
     set(DISTILL_DEFAULT_PLATFORM windows)
+    enable_language(RC)
+    set(DISTILL_WINDOWS_ICON "${CMAKE_SOURCE_DIR}/share/branding/distill.ico")
+    set(DISTILL_WINDOWS_RESOURCES "${CMAKE_BINARY_DIR}/generated/distill.rc")
+    configure_file(src/platform/windows/distill.rc.in "${DISTILL_WINDOWS_RESOURCES}" @ONLY)
+    set_source_files_properties("${DISTILL_WINDOWS_RESOURCES}" PROPERTIES
+                                OBJECT_DEPENDS "${DISTILL_WINDOWS_ICON}")
 else()
     set(DISTILL_DEFAULT_PLATFORM linux)
 endif()
@@ -153,6 +167,9 @@ function(distill_manifest_includes target output)
     foreach(include IN LISTS ${key})
         if(include STREQUAL "external/install/include")
             list(APPEND result "${EXTERNAL_PREFIX}/include")
+        elseif(include MATCHES "^external/src/")
+            string(REGEX REPLACE "^external/" "" relative "${include}")
+            list(APPEND result "${DISTILL_VENDOR_DIR}/${relative}")
         else()
             list(APPEND result "${CMAKE_SOURCE_DIR}/${include}")
         endif()
@@ -203,7 +220,8 @@ endforeach()
 find_program(DISTILL_PYTHON3 python3)
 if(DISTILL_PYTHON3)
     add_test(NAME distill-portable-manifest
-             COMMAND ${DISTILL_PYTHON3} ${CMAKE_SOURCE_DIR}/tools/portable_manifest.py --check)
+             COMMAND ${DISTILL_PYTHON3} ${CMAKE_SOURCE_DIR}/tools/portable_manifest.py --check
+                     --external-prefix "${EXTERNAL_PREFIX}" --vendor-dir "${DISTILL_VENDOR_DIR}")
     add_test(NAME distill-portable-manifest-self-test
              COMMAND ${DISTILL_PYTHON3} ${CMAKE_SOURCE_DIR}/tools/portable_manifest.py --self-test)
     add_test(NAME distill-portable-data
@@ -305,7 +323,7 @@ distill_manifest_sources(distill-media-audio DISTILL_MEDIA_AUDIO_SOURCES)
 distill_manifest_includes(distill-media-audio DISTILL_MEDIA_AUDIO_INCLUDES)
 add_library(distill-media-audio STATIC ${DISTILL_MEDIA_AUDIO_SOURCES})
 target_include_directories(distill-media-audio PUBLIC ${DISTILL_MEDIA_AUDIO_INCLUDES})
-target_include_directories(distill-media-audio SYSTEM PRIVATE "${CMAKE_SOURCE_DIR}/external/src/miniaudio")
+target_include_directories(distill-media-audio SYSTEM PRIVATE "${DISTILL_VENDOR_DIR}/src/miniaudio")
 set_source_files_properties(${DISTILL_PLATFORM_DIR}/audio.c PROPERTIES COMPILE_OPTIONS -w)
 target_link_libraries(distill-media-audio PUBLIC distill-platform Threads::Threads ${CMAKE_DL_LIBS} m)
 
@@ -350,7 +368,7 @@ if(DISTILL_HAVE_RENDERER)
     add_library(distill-layout STATIC ${DISTILL_LAYOUT_SOURCES})
     target_include_directories(distill-layout PUBLIC ${DISTILL_LAYOUT_INCLUDES})
     target_link_directories(distill-layout PUBLIC "${EXTERNAL_PREFIX}/lib")
-    target_link_libraries(distill-layout PUBLIC lexbor distill-render-core m)
+    target_link_libraries(distill-layout PUBLIC ${DISTILL_LEXBOR} distill-render-core m)
     add_executable(distill-layout-reader tests/layout_dump.c)
     target_link_libraries(distill-layout-reader PRIVATE distill-layout distill-render-core distill-paint)
     add_executable(distill-layout-paint tests/paint_tool.c)
@@ -367,7 +385,7 @@ if(DISTILL_HAVE_RENDERER)
     target_compile_definitions(distill-layout-defect PRIVATE DISTILL_LAYOUT_DEFECT=1)
     target_include_directories(distill-layout-defect PUBLIC ${DISTILL_LAYOUT_INCLUDES})
     target_link_directories(distill-layout-defect PUBLIC "${EXTERNAL_PREFIX}/lib")
-    target_link_libraries(distill-layout-defect PUBLIC lexbor distill-render-core m)
+    target_link_libraries(distill-layout-defect PUBLIC ${DISTILL_LEXBOR} distill-render-core m)
     add_executable(distill-layout-defect-paint tests/paint_tool.c)
     target_link_libraries(distill-layout-defect-paint PRIVATE distill-layout-defect distill-render-core distill-paint)
 
@@ -398,7 +416,7 @@ distill_manifest_includes(distill-reader DISTILL_READER_INCLUDES)
 add_library(distill-reader STATIC ${DISTILL_READER_SOURCES})
 target_include_directories(distill-reader PUBLIC ${DISTILL_READER_INCLUDES})
 target_link_directories(distill-reader PUBLIC "${EXTERNAL_PREFIX}/lib")
-target_link_libraries(distill-reader PUBLIC lexbor distill-shaper)
+target_link_libraries(distill-reader PUBLIC ${DISTILL_LEXBOR} distill-shaper)
 
 add_executable(distill-reader-cells-test tests/reader_cells_test.c)
 target_link_libraries(distill-reader-cells-test PRIVATE distill-reader)
@@ -435,8 +453,8 @@ else()
     set_target_properties(distill-jsc PROPERTIES BUILD_RPATH "${EXTERNAL_PREFIX}/lib")
     set(DISTILL_JSC_COMMAND distill-jsc)
 endif()
-set(DISTILL_JS_LINKEDOM "${CMAKE_SOURCE_DIR}/external/js/linkedom/node_modules/linkedom/worker.js")
-set(DISTILL_JS_READABILITY_DIR "${CMAKE_SOURCE_DIR}/external/src/readability")
+set(DISTILL_JS_LINKEDOM "${DISTILL_VENDOR_DIR}/js/linkedom/node_modules/linkedom/worker.js")
+set(DISTILL_JS_READABILITY_DIR "${DISTILL_VENDOR_DIR}/src/readability")
 set(DISTILL_EMBEDDED_JS "${CMAKE_BINARY_DIR}/generated/embedded_js.c")
 add_custom_command(
     OUTPUT "${DISTILL_EMBEDDED_JS}"
@@ -461,7 +479,7 @@ target_include_directories(distill-engine PUBLIC ${DISTILL_ENGINE_INCLUDES} PRIV
 target_link_directories(distill-engine PUBLIC "${EXTERNAL_PREFIX}/lib")
 target_link_libraries(distill-engine PUBLIC
     qjs
-    lexbor
+    ${DISTILL_LEXBOR}
     CURL::libcurl
     Threads::Threads
     distill-image
@@ -479,6 +497,9 @@ endif()
 distill_manifest_sources(distill-command DISTILL_COMMAND_SOURCES)
 distill_manifest_includes(distill-command DISTILL_COMMAND_INCLUDES)
 add_executable(distill ${DISTILL_COMMAND_SOURCES})
+if(WIN32)
+    target_sources(distill PRIVATE "${DISTILL_WINDOWS_RESOURCES}")
+endif()
 target_include_directories(distill PRIVATE ${DISTILL_COMMAND_INCLUDES})
 target_link_libraries(distill PRIVATE distill-engine)
 distill_windows_entry(distill)
@@ -505,7 +526,7 @@ install(TARGETS distill RUNTIME DESTINATION bin)
 # master are what a reader whose output is gated needs.
 #   termbox2 master cdf62e9990d8b200768780080fb10a4e2f680051 (2026-09-03)
 #   sha256 edfa22b227c1a82a4a33ffcd1699b2903a7bff46075a210be2e8849127c63f62
-set(DISTILL_TERMBOX_DIR "${CMAKE_SOURCE_DIR}/external/src/termbox2")
+set(DISTILL_TERMBOX_DIR "${DISTILL_VENDOR_DIR}/src/termbox2")
 if(NOT WIN32 AND EXISTS "${DISTILL_TERMBOX_DIR}/termbox2.h")
     distill_manifest_sources(distill-termbox DISTILL_TERMBOX_SOURCES)
     distill_manifest_includes(distill-termbox DISTILL_TERMBOX_INCLUDES)
@@ -537,7 +558,7 @@ if(NOT WIN32 AND EXISTS "${DISTILL_TERMBOX_DIR}/termbox2.h")
     )
     install(TARGETS distill-tui RUNTIME DESTINATION bin)
 elseif(NOT WIN32)
-    message(STATUS "termbox2 not found under external/src/termbox2; skipping distill-tui")
+    message(STATUS "termbox2 not found under ${DISTILL_TERMBOX_DIR}; skipping distill-tui")
 endif()
 # The framebuffer shell (FRAMEBUFFER_PLAN.md). distill-fb is the target: the
 # console sink, the memory sink the gates drive, and nothing that links GLib,
@@ -563,6 +584,7 @@ if(DISTILL_HAVE_RENDERER)
     endif()
     add_executable(distill-fb ${DISTILL_FB_SOURCES})
     if(DISTILL_PLATFORM STREQUAL "windows")
+        target_sources(distill-fb PRIVATE "${DISTILL_WINDOWS_RESOURCES}")
         target_compile_definitions(distill-fb PRIVATE DISTILL_DISPLAY_WINDOWS=1 DISTILL_WINDOW_ENTRY=1)
         set_target_properties(distill-fb PROPERTIES WIN32_EXECUTABLE TRUE)
         target_link_libraries(distill-fb PRIVATE gdi32)
@@ -635,6 +657,14 @@ if(DISTILL_HAVE_RENDERER AND DISTILL_GTK_FOUND)
         INSTALL_RPATH "${EXTERNAL_PREFIX}/lib"
     )
     install(TARGETS distill-gtk RUNTIME DESTINATION bin)
+    install(FILES share/branding/org.distill.Reader.desktop
+            DESTINATION "${CMAKE_INSTALL_DATADIR}/applications")
+    install(FILES share/branding/distill-icon.svg
+            DESTINATION "${CMAKE_INSTALL_DATADIR}/icons/hicolor/scalable/apps"
+            RENAME org.distill.Reader.svg)
+    install(FILES share/branding/distill-48.png
+            DESTINATION "${CMAKE_INSTALL_DATADIR}/icons/hicolor/48x48/apps"
+            RENAME org.distill.Reader.png)
 else()
     message(STATUS "GTK3 or the renderer not found; skipping optional distill-gtk desktop shell")
 endif()

@@ -52,13 +52,13 @@ def collect_binaries(build, prefixes, objdump, destination):
     return len(collected) - 2
 
 
-def copy_licenses(prefixes, destination):
+def copy_licenses(prefixes, destination, vendor_dir=ROOT / "external", *, termbox=False):
     for prefix in prefixes:
         licenses = prefix / "share/licenses"
         if licenses.is_dir():
             shutil.copytree(licenses, destination, dirs_exist_ok=True)
-    vendored = ROOT / "external/src"
-    linkedom = ROOT / "external/js/linkedom/node_modules"
+    vendored = vendor_dir / "src"
+    linkedom = vendor_dir / "js/linkedom/node_modules"
     for folder in (vendored / "quickjs", vendored / "lexbor", *sorted(linkedom.iterdir())):
         if not folder.is_dir() or folder.name.startswith("."):
             continue
@@ -78,12 +78,56 @@ def copy_licenses(prefixes, destination):
 
     readability = destination / "readability"
     readability.mkdir(exist_ok=True)
-    shutil.copy2(vendored / "lexbor/LICENSE", readability / "LICENSE")
+    readability_source = vendored / "readability"
+    license_path = readability_source / "LICENSE.md"
+    if not license_path.is_file():
+        license_path = vendored / "lexbor/LICENSE"
+    shutil.copy2(license_path, readability / "LICENSE")
     notices = []
+    upstream_notice = readability_source / "NOTICE"
+    if upstream_notice.is_file():
+        notices.append(upstream_notice.read_text(encoding="utf-8").strip())
     for name in ("Readability.js", "JSDOMParser.js"):
-        source = (vendored / "readability" / name).read_text(encoding="utf-8")
+        source = (readability_source / name).read_text(encoding="utf-8")
         notices.append(name + "\n" + source.split("*/", 1)[0].removeprefix("/*").strip())
     (readability / "NOTICE").write_text("\n\n".join(notices) + "\n", encoding="utf-8")
+    if termbox:
+        source = (vendored / "termbox2/termbox2.h").read_text(encoding="utf-8")
+        folder = destination / "termbox2"
+        folder.mkdir(exist_ok=True)
+        (folder / "LICENSE").write_text(
+            source.split("*/", 1)[0].removeprefix("/*").strip() + "\n", encoding="utf-8")
+
+
+def build_installer(payload, output, version):
+    if not re.fullmatch(r"[0-9]+(?:\.[0-9]+){0,3}", version):
+        raise ValueError(f"invalid installer version: {version}")
+    parts = version.split(".")
+    file_version = ".".join(parts + ["0"] * (4 - len(parts)))
+
+    def installed_path(path):
+        relative = "\\".join(path.relative_to(payload).parts).replace("$", "$$")
+        return f'"$INSTDIR\\{relative}"'
+
+    entries = sorted(payload.rglob("*"))
+    with (payload.parent / "payload.nsh").open("w", encoding="utf-8") as manifest:
+        # Delete only shipped files, even when Distill shares a custom directory.
+        print("!macro DeletePayload", file=manifest)
+        for path in entries:
+            if path.is_file():
+                print(f"    Delete {installed_path(path)}", file=manifest)
+        print("!macroend\n!macro PrunePayloadDirectories", file=manifest)
+        for path in reversed(entries):
+            if path.is_dir():
+                print(f"    RMDir {installed_path(path)}", file=manifest)
+        print("!macroend", file=manifest)
+
+    subprocess.run(["makensis", "-V2", "-WX", "-NOCD", f"-DDISTILL_VERSION={version}",
+                    f"-DDISTILL_FILE_VERSION={file_version}", ROOT / "tools/distill.nsi"],
+                   cwd=payload.parent, check=True)
+    output.parent.mkdir(parents=True, exist_ok=True)
+    shutil.move(payload.parent / "Distill-Setup.exe", output)
+    print(f"{output}: per-user NSIS installer")
 
 
 def main():
@@ -92,8 +136,15 @@ def main():
     parser.add_argument("--prefix", type=Path, action="append", required=True,
                         help="dependency prefix with bin/ and share/licenses/; may repeat")
     parser.add_argument("--objdump", default="llvm-objdump")
+    parser.add_argument("--vendor-dir", type=Path, default=ROOT / "external")
     parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument("--installer", type=Path, help="also write an NSIS installer to this path")
+    parser.add_argument("--version", help="Distill release version for the installer")
     args = parser.parse_args()
+    if args.installer and not args.version:
+        parser.error("--installer requires --version")
+    if args.installer and args.installer.resolve() == args.output.resolve():
+        parser.error("the ZIP and installer must have different output paths")
     with tempfile.TemporaryDirectory(prefix="distill-win-package-") as work:
         root = Path(work) / "Distill"
         binaries = root / "bin"
@@ -103,7 +154,7 @@ def main():
         shutil.copytree(ROOT / "external/fonts", data / "fonts")
         shutil.copytree(ROOT / "profiles", data / "profiles")
         shutil.copy2(ROOT / "share/welcome.html", data / "welcome.html")
-        copy_licenses(args.prefix, root / "licenses")
+        copy_licenses(args.prefix, root / "licenses", args.vendor_dir)
         shutil.copy2(ROOT / "src/documents/WINDOWS.md", root / "WINDOWS.md")
         args.output.parent.mkdir(parents=True, exist_ok=True)
         with zipfile.ZipFile(args.output, "w", zipfile.ZIP_DEFLATED) as archive:
@@ -111,6 +162,8 @@ def main():
                 if path.is_file():
                     archive.write(path, path.relative_to(root.parent))
         print(f"{args.output}: two executables and {count} DLLs")
+        if args.installer:
+            build_installer(root, args.installer, args.version)
 
 
 if __name__ == "__main__":

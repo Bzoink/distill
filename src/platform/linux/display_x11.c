@@ -13,14 +13,17 @@
 
 #define _POSIX_C_SOURCE 200809L
 
+#include "app_icon.h"
 #include "cutil.h"
 #include "display_sink.h"
 
+#include <X11/Xatom.h>
 #include <X11/Xlib.h>
 #include <X11/Xutil.h>
 #include <X11/extensions/XShm.h>
 #include <X11/keysym.h>
 #include <locale.h>
+#include <png.h>
 #include <sys/ipc.h>
 #include <sys/shm.h>
 
@@ -44,6 +47,33 @@ typedef struct {
     size_t head, count;
     char *title;
 } X11Display;
+
+static void set_window_icon(X11Display *d)
+{
+    png_image image = {.version = PNG_IMAGE_VERSION};
+    if (png_image_begin_read_from_memory(&image, distill_icon_48_png, sizeof(distill_icon_48_png))) {
+        image.format = PNG_FORMAT_RGBA;
+        unsigned char *rgba = d_xcalloc(PNG_IMAGE_SIZE(image), 1);
+        if (png_image_finish_read(&image, NULL, rgba, 0, NULL)) {
+            size_t count = (size_t)image.width * image.height;
+            /* Xlib expects a long for each 32-bit value. Pixels are straight ARGB. */
+            unsigned long *icon = d_xcalloc(count + 2, sizeof(*icon));
+            icon[0] = image.width;
+            icon[1] = image.height;
+            for (size_t i = 0; i < count; ++i) {
+                const unsigned char *pixel = rgba + i * 4;
+                icon[i + 2] = (unsigned long)pixel[3] << 24 | (unsigned long)pixel[0] << 16 |
+                              (unsigned long)pixel[1] << 8 | pixel[2];
+            }
+            Atom name = XInternAtom(d->x, "_NET_WM_ICON", False);
+            XChangeProperty(d->x, d->window, name, XA_CARDINAL, 32, PropModeReplace,
+                            (const unsigned char *)icon, (int)(count + 2));
+            free(icon);
+        }
+        free(rgba);
+    }
+    png_image_free(&image);
+}
 
 static void enqueue(X11Display *d, DEvent event)
 {
@@ -337,6 +367,7 @@ DDisplay *d_display_x11_open(const char *spec, char **error)
     d->delete_window = XInternAtom(x, "WM_DELETE_WINDOW", False);
     XSetWMProtocols(x, d->window, &d->delete_window, 1);
     Xutf8SetWMProperties(x, d->window, "Distill", "Distill", NULL, 0, NULL, NULL, NULL);
+    set_window_icon(d);
     /* Only the character type, which an input method needs to hand back
        UTF-8; numbers are never read through the locale (cutil.h d_strtod). */
     setlocale(LC_CTYPE, "");

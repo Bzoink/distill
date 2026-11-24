@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=Distill
+Comment=Read web pages
+Exec=distill-gtk
+TryExec=distill-gtk
+Icon=org.distill.Reader
+Terminal=false
+Categories=Network;

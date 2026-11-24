@@ -3387,17 +3387,9 @@ static void app_destroy(GtkWidget *widget, gpointer opaque)
     app_unref(app);
 }
 
-/* The window's own icon, carried in the binary rather than installed beside
-   it. On X11 this is the whole story: the pixbufs become _NET_WM_ICON on
-   every window, and the task bar and alt-tab read them with no desktop entry
-   and no icon theme involved. A Wayland compositor ignores _NET_WM_ICON and
-   looks up a desktop entry by application id instead, so that case needs the
-   file share/branding/README.md describes -- this is not a substitute for it,
-   only the half that works without installing anything.
-
-   PNG rather than the SVG it was drawn from, because gdk-pixbuf has PNG built
-   in while SVG wants librsvg's loader; a missing loader would mean no icon
-   and no explanation. */
+/* Embedded PNGs let GTK set _NET_WM_ICON on X11, including when Distill runs
+   from an extracted archive. Wayland uses the installed org.distill.Reader
+   desktop entry and its icon theme assets. */
 static void install_window_icon(void)
 {
     GList *icons = NULL;

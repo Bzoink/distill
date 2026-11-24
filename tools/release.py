@@ -1,0 +1,300 @@
+#!/usr/bin/env python3
+"""Build and package Distill for Linux x64 and Windows x64 from Linux."""
+
+import argparse
+import fcntl
+import hashlib
+import os
+from pathlib import Path
+import platform
+import re
+import shlex
+import shutil
+import subprocess
+import sys
+import tarfile
+import tempfile
+
+from package_windows import copy_licenses
+
+ROOT = Path(__file__).resolve().parents[1]
+LINUX_BINARIES = (
+    "distill", "distill-gtk", "distill-tui", "distill-fb", "distill-fb-x11", "distill-arm-b",
+)
+RAW = "https://raw.githubusercontent.com"
+READABILITY = f"{RAW}/mozilla/readability/ab4027a8b37669745016869a37a504727992b2ba"
+ARCHIVES = {
+    "quickjs": (
+        "https://codeload.github.com/quickjs-ng/quickjs/tar.gz/9b061718955874e648d8c2bf2910a717aac8fa63",
+        "3d85841fc0a50000c41706c387ff994f2fe187a59ca4b2badc07195d54a8f555",
+    ),
+    "lexbor": (
+        "https://codeload.github.com/lexbor/lexbor/tar.gz/f4cbbcd91359a0ec9499e3ce7e263de629482d61",
+        "8efad1999022e872fee2f911e92aaf4bbd6b32185b2e803cab207e3e5ac66f5d",
+    ),
+}
+SOURCES = {
+    "miniaudio/miniaudio.h": (
+        f"{RAW}/mackron/miniaudio/0.11.25/miniaudio.h",
+        "ac7af4de748b7e26b777f37e01cee313a308a7296a3eb080e2906b320cc55c89",
+    ),
+    "termbox2/termbox2.h": (
+        f"{RAW}/termbox/termbox2/cdf62e9990d8b200768780080fb10a4e2f680051/termbox2.h",
+        "edfa22b227c1a82a4a33ffcd1699b2903a7bff46075a210be2e8849127c63f62",
+    ),
+    "readability/JSDOMParser.js": (
+        f"{READABILITY}/JSDOMParser.js",
+        "c33bdfb5b3b27672ad8470199fb6852e8b5223eeb1342ae3a9ff393e5bf50a2d",
+    ),
+    "readability/Readability.js": (
+        f"{READABILITY}/Readability.js",
+        "e9330028c8a5a4aa7d75147be2605d520f7f213c7b28474947dc0e9c984e9bed",
+    ),
+    "readability/LICENSE.md": (
+        f"{READABILITY}/LICENSE.md",
+        "cfc7749b96f63bd31c3c42b5c471bf756814053e847c10f3eb003417bc523d30",
+    ),
+    "readability/NOTICE": (
+        f"{READABILITY}/NOTICE",
+        "21d526d361caf2b1ca578820ef1113982da5c094878a26bdd7ad555f84946f54",
+    ),
+}
+
+
+def run(*command, **kwargs):
+    command = [os.fspath(part) for part in command]
+    print("+ " + shlex.join(command), flush=True)
+    subprocess.run(command, check=True, **kwargs)
+
+
+def executable(name):
+    path = shutil.which(name)
+    if path is None:
+        raise ValueError(f"required executable not found: {name}")
+    return os.path.abspath(path)
+
+
+def sha256(path):
+    with path.open("rb") as handle:
+        return hashlib.file_digest(handle, "sha256").hexdigest()
+
+
+def download(cache, url, expected):
+    path = cache / expected
+    if path.is_file() and sha256(path) == expected:
+        return path
+    with tempfile.TemporaryDirectory(dir=cache) as temporary:
+        candidate = Path(temporary) / "download"
+        run("curl", "-fLsS", "--retry", "2", "-o", candidate, url)
+        if sha256(candidate) != expected:
+            raise ValueError(f"SHA-256 mismatch for {url}")
+        candidate.replace(path)
+    return path
+
+
+def prepare_vendor(work, cache):
+    vendor = work / "vendor"
+    sources = vendor / "src"
+    sources.mkdir(parents=True)
+    cache.mkdir(parents=True, exist_ok=True)
+    for name, pin in ARCHIVES.items():
+        with tempfile.TemporaryDirectory(dir=work) as unpack:
+            unpack = Path(unpack)
+            with tarfile.open(download(cache, *pin), "r:gz") as archive:
+                archive.extractall(unpack, filter="data")
+            [source] = unpack.iterdir()
+            source.rename(sources / name)
+    for name, pin in SOURCES.items():
+        destination = sources / name
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(download(cache, *pin), destination)
+    js = vendor / "js/linkedom"
+    shutil.copytree(ROOT / "tools/release-deps", js)
+    run("npm", "ci", "--ignore-scripts", "--no-audit", "--no-fund", "--prefer-offline",
+        "--cache", cache / "npm", cwd=js)
+    return vendor
+
+
+def configure(source, build, flags, env):
+    run("cmake", "-S", source, "-B", build, "-G", "Ninja",
+        "-DCMAKE_BUILD_TYPE=Release", *flags, env=env)
+
+
+def build_dependencies(vendor, work, flags, env, jobs):
+    prefix = work / "prefix"
+    quickjs = work / "quickjs"
+    quickjs_source = vendor / "src/quickjs"
+    configure(quickjs_source, quickjs, [*flags, "-DBUILD_SHARED_LIBS=OFF"], env)
+    run("cmake", "--build", quickjs, "--parallel", jobs, "--target", "qjs", env=env)
+    (prefix / "include").mkdir(parents=True)
+    (prefix / "lib").mkdir()
+    shutil.copy2(quickjs_source / "quickjs.h", prefix / "include")
+    shutil.copy2(quickjs / "libqjs.a", prefix / "lib")
+
+    lexbor = work / "lexbor"
+    configure(vendor / "src/lexbor", lexbor,
+              [*flags, "-DLEXBOR_BUILD_STATIC=ON", "-DLEXBOR_BUILD_SHARED=OFF",
+               "-DCMAKE_INSTALL_LIBDIR=lib", f"-DCMAKE_INSTALL_PREFIX={prefix}"], env)
+    run("cmake", "--build", lexbor, "--parallel", jobs, env=env)
+    run("cmake", "--install", lexbor, env=env)
+    return prefix
+
+
+def configure_distill(vendor, work, flags, env, jobs, extra=()):
+    prefix = build_dependencies(vendor, work, flags, env, jobs)
+    build = work / "distill"
+    configure(ROOT, build, [*flags, f"-DEXTERNAL_PREFIX={prefix}",
+                            f"-DDISTILL_VENDOR_DIR={vendor}", "-DDISTILL_STATIC_LEXBOR=ON",
+                            "-DCMAKE_SKIP_INSTALL_RPATH=ON", *extra], env)
+    return build
+
+
+def project_version(build):
+    header = (build / "generated/distill_version.h").read_text(encoding="utf-8")
+    match = re.search(r'^#define DISTILL_VERSION "([0-9]+(?:\.[0-9]+)*)"$', header, re.MULTILINE)
+    if match is None:
+        raise ValueError("missing version in generated distill_version.h")
+    return match[1]
+
+
+def package_linux(build, vendor, archive):
+    with tempfile.TemporaryDirectory() as staging:
+        root = Path(staging) / "Distill"
+        run("cmake", "--install", build, "--prefix", root)
+        for name in LINUX_BINARIES:
+            binary = root / "bin" / name
+            if not binary.is_file():
+                raise ValueError(f"Linux build did not install {name}. Check the development libraries.")
+            libraries = subprocess.check_output(["ldd", binary], text=True,
+                                                env={**os.environ, "LC_ALL": "C"})
+            if "not found" in libraries:
+                raise ValueError(f"unresolved Linux runtime libraries for {name}\n{libraries}")
+        run(root / "bin/distill", "--version", cwd=root.parent)
+        copy_licenses([], root / "licenses", vendor, termbox=True)
+        with tarfile.open(archive, "w:gz") as package:
+            package.add(root, arcname=root.name)
+
+
+def windows_settings(prefix, toolchain, work):
+    def tool(name):
+        return executable(toolchain / name if toolchain else name)
+
+    compiler = "x86_64-w64-mingw32"
+    flags = [
+        "-DCMAKE_SYSTEM_NAME=Windows", "-DCMAKE_SYSTEM_PROCESSOR=x86_64",
+        f"-DCMAKE_C_COMPILER={tool(compiler + '-clang')}",
+        f"-DCMAKE_CXX_COMPILER={tool(compiler + '-clang++')}",
+        f"-DCMAKE_FIND_ROOT_PATH={prefix}",
+        "-DCMAKE_FIND_ROOT_PATH_MODE_PROGRAM=NEVER",
+        "-DCMAKE_FIND_ROOT_PATH_MODE_LIBRARY=ONLY",
+        "-DCMAKE_FIND_ROOT_PATH_MODE_INCLUDE=ONLY",
+        "-DCMAKE_FIND_ROOT_PATH_MODE_PACKAGE=ONLY",
+    ]
+    libcurl = prefix / "lib/libcurl.dll.a"
+    if (not libcurl.is_file() or not (prefix / "lib/pkgconfig").is_dir()
+            or not (prefix / "bin").is_dir()):
+        raise ValueError(f"expected a Windows x64 UCRT dependency prefix at {prefix}")
+    # MSYS2 .pc files use /ucrt64, including hard-coded paths in libjpeg.pc.
+    # Give pkg-config that layout even if the caller named the prefix differently.
+    ucrt64 = work / "ucrt64"
+    ucrt64.symlink_to(prefix, target_is_directory=True)
+    env = dict(os.environ)
+    env.pop("PKG_CONFIG_PATH", None)
+    env["PKG_CONFIG_SYSROOT_DIR"] = str(work)
+    env["PKG_CONFIG_LIBDIR"] = os.pathsep.join(
+        str(ucrt64 / path) for path in ("lib/pkgconfig", "share/pkgconfig"))
+    extra = [
+        f"-DCMAKE_RC_COMPILER={tool(compiler + '-windres')}",
+        "-DPKG_CONFIG_USE_CMAKE_PREFIX_PATH=OFF",
+        "-DCURL_NO_CURL_CMAKE=ON", f"-DCURL_LIBRARY={libcurl}",
+        f"-DCURL_INCLUDE_DIR={prefix / 'include'}",
+    ]
+    return flags, env, extra, tool("llvm-objdump")
+
+
+def publish_packages(staged, destination):
+    archives = sorted(staged.iterdir())
+    checksums = []
+    for archive in archives:
+        checksum = archive.with_name(archive.name + ".sha256")
+        checksum.write_text(f"{sha256(archive)}  {archive.name}\n", encoding="ascii")
+        checksums.append(checksum)
+
+    directory = os.open(destination, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        fcntl.flock(directory, fcntl.LOCK_EX)
+        for file in archives + checksums:
+            file.replace(destination / file.name)
+    finally:
+        os.close(directory)
+    for archive in archives:
+        print(destination / archive.name, flush=True)
+
+
+def release(args):
+    for command in ("cmake", "ninja", "pkg-config", "curl", "npm"):
+        executable(command)
+    native_flags = [f"-DCMAKE_C_COMPILER={executable('clang')}",
+                    f"-DCMAKE_CXX_COMPILER={executable('clang++')}"]
+    linux = args.target != "windows"
+    windows = args.target != "linux"
+    if linux:
+        executable("ctest")
+        executable("ldd")
+    if windows:
+        executable("makensis")
+    jobs = str(args.jobs)
+    args.output_dir.mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory(prefix="distill-release-") as work, \
+         tempfile.TemporaryDirectory(dir=args.output_dir) as output:
+        work = Path(work)
+        output = Path(output)
+        if windows:
+            prefix = args.windows_prefix.resolve()
+            flags, env, extra, objdump = windows_settings(prefix, args.windows_toolchain, work)
+        vendor = prepare_vendor(work, ROOT / "build/release-cache")
+        native = configure_distill(vendor, work / "linux", native_flags, None, jobs)
+        version = project_version(native)
+        if linux:
+            run("cmake", "--build", native, "--parallel", jobs)
+            run("ctest", "--test-dir", native, "--output-on-failure")
+            package_linux(native, vendor, output / f"distill-{version}-linux-x64.tar.gz")
+        if windows:
+            if not linux:
+                run("cmake", "--build", native, "--parallel", jobs, "--target", "distill-jsc")
+            target = configure_distill(vendor, work / "windows", flags, env, jobs,
+                                       [*extra, f"-DDISTILL_HOST_JSC={native / 'distill-jsc'}"])
+            run("cmake", "--build", target, "--parallel", jobs, env=env)
+            run(sys.executable, ROOT / "tools/package_windows.py", "--build", target,
+                "--prefix", prefix, "--vendor-dir", vendor, "--objdump", objdump,
+                "--output", output / f"distill-{version}-windows-x64.zip",
+                "--installer", output / f"distill-{version}-windows-x64-setup.exe",
+                "--version", version)
+
+        publish_packages(output, args.output_dir)
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--target", choices=("all", "linux", "windows"), default="all")
+    parser.add_argument("--windows-prefix", type=Path, help="MSYS2-style Windows x64 UCRT dependencies")
+    parser.add_argument("--windows-toolchain", type=Path, help="LLVM-MinGW bin directory (defaults to PATH)")
+    parser.add_argument("--output-dir", type=Path, default=ROOT / "build/releases")
+    parser.add_argument("--jobs", type=int, default=os.cpu_count() or 1)
+    args = parser.parse_args()
+    if platform.system() != "Linux" or platform.machine() != "x86_64":
+        parser.error("the release script requires an x86-64 Linux build host")
+    if args.target != "linux" and args.windows_prefix is None:
+        parser.error("--windows-prefix is required for the Windows build")
+    if args.jobs < 1:
+        parser.error("--jobs must be positive")
+    try:
+        release(args)
+    except (OSError, ValueError, subprocess.CalledProcessError) as error:
+        print(f"distill release: {error}", file=sys.stderr)
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

@@ -44,11 +44,15 @@ def expand(path, platform, external):
     return path.replace("{platform}", platform).replace("{external}", external)
 
 
-def validate(manifest, root, platform):
+def validate(manifest, root, platform, external_prefix=None, vendor_dir=None):
     entries = fields(manifest)
     seen = set()
     problems = []
-    external = os.path.relpath(root / "external" / "install", root)
+    if external_prefix is None:
+        external_prefix = root / "external/install"
+    if vendor_dir is None:
+        vendor_dir = root / "external"
+    external = os.path.relpath(external_prefix, root)
     for number, target, sources, defines, includes in entries:
         if target in seen:
             problems.append(f"{manifest}:{number}: duplicate target {target}")
@@ -59,6 +63,10 @@ def validate(manifest, root, platform):
         for relative in sources + includes:
             expanded = expand(relative, platform, external)
             candidate = root / expanded
+            if relative == "external/install/include":
+                candidate = external_prefix / "include"
+            elif relative.startswith("external/src/"):
+                candidate = vendor_dir / expanded.removeprefix("external/")
             if not candidate.exists():
                 kind = "source" if relative in sources else "include directory"
                 problems.append(f"{manifest}:{number}: missing {kind} {relative!r} ({candidate})")
@@ -98,6 +106,8 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--manifest", type=Path, default=DEFAULT_MANIFEST)
     parser.add_argument("--root", type=Path, default=ROOT)
+    parser.add_argument("--external-prefix", type=Path)
+    parser.add_argument("--vendor-dir", type=Path)
     parser.add_argument("--platform", default="linux")
     parser.add_argument("--check", action="store_true", help="validate the manifest (the default)")
     parser.add_argument("--self-test", action="store_true")
@@ -105,7 +115,8 @@ def main():
     if args.self_test:
         return self_test()
     try:
-        entries, problems = validate(args.manifest, args.root, args.platform)
+        entries, problems = validate(args.manifest, args.root, args.platform,
+                                     args.external_prefix, args.vendor_dir)
     except (OSError, ValueError) as error:
         print(f"portable manifest: {error}", file=sys.stderr)
         return 1

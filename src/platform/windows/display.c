@@ -1,4 +1,5 @@
 #include "display_sink.h"
+#include "resource.h"
 #include "win.h"
 
 #include <windowsx.h>
@@ -267,11 +268,16 @@ DDisplay *d_display_open(const char *spec, char **error)
         return NULL;
     }
     HINSTANCE instance = GetModuleHandleW(NULL);
-    WNDCLASSW type = {.lpfnWndProc = window_proc, .hInstance = instance,
-                      .hCursor = LoadCursorW(NULL, MAKEINTRESOURCEW(32512)),
-                      .hIcon = LoadIconW(NULL, MAKEINTRESOURCEW(32512)),
-                      .lpszClassName = L"DistillReaderWindow"};
-    if (!RegisterClassW(&type) && GetLastError() != ERROR_CLASS_ALREADY_EXISTS) {
+    const wchar_t *icon = MAKEINTRESOURCEW(IDI_DISTILL);
+    WNDCLASSEXW type = {
+        .cbSize = sizeof(type), .lpfnWndProc = window_proc, .hInstance = instance,
+        .hCursor = LoadCursorW(NULL, MAKEINTRESOURCEW(32512)),
+        .hIcon = LoadIconW(instance, icon),
+        .hIconSm = LoadImageW(instance, icon, IMAGE_ICON, GetSystemMetrics(SM_CXSMICON),
+                              GetSystemMetrics(SM_CYSMICON), LR_SHARED),
+        .lpszClassName = L"DistillReaderWindow"
+    };
+    if (!RegisterClassExW(&type) && GetLastError() != ERROR_CLASS_ALREADY_EXISTS) {
         d_win_error(error, "could not register the Distill window", GetLastError());
         return NULL;
     }

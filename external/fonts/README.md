@@ -16,3 +16,6 @@ under the SIL Open Font License 1.1:
 
 The OFL permits redistribution and modification. Keep this notice and the
 upstream license information with the font files when packaging Distill.
+
+The bundled DejaVu Sans and DejaVu Serif faces are covered by
+[DejaVu-LICENSE.txt](DejaVu-LICENSE.txt).
