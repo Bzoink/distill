@@ -520,12 +520,8 @@ set_target_properties(distill PROPERTIES
 
 install(TARGETS distill RUNTIME DESTINATION bin)
 
-# The terminal front end. termbox2 is a vendored single header, like
-# miniaudio, pinned to a commit rather than a release: v2.5.0 measures cell
-# widths with libc's locale-dependent wcwidth(), and the built-in tables on
-# master are what a reader whose output is gated needs.
-#   termbox2 master cdf62e9990d8b200768780080fb10a4e2f680051 (2026-09-03)
-#   sha256 edfa22b227c1a82a4a33ffcd1699b2903a7bff46075a210be2e8849127c63f62
+# The terminal front end uses the vendored termbox2 header pinned in
+# tools/release.py. It needs tb_wcwidth for locale-independent cell widths.
 set(DISTILL_TERMBOX_DIR "${DISTILL_VENDOR_DIR}/src/termbox2")
 if(NOT WIN32 AND EXISTS "${DISTILL_TERMBOX_DIR}/termbox2.h")
     distill_manifest_sources(distill-termbox DISTILL_TERMBOX_SOURCES)

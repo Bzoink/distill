@@ -457,10 +457,9 @@ keeps the evidence.
 
 ### Where the plan had to change
 
-- **termbox2 is pinned to a master commit, not a release.** v2.5.0 has no
-  `tb_wcwidth`; it calls libc's `wcwidth()`, which depends on the locale. The
-  4,321-line header this plan measured is master
-  (`cdf62e9990d8`), and that is what is vendored.
+- **termbox2 needs `tb_wcwidth`.** v2.5.0 used libc's locale-dependent
+  `wcwidth()`, so this plan measured master at `cdf62e9990d8`. The current
+  release pin is in [tools/release.py](../../tools/release.py).
 - **termbox2 does not draw.** Measured on a virtual display: xterm draws the
   Devanagari conjunct क्ष and the Thai กำ in two cells, kitty in one, pyte in
   two. termbox advances by its own answer and repositions the cursor only

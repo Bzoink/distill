@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Build and package Distill for Linux x64 and Windows x64 from Linux."""
+"""Build and package Distill for Linux x64, Windows x64, or Raspberry Pi ARM64."""
 
 import argparse
 import fcntl
@@ -25,22 +25,22 @@ RAW = "https://raw.githubusercontent.com"
 READABILITY = f"{RAW}/mozilla/readability/ab4027a8b37669745016869a37a504727992b2ba"
 ARCHIVES = {
     "quickjs": (
-        "https://codeload.github.com/quickjs-ng/quickjs/tar.gz/9b061718955874e648d8c2bf2910a717aac8fa63",
-        "3d85841fc0a50000c41706c387ff994f2fe187a59ca4b2badc07195d54a8f555",
+        "https://codeload.github.com/quickjs-ng/quickjs/tar.gz/d7215b0ad3fc2c562e8317fd9bca058fd4863804",
+        "a49defe70cbcae9226d9fac025af116e87ebae2440dcff1ca3c80b79e1cdef0b",
     ),
     "lexbor": (
-        "https://codeload.github.com/lexbor/lexbor/tar.gz/f4cbbcd91359a0ec9499e3ce7e263de629482d61",
-        "8efad1999022e872fee2f911e92aaf4bbd6b32185b2e803cab207e3e5ac66f5d",
+        "https://codeload.github.com/lexbor/lexbor/tar.gz/b2ca101decbc38d0fd2d02383d23ac0cb5f22384",
+        "673cf2fafc9c2e5e7e9ae3473434f58c049dc17cfa1e9903ebcd2deffca2f3be",
     ),
 }
 SOURCES = {
     "miniaudio/miniaudio.h": (
-        f"{RAW}/mackron/miniaudio/0.11.25/miniaudio.h",
-        "ac7af4de748b7e26b777f37e01cee313a308a7296a3eb080e2906b320cc55c89",
+        f"{RAW}/mackron/miniaudio/0.11.26/miniaudio.h",
+        "6b376c7fbb1352ba1e0e432ab66069b335ea9405e45cb6c30b97ef0f3c9c3e0e",
     ),
     "termbox2/termbox2.h": (
-        f"{RAW}/termbox/termbox2/cdf62e9990d8b200768780080fb10a4e2f680051/termbox2.h",
-        "edfa22b227c1a82a4a33ffcd1699b2903a7bff46075a210be2e8849127c63f62",
+        f"{RAW}/termbox/termbox2/0e801fd9808a94dbded47ddf86bea4f93049d64d/termbox2.h",
+        "0ba7a4bbce31f98b337c0bd6df2758ef5ce4f5907cb0822cd16569ba1b56bc61",
     ),
     "readability/JSDOMParser.js": (
         f"{READABILITY}/JSDOMParser.js",
@@ -157,7 +157,8 @@ def project_version(build):
     return match[1]
 
 
-def package_linux(build, vendor, archive):
+def package_linux(build, vendor, archive, emulator=(), loader=None):
+    command = [*emulator, loader, "--list"] if loader else ["ldd"]
     with tempfile.TemporaryDirectory() as staging:
         root = Path(staging) / "Distill"
         run("cmake", "--install", build, "--prefix", root)
@@ -165,14 +166,43 @@ def package_linux(build, vendor, archive):
             binary = root / "bin" / name
             if not binary.is_file():
                 raise ValueError(f"Linux build did not install {name}. Check the development libraries.")
-            libraries = subprocess.check_output(["ldd", binary], text=True,
+            libraries = subprocess.check_output([*command, binary], text=True,
                                                 env={**os.environ, "LC_ALL": "C"})
             if "not found" in libraries:
                 raise ValueError(f"unresolved Linux runtime libraries for {name}\n{libraries}")
-        run(root / "bin/distill", "--version", cwd=root.parent)
+        run(*emulator, root / "bin/distill", "--version", cwd=root.parent)
         copy_licenses([], root / "licenses", vendor, termbox=True)
         with tarfile.open(archive, "w:gz") as package:
             package.add(root, arcname=root.name)
+
+
+def raspberry_pi_settings(sysroot):
+    triplet = "aarch64-linux-gnu"
+    loader = sysroot / "lib/ld-linux-aarch64.so.1"
+    if not loader.is_file():
+        raise ValueError(f"ARM64 loader missing from Raspberry Pi sysroot: {loader}")
+    emulator = [executable("qemu-aarch64"), "-cpu", "cortex-a53", "-L", str(sysroot)]
+    executable("ld.lld")
+    flags = [
+        "-DCMAKE_SYSTEM_NAME=Linux", "-DCMAKE_SYSTEM_PROCESSOR=aarch64",
+        f"-DCMAKE_C_COMPILER={executable('clang')}",
+        f"-DCMAKE_CXX_COMPILER={executable('clang++')}",
+        f"-DCMAKE_C_COMPILER_TARGET={triplet}", f"-DCMAKE_CXX_COMPILER_TARGET={triplet}",
+        f"-DCMAKE_SYSROOT={sysroot}",
+        "-DCMAKE_EXE_LINKER_FLAGS_INIT=-fuse-ld=lld",
+        "-DCMAKE_FIND_ROOT_PATH_MODE_PROGRAM=NEVER",
+        "-DCMAKE_FIND_ROOT_PATH_MODE_LIBRARY=ONLY",
+        "-DCMAKE_FIND_ROOT_PATH_MODE_INCLUDE=ONLY",
+        "-DCMAKE_FIND_ROOT_PATH_MODE_PACKAGE=ONLY",
+        f"-DCMAKE_CROSSCOMPILING_EMULATOR={';'.join(emulator)}",
+        "-DPKG_CONFIG_USE_CMAKE_PREFIX_PATH=OFF",
+    ]
+    env = dict(os.environ)
+    env.pop("PKG_CONFIG_PATH", None)
+    env["PKG_CONFIG_SYSROOT_DIR"] = str(sysroot)
+    env["PKG_CONFIG_LIBDIR"] = os.pathsep.join(
+        str(sysroot / path) for path in (f"usr/lib/{triplet}/pkgconfig", "usr/share/pkgconfig"))
+    return flags, env, emulator, loader
 
 
 def windows_settings(prefix, toolchain, work):
@@ -234,12 +264,12 @@ def publish_packages(staged, destination):
 def release(args):
     for command in ("cmake", "ninja", "pkg-config", "curl", "npm"):
         executable(command)
-    native_flags = [f"-DCMAKE_C_COMPILER={executable('clang')}",
-                    f"-DCMAKE_CXX_COMPILER={executable('clang++')}"]
-    linux = args.target != "windows"
-    windows = args.target != "linux"
-    if linux:
+    linux = args.target in ("all", "linux")
+    windows = args.target in ("all", "windows")
+    raspberry_pi = args.target == "raspberry-pi"
+    if linux or raspberry_pi:
         executable("ctest")
+    if linux:
         executable("ldd")
     if windows:
         executable("makensis")
@@ -252,13 +282,27 @@ def release(args):
         if windows:
             prefix = args.windows_prefix.resolve()
             flags, env, extra, objdump = windows_settings(prefix, args.windows_toolchain, work)
+        if raspberry_pi:
+            pi_flags, pi_env, emulator, loader = raspberry_pi_settings(args.raspberry_pi_sysroot.resolve())
         vendor = prepare_vendor(work, ROOT / "build/release-cache")
-        native = configure_distill(vendor, work / "linux", native_flags, None, jobs)
-        version = project_version(native)
+        if linux or windows:
+            native_flags = [f"-DCMAKE_C_COMPILER={executable('clang')}",
+                            f"-DCMAKE_CXX_COMPILER={executable('clang++')}"]
+            native = configure_distill(vendor, work / "linux", native_flags, None, jobs)
+            version = project_version(native)
         if linux:
             run("cmake", "--build", native, "--parallel", jobs)
             run("ctest", "--test-dir", native, "--output-on-failure")
             package_linux(native, vendor, output / f"distill-{version}-linux-x64.tar.gz")
+        if raspberry_pi:
+            target = configure_distill(vendor, work / "raspberry-pi", pi_flags, pi_env, jobs)
+            version = project_version(target)
+            run("cmake", "--build", target, "--parallel", jobs, env=pi_env)
+            # QEMU user mode cannot report posix_spawn exec errors to the parent.
+            run("ctest", "--test-dir", target, "--output-on-failure",
+                "--exclude-regex", "^distill-media-transfer$")
+            package_linux(target, vendor, output / f"distill-{version}-raspberry-pi-arm64.tar.gz",
+                          emulator, loader)
         if windows:
             if not linux:
                 run("cmake", "--build", native, "--parallel", jobs, "--target", "distill-jsc")
@@ -276,7 +320,10 @@ def release(args):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--target", choices=("all", "linux", "windows"), default="all")
+    parser.add_argument("--target", choices=("all", "linux", "windows", "raspberry-pi"),
+                        default="all")
+    parser.add_argument("--raspberry-pi-sysroot", type=Path,
+                        help="Debian Trixie ARM64 sysroot for Raspberry Pi OS")
     parser.add_argument("--windows-prefix", type=Path, help="MSYS2-style Windows x64 UCRT dependencies")
     parser.add_argument("--windows-toolchain", type=Path, help="LLVM-MinGW bin directory (defaults to PATH)")
     parser.add_argument("--output-dir", type=Path, default=ROOT / "build/releases")
@@ -284,8 +331,10 @@ def main():
     args = parser.parse_args()
     if platform.system() != "Linux" or platform.machine() != "x86_64":
         parser.error("the release script requires an x86-64 Linux build host")
-    if args.target != "linux" and args.windows_prefix is None:
+    if args.target in ("all", "windows") and args.windows_prefix is None:
         parser.error("--windows-prefix is required for the Windows build")
+    if args.target == "raspberry-pi" and args.raspberry_pi_sysroot is None:
+        parser.error("--raspberry-pi-sysroot is required for the Raspberry Pi build")
     if args.jobs < 1:
         parser.error("--jobs must be positive")
     try:

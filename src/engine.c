@@ -1758,9 +1758,21 @@ static void dispatch_host_event(Engine *engine, const char *kind, const char *ty
     JS_FreeValue(engine->context, dispatch);
 }
 
-/* One literal per line: ISO C promises literals of 4095 characters, and the
-   whole shim is several times that. Joined with nothing between them, as the
-   adjacent literals were, so the script is byte-for-byte what it was. */
+/* LinkeDOM's CSS parser constructs an Intl.NumberFormat when it loads. */
+static const char INTL_JS[] =
+    "globalThis.Intl = { getCanonicalLocales(locales) { if (locales == null) return []; return (Array.isArray(locales) ? locales : [locales]).map(String); }, "
+    "Locale: class { constructor(locale) { this.baseName=String(locale || 'en-US'); this.language=this.baseName.split('-')[0]; } toString() { return this.baseName; } maximize() { return this; } }, "
+    "NumberFormat: class { constructor(locales, options) { this.locales=locales; this.options=options || {}; } format(value) { return String(value); } formatToParts(value) { return [{type:'integer', value:String(value)}]; } resolvedOptions() { return {locale:'en-US', numberingSystem:'latn'}; } }, "
+    "DateTimeFormat: class { constructor(locales, options) { this.locales=locales; this.options=options || {}; } format(value) { return new Date(value == null ? Date.now() : value).toISOString(); } formatToParts(value) { return [{type:'literal', value:this.format(value)}]; } resolvedOptions() { return {locale:'en-US', calendar:'gregory', numberingSystem:'latn', timeZone:'UTC'}; } }, "
+    "PluralRules: class { select(value) { return Number(value) === 1 ? 'one' : 'other'; } resolvedOptions() { return {locale:'en-US', type:'cardinal', pluralCategories:['one','other']}; } }, "
+    "RelativeTimeFormat: class { format(value, unit) { return String(value) + ' ' + String(unit); } resolvedOptions() { return {locale:'en-US', numeric:'always', style:'long'}; } }, "
+    "ListFormat: class { format(values) { return Array.from(values || []).join(', '); } }, "
+    "Collator: class { compare(a, b) { return String(a).localeCompare(String(b)); } }, "
+    "Segmenter: class { segment(value) { return Array.from(String(value), segment => ({segment})); } }, "
+    "DisplayNames: class { of(value) { return String(value); } } };";
+
+/* The whole shim exceeds ISO C's guaranteed string literal length. The host
+   joins these strings before evaluating the script. */
 static const char *const HOST_JS[] = {
 "globalThis.__listeners = {window: Object.create(null), document: Object.create(null)};",
 "globalThis.__add = function(kind, type, callback) { (globalThis.__listeners[kind][type] ||= []).push(callback); };",
@@ -1782,6 +1794,25 @@ static const char *const HOST_JS[] = {
 "Object.defineProperty(document, 'dispatchEvent', {value:event => __dispatch('document', event.type), configurable:true});",
 "document.readyState = 'loading';",
 "document.visibilityState = 'visible';",
+"document.currentScript = null;",
+"{ let written = ''; document.write = (...parts) => {"
+"    if (document.currentScript) written += parts.map(String).join('');"
+"  }; document.writeln = (...parts) => document.write(...parts, '\\n');"
+"  globalThis.__distillFlushWrite = () => {"
+"    const script = document.currentScript; document.currentScript = null;"
+"    const html = written; written = '';"
+"    if (html && script && script.parentNode) script.insertAdjacentHTML('afterend', html);"
+"  }; }",
+"globalThis.__distillContentPending = () => {"
+"  const root = document.querySelector('main, [role=main]') || document;"
+"  const pending = '[aria-busy=true], [data-ready=false], [role=progressbar]';"
+"  const hidden = '[hidden], [aria-hidden=true], nav, footer, aside';"
+"  if (root.matches?.(pending)) return !root.closest(hidden);"
+"  const placeholders = /^(?:loading(?: content| products)?|please wait|waiting for content)[.\\s…]*$/i;"
+"  if (Array.from(root.querySelectorAll(pending)).some(node => !node.closest(hidden))) return true;"
+"  return Array.from(root.querySelectorAll('p, div, span, [role=status]')).some(node =>"
+"    !node.firstElementChild && placeholders.test(node.textContent.trim()) && !node.closest(hidden));"
+"};",
 "Object.defineProperty(document, 'cookie', {get() { return __distillCookieGet(); }, set(value) { __distillCookieSet(String(value)); }, configurable:true});",
 "globalThis.localStorage = {__data: Object.create(null), getItem(k) { return this.__data[k] === undefined ? null : this.__data[k]; }, setItem(k,v) { this.__data[k] = String(v); }, removeItem(k) { delete this.__data[k]; }, clear() { this.__data = Object.create(null); }, key(i) { return Object.keys(this.__data)[i] ?? null; }};",
 "Object.defineProperty(localStorage, 'length', {get() { return Object.keys(this.__data).length; }});",
@@ -1797,7 +1828,7 @@ static const char *const HOST_JS[] = {
 "globalThis.AbortSignal = class { constructor() { this.aborted=false; this.reason=undefined; this.__listeners=[]; } addEventListener(type, callback) { if (type === 'abort' && typeof callback === 'function') this.__listeners.push(callback); } removeEventListener(type, callback) { if (type === 'abort') this.__listeners=this.__listeners.filter(item => item !== callback); } dispatchEvent(event) { for (const callback of this.__listeners.slice()) callback.call(this, event); return true; } throwIfAborted() { if (this.aborted) throw this.reason || new Error('The operation was aborted'); } };",
 "globalThis.AbortController = class { constructor() { this.signal=new AbortSignal(); } abort(reason) { if (this.signal.aborted) return; this.signal.aborted=true; this.signal.reason=reason || new Error('The operation was aborted'); this.signal.dispatchEvent({type:'abort', target:this.signal}); } }; __setWindow('AbortSignal', AbortSignal); __setWindow('AbortController', AbortController);",
 "globalThis.CustomEvent = class extends Event { constructor(type, init={}) { super(type, init); this.detail=init.detail; } }; __setWindow('CustomEvent', CustomEvent);",
-"globalThis.Intl = { getCanonicalLocales(locales) { if (locales == null) return []; return (Array.isArray(locales) ? locales : [locales]).map(String); }, Locale: class { constructor(locale) { this.baseName=String(locale || 'en-US'); this.language=this.baseName.split('-')[0]; } toString() { return this.baseName; } maximize() { return this; } }, NumberFormat: class { constructor(locales, options) { this.locales=locales; this.options=options || {}; } format(value) { return String(value); } formatToParts(value) { return [{type:'integer', value:String(value)}]; } resolvedOptions() { return {locale:'en-US', numberingSystem:'latn'}; } }, DateTimeFormat: class { constructor(locales, options) { this.locales=locales; this.options=options || {}; } format(value) { return new Date(value == null ? Date.now() : value).toISOString(); } formatToParts(value) { return [{type:'literal', value:this.format(value)}]; } resolvedOptions() { return {locale:'en-US', calendar:'gregory', numberingSystem:'latn', timeZone:'UTC'}; } }, PluralRules: class { select(value) { return Number(value) === 1 ? 'one' : 'other'; } resolvedOptions() { return {locale:'en-US', type:'cardinal', pluralCategories:['one','other']}; } }, RelativeTimeFormat: class { format(value, unit) { return String(value) + ' ' + String(unit); } resolvedOptions() { return {locale:'en-US', numeric:'always', style:'long'}; } }, ListFormat: class { format(values) { return Array.from(values || []).join(', '); } }, Collator: class { compare(a, b) { return String(a).localeCompare(String(b)); } }, Segmenter: class { segment(value) { return Array.from(String(value), segment => ({segment})); } }, DisplayNames: class { of(value) { return String(value); } } }; __setWindow('Intl', Intl);",
+"__setWindow('Intl', Intl);",
 "globalThis.matchMedia = q => ({matches: false, media: q, addListener() {}, removeListener() {}, addEventListener() {}, removeEventListener() {}}); __setWindow('matchMedia', matchMedia);",
 "globalThis.performance = {now: () => Date.now(), mark() {}, measure() {}, getEntries() { return []; }, getEntriesByName() { return []; }, getEntriesByType() { return []; }, clearMarks() {}, clearMeasures() {}}; __setWindow('performance', performance);",
 "globalThis.PerformanceObserver = class { constructor(callback) { this.callback=callback; } observe() {} disconnect() {} takeRecords() { return []; } }; PerformanceObserver.supportedEntryTypes=[]; __setWindow('PerformanceObserver', PerformanceObserver);",
@@ -1842,13 +1873,23 @@ static const char *const HOST_JS[] = {
 };
 
 static bool evaluate(Engine *engine, const char *source, size_t length,
-                     const char *filename, int flags)
+                     const char *filename, int flags, JSValueConst parser_script)
 {
     if (++engine->scripts_run > engine->max_scripts) return false;
-    JSValue result = JS_Eval(engine->context, source, length, filename, flags);
+    JSContext *ctx = engine->context;
+    if (!JS_IsUndefined(parser_script))
+        JS_SetPropertyStr(ctx, engine->document, "currentScript", JS_DupValue(ctx, parser_script));
+    JSValue result = JS_Eval(ctx, source, length, filename, flags);
     bool ok = !JS_IsException(result);
     if (!ok) note_exception(engine, filename);
-    JS_FreeValue(engine->context, result);
+    JS_FreeValue(ctx, result);
+    if (!JS_IsUndefined(parser_script)) {
+        JSValue flush = JS_GetPropertyStr(ctx, engine->global, "__distillFlushWrite");
+        result = JS_Call(ctx, flush, JS_UNDEFINED, 0, NULL);
+        if (JS_IsException(result)) note_exception(engine, "document.write");
+        JS_FreeValue(ctx, result);
+        JS_FreeValue(ctx, flush);
+    }
     execute_jobs(engine);
     return ok;
 }
@@ -1870,13 +1911,22 @@ static void process_async_scripts(Engine *engine)
         ++engine->async_next_order;
         if (next->body.length && next->body.data) {
             int flags = next->module_script ? JS_EVAL_TYPE_MODULE : JS_EVAL_TYPE_GLOBAL;
-            evaluate(engine, next->body.data, next->body.length, next->url, flags);
+            evaluate(engine, next->body.data, next->body.length, next->url, flags, JS_UNDEFINED);
         }
     }
 }
 
 static bool load_linkedom(Engine *engine, const DBuffer *html)
 {
+    /* Bootstrap the DOM without spending a page-script slot. */
+    JSValue intl = JS_Eval(engine->context, INTL_JS, sizeof(INTL_JS) - 1,
+                          "distill-intl.js", JS_EVAL_TYPE_GLOBAL);
+    if (JS_IsException(intl)) {
+        note_exception(engine, "distill-intl.js");
+        return false;
+    }
+    JS_FreeValue(engine->context, intl);
+
     /* Compiled at build time (embedded_js.h); read, not parsed. */
     uint64_t load_started = clock_ms();
     JSValue module_value = JS_ReadObject(engine->context, distill_js_linkedom,
@@ -1973,7 +2023,8 @@ static bool install_host(Engine *engine)
     DBuffer script;
     dbuf_init(&script);
     for (size_t i = 0; i < sizeof(HOST_JS) / sizeof(HOST_JS[0]); ++i) dbuf_puts(&script, HOST_JS[i]);
-    bool ok = evaluate(engine, script.data, script.length, "distill-host.js", JS_EVAL_TYPE_GLOBAL);
+    bool ok = evaluate(engine, script.data, script.length, "distill-host.js", JS_EVAL_TYPE_GLOBAL,
+                       JS_UNDEFINED);
     dbuf_free(&script);
     return ok;
 }
@@ -2004,15 +2055,18 @@ static bool discover_scripts(Engine *engine)
         bool is_async = JS_ToBool(engine->context, async_value);
         bool is_defer = JS_ToBool(engine->context, defer_value);
         bool is_nomodule = JS_ToBool(engine->context, nomodule_value);
-        JS_FreeValue(engine->context, node); JS_FreeValue(engine->context, src_value); JS_FreeValue(engine->context, async_value);
+        JS_FreeValue(engine->context, src_value); JS_FreeValue(engine->context, async_value);
         JS_FreeValue(engine->context, defer_value); JS_FreeValue(engine->context, text_value);
         JS_FreeValue(engine->context, type_value); JS_FreeValue(engine->context, nomodule_value);
         JS_FreeValue(engine->context, spec);
-        if (d_contains(type, "json")) { free(src); free(code); free(type); continue; }
         /* A page that ships a module bundle and a nomodule fallback expects a
            module-capable client to run exactly one of them. Running both
            initialises the same framework twice. */
-        if (is_nomodule) { free(src); free(code); free(type); continue; }
+        if (d_contains(type, "json") || is_nomodule) {
+            JS_FreeValue(engine->context, node);
+            free(src); free(code); free(type); continue;
+        }
+        bool module_script = d_eq(type, "module") || d_eq(type, "text/javascript;module");
         char *url = src[0] ? resolve_url(engine->base_url, src) : NULL;
         if (is_async && url) {
             ++engine->async_pending;
@@ -2020,7 +2074,7 @@ static bool discover_scripts(Engine *engine)
             if (!request) {
                 --engine->async_pending;
             } else {
-                request->module_script = d_eq(type, "module") || d_eq(type, "text/javascript;module");
+                request->module_script = module_script;
                 request->async_order = engine->async_sequence++;
             }
         } else if (is_defer) {
@@ -2039,14 +2093,16 @@ static bool discover_scripts(Engine *engine)
                 }
             }
             if (*code) evaluate(engine, code, strlen(code), url ? url : "distill-inline.js",
-                                d_eq(type, "module") || d_eq(type, "text/javascript;module") ? JS_EVAL_TYPE_MODULE : JS_EVAL_TYPE_GLOBAL);
+                                module_script ? JS_EVAL_TYPE_MODULE : JS_EVAL_TYPE_GLOBAL,
+                                module_script || is_async ? JS_UNDEFINED : node);
         }
+        JS_FreeValue(engine->context, node);
         free(src); free(code); free(type); free(url);
     }
     for (uint32_t i = 0; i < deferred_count; ++i) {
         JSValue code_value = JS_GetPropertyUint32(engine->context, deferred, i);
         char *code = js_string(engine->context, code_value);
-        evaluate(engine, code, strlen(code), "distill-defer.js", JS_EVAL_TYPE_GLOBAL);
+        evaluate(engine, code, strlen(code), "distill-defer.js", JS_EVAL_TYPE_GLOBAL, JS_UNDEFINED);
         free(code); JS_FreeValue(engine->context, code_value);
     }
     JS_FreeValue(engine->context, deferred);
@@ -2092,7 +2148,8 @@ static bool discover_scripts(Engine *engine)
             if (!d_contains(type, "json") && *code) {
                 int flags = d_eq(type, "module") || d_eq(type, "text/javascript;module")
                     ? JS_EVAL_TYPE_MODULE : JS_EVAL_TYPE_GLOBAL;
-                ok = evaluate(engine, code, strlen(code), url ? url : "distill-dynamic.js", flags);
+                ok = evaluate(engine, code, strlen(code), url ? url : "distill-dynamic.js", flags,
+                              JS_UNDEFINED);
             }
             JSValue onload = JS_GetPropertyStr(engine->context, node, "onload");
             if (ok && JS_IsFunction(engine->context, onload)) {
@@ -2120,14 +2177,26 @@ static bool request_in_flight(const Engine *engine)
     return false;
 }
 
-static bool timer_near(const Engine *engine)
+static bool timer_due_by(const Engine *engine, uint64_t limit, bool one_shot)
 {
-    uint64_t limit = clock_ms() + 500;
     for (size_t i = 0; i < engine->timers.length; ++i) {
         const Timer *timer = &engine->timers.items[i];
-        if (!timer->cancelled && !timer->recurring && timer->due <= limit) return true;
+        if (!timer->cancelled && !timer->recurring && (!one_shot || !timer->interval) &&
+            timer->due <= limit) return true;
     }
     return false;
+}
+
+static bool page_content_pending(Engine *engine)
+{
+    JSContext *ctx = engine->context;
+    JSValue probe = JS_GetPropertyStr(ctx, engine->global, "__distillContentPending");
+    JSValue value = JS_Call(ctx, probe, JS_UNDEFINED, 0, NULL);
+    bool pending = JS_IsBool(value) && JS_ToBool(ctx, value);
+    if (JS_IsException(value)) JS_FreeValue(ctx, JS_GetException(ctx));
+    JS_FreeValue(ctx, value);
+    JS_FreeValue(ctx, probe);
+    return pending;
 }
 
 static void dispatch_load_if_ready(Engine *engine)
@@ -2193,6 +2262,7 @@ static const char *challenge_kind(const char *data, size_t length, size_t limit)
 
 static void settle(Engine *engine)
 {
+    uint64_t loading_deadline = 0;
     for (;;) {
         process_network(engine);
         process_async_scripts(engine);
@@ -2214,7 +2284,17 @@ static void settle(Engine *engine)
             engine->cap_hit = true;
             break;
         }
-        if (!request_in_flight(engine) && !JS_IsJobPending(engine->runtime) && !timer_near(engine)) break;
+        uint64_t now = clock_ms();
+        if (!request_in_flight(engine) && !JS_IsJobPending(engine->runtime) &&
+            !timer_due_by(engine, now + 500, false)) {
+            /* Give a loading shell one bounded grace period for delayed work. */
+            uint64_t limit = now + 1500;
+            uint64_t cap = engine->started + engine->cap_ms;
+            if (limit > cap) limit = cap;
+            if (!loading_deadline && timer_due_by(engine, limit, true) && page_content_pending(engine))
+                loading_deadline = limit;
+            if (now >= loading_deadline || !timer_due_by(engine, loading_deadline, true)) break;
+        }
         d_clock_sleep_ms(10);
     }
 }
@@ -2252,6 +2332,7 @@ typedef struct {
     size_t media;
     bool useful;
     bool error_like;
+    bool has_body;
 } ExtractionCandidate;
 
 static int64_t candidate_array_length(Engine *engine, JSValueConst value)
@@ -2294,6 +2375,7 @@ static ExtractionCandidate score_extraction(Engine *engine, const char *json)
     JSValue blocks = JS_GetPropertyStr(engine->context, parsed, "blocks");
     int64_t block_count = candidate_array_length(engine, blocks);
     bool any_error = false;
+    unsigned linked_headings = 0;
     for (int64_t i = 0; i < block_count; ++i) {
         JSValue block = JS_GetPropertyUint32(engine->context, blocks, (uint32_t)i);
         char *text = candidate_string(engine, block, "text");
@@ -2304,6 +2386,16 @@ static ExtractionCandidate score_extraction(Engine *engine, const char *json)
             else {
                 score.characters += length;
                 score.score += (long)length + 32;
+                if (!score.has_body) {
+                    char *type = candidate_string(engine, block, "type");
+                    char *href = candidate_string(engine, block, "href");
+                    score.has_body = d_eq(type, "blockquote") || d_eq(type, "pre") ||
+                        (!*href && length >= 24 && (d_eq(type, "p") || d_eq(type, "li") ||
+                                                   d_eq(type, "dd")));
+                    if (*href && length >= 12 && (d_eq(type, "h2") || d_eq(type, "h3")))
+                        score.has_body = ++linked_headings >= 3;
+                    free(type); free(href);
+                }
             }
         }
         free(text);
@@ -2314,6 +2406,19 @@ static ExtractionCandidate score_extraction(Engine *engine, const char *json)
     score.links = (size_t)candidate_array_length(engine, links);
     score.media = (size_t)candidate_array_length(engine, media);
     score.score += (long)score.links * 8L + (long)score.media * 16L;
+    const char *body_arrays[] = {"tables", "search_results", "forms", "videos", "audio"};
+    for (size_t i = 0; i < sizeof(body_arrays) / sizeof(body_arrays[0]) && !score.has_body; ++i) {
+        JSValue array = JS_GetPropertyStr(engine->context, parsed, body_arrays[i]);
+        score.has_body = candidate_array_length(engine, array) > 0;
+        JS_FreeValue(engine->context, array);
+    }
+    for (size_t i = 0; i < score.media && !score.has_body; ++i) {
+        JSValue item = JS_GetPropertyUint32(engine->context, media, (uint32_t)i);
+        char *kind = candidate_string(engine, item, "kind");
+        score.has_body = d_eq(kind, "content");
+        free(kind);
+        JS_FreeValue(engine->context, item);
+    }
 
     JSValue main_content = JS_GetPropertyStr(engine->context, parsed, "main_content");
     JSValue main_blocks = JS_GetPropertyStr(engine->context, main_content, "blocks");
@@ -2332,6 +2437,7 @@ static ExtractionCandidate score_extraction(Engine *engine, const char *json)
         if (*text && !candidate_error_text(text)) {
             score.characters += strlen(text);
             score.score += (long)strlen(text) / 2L;
+            if (strlen(text) >= 120) score.has_body = true;
         } else if (*text) {
             any_error = true;
         }
@@ -2351,7 +2457,8 @@ static ExtractionCandidate score_extraction(Engine *engine, const char *json)
 }
 
 static char *annotate_extraction(Engine *engine, const char *json, const char *source,
-                                 const char *reason, const ExtractionCandidate *initial,
+                                 const char *reason, const char *content_problem,
+                                 const ExtractionCandidate *initial,
                                  const ExtractionCandidate *settled)
 {
     JSValue parsed = JS_ParseJSON(engine->context, json ? json : "", json ? strlen(json) : 0,
@@ -2364,6 +2471,12 @@ static char *annotate_extraction(Engine *engine, const char *json, const char *s
     JS_SetPropertyStr(engine->context, diagnostics, "selected_source", js_str(engine->context, source));
     JS_SetPropertyStr(engine->context, diagnostics, "fallback", JS_NewBool(engine->context, d_eq(source, "initial-html")));
     JS_SetPropertyStr(engine->context, diagnostics, "reason", js_str(engine->context, reason));
+    JS_SetPropertyStr(engine->context, diagnostics, "content_status",
+                      js_str(engine->context, engine->challenge ? "challenge" :
+                             content_problem ? "incomplete" : "content-found"));
+    if (content_problem)
+        JS_SetPropertyStr(engine->context, diagnostics, "content_reason",
+                          js_str(engine->context, content_problem));
     JS_SetPropertyStr(engine->context, diagnostics, "initial_score", JS_NewInt64(engine->context, initial->score));
     JS_SetPropertyStr(engine->context, diagnostics, "settled_score", JS_NewInt64(engine->context, settled->score));
     JS_SetPropertyStr(engine->context, diagnostics, "script_errors", JS_NewInt64(engine->context, (int64_t)engine->script_errors));
@@ -2402,7 +2515,16 @@ static char *select_extraction(Engine *engine, const char *initial_json,
                          : initial.useful ? "settled DOM is coherent or improves the page"
                                           : "initial HTML has no useful content");
     const char *selected = choose_initial ? initial_json : settled_json;
-    return annotate_extraction(engine, selected, source, reason, &initial, &settled);
+    const ExtractionCandidate *candidate = choose_initial ? &initial : &settled;
+    const char *content_problem = NULL;
+    if (!engine->challenge) {
+        if (!choose_initial && page_content_pending(engine))
+            content_problem = "the page still reports that content is loading";
+        else if (!candidate->has_body)
+            content_problem = "no recognizable main content was found";
+    }
+    if (content_problem) note("incomplete extraction: %s\n", content_problem);
+    return annotate_extraction(engine, selected, source, reason, content_problem, &initial, &settled);
 }
 
 #ifdef DISTILL_RENDER
@@ -3222,6 +3344,7 @@ static char *reader_template(Engine *engine, const char *json, const char *theme
        densest container and on a liveblog permalink returns the whole stream
        with the requested post somewhere inside it. */
     bool main_found = false;
+    bool article_only = false;
     bool embedded_mapped = false;
     if (JS_IsObject(embedded_data)) {
         JSValue matched = JS_GetPropertyStr(engine->context, embedded_data, "matched");
@@ -3232,6 +3355,9 @@ static char *reader_template(Engine *engine, const char *json, const char *theme
         JSValue found = JS_GetPropertyStr(engine->context, main_content, "found");
         main_found = JS_ToBool(engine->context, found);
         JS_FreeValue(engine->context, found);
+        JSValue scope = JS_GetPropertyStr(engine->context, main_content, "article_only");
+        article_only = JS_IsBool(scope) && JS_ToBool(engine->context, scope);
+        JS_FreeValue(engine->context, scope);
     }
     char *main_heading = d_strdup("");
     if (main_found) {
@@ -3411,11 +3537,17 @@ static char *reader_template(Engine *engine, const char *json, const char *theme
     const char *heading = *main_heading ? main_heading : (*title ? title : "Untitled page");
     append_html_escaped(&output, heading);
     dbuf_puts(&output, "</h1>");
+    JSValue diagnostics = JS_GetPropertyStr(engine->context, parsed, "diagnostics");
+    char *content_status = candidate_string(engine, diagnostics, "content_status");
+    if (d_eq(content_status, "incomplete"))
+        dbuf_puts(&output, "<p class=\"eyebrow\" role=\"status\">Main content may be incomplete.</p>");
+    free(content_status);
+    JS_FreeValue(engine->context, diagnostics);
     if (main_found) {
         dbuf_puts(&output, "<section class=\"main-content\">");
         append_json_blocks(engine, main_blocks, &output, false);
         dbuf_puts(&output, "</section>");
-        if (json_blocks_outside_main(engine, blocks) > 0) {
+        if (!article_only && json_blocks_outside_main(engine, blocks) > 0) {
             dbuf_puts(&output, "<p class=\"eyebrow main-rest\">Rest of the page</p>");
             append_json_blocks(engine, blocks, &output, true);
         }

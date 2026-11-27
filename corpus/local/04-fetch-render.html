@@ -2,13 +2,14 @@
 <meta charset="utf-8">
 <title>04 — Client rendering over the network bridge</title>
 
-<article id="content">
+<article id="content" aria-busy="true">
   <p id="status">LOADING</p>
 </article>
 <div id="xhr">XHR-NEVER-RAN</div>
 
 <script>
   async function render() {
+    await new Promise(resolve => setTimeout(resolve, 650));
     const res = await fetch('04-article.json');
     if (!res.ok) throw new Error('HTTP ' + res.status);
     const data = await res.json();
@@ -25,6 +26,7 @@
       p.textContent = text;
       root.appendChild(p);
     }
+    root.setAttribute('aria-busy', 'false');
   }
 
   render().catch(function (e) {

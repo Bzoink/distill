@@ -1,6 +1,7 @@
 # Building Distill releases
 
-From an x86-64 Linux checkout, build and package both supported targets with:
+Run the release script from an x86-64 Linux checkout to build and package
+Linux x64 and Windows x64.
 
 ```sh
 python3 tools/release.py \
@@ -43,6 +44,24 @@ Keep the prefix's headers, import libraries, pkg-config files, DLLs and
 licenses. The Windows packager follows imports recursively and fails if
 an application DLL is missing.
 
+## Raspberry Pi
+
+Build for 64-bit Raspberry Pi OS (Trixie) from the same x86-64 Linux host.
+Install `gcc-aarch64-linux-gnu`, `lld`, and `qemu-user` on the host.
+Use a Debian 13 ARM64 sysroot with the Linux development libraries listed
+above, plus `libc6-dev` and `libstdc++-14-dev`. Preserve the sysroot's
+`/lib` and `/usr` layout and its symlinks.
+
+```sh
+python3 tools/release.py --target raspberry-pi \
+  --raspberry-pi-sysroot /path/to/arm64-sysroot
+```
+
+The script runs CTest and checks the packaged binaries' shared libraries
+under QEMU with a Cortex-A53 CPU. The media-transfer test requires native
+ARM64 or full-system emulation because QEMU user mode cannot pass
+`posix_spawn` errors back to the parent process.
+
 ## Packages
 
 Each package has a matching `.sha256` file in `build/releases`. The portable
@@ -56,6 +75,17 @@ archives contain a `Distill/` directory. Extract it and keep its `bin/` and
   Run `Distill/bin/distill-gtk` from a graphical session.
   Install the `bin/` and `share/` contents under a standard prefix such as
   `~/.local` to register the Distill launcher and icon for your desktop.
+- `distill-<version>-raspberry-pi-arm64.tar.gz` contains the same Linux
+  readers for 64-bit Raspberry Pi OS (Trixie). Run `Distill/bin/distill-gtk`
+  from the desktop or `Distill/bin/distill-tui` from a terminal. On
+  Raspberry Pi OS Lite, install the runtime libraries first.
+
+  ```sh
+  sudo apt install libcurl4t64 libunibreak6 libfreetype6 libharfbuzz0b \
+    libpng16-16t64 libjpeg62-turbo libwebp7
+  ```
+
+  The GTK reader also needs `libgtk-3-0t64` and a graphical session.
 - `distill-<version>-windows-x64.zip` contains the command-line tool and
   native GDI reader with their DLLs. On Windows 10 or later, open
   `Distill/bin/distill-fb.exe`. See [the Windows guide](WINDOWS.md).

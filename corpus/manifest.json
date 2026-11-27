@@ -58,7 +58,10 @@
           "stage": "dom",
           "selector": "#probe",
           "expect": "DOM-API-OK"
-        }
+        },
+        {"stage": "dom", "selector": "#written", "expect": "WRITE-ORDER-OK"},
+        {"stage": "dom", "selector": "#written", "expect": "WRITE-PLACEMENT-OK"},
+        {"stage": "extract", "path": "blocks", "expect": "WRITE-ORDER-OK"}
       ]
     },
     {
@@ -190,7 +193,9 @@
           "stage": "extract",
           "path": "diagnostics.selected_source",
           "expect": "settled-dom"
-        }
+        },
+        {"stage": "extract", "path": "blocks", "expect": "FETCH-BODY-OK"},
+        {"stage": "extract", "path": "diagnostics.content_status", "expect": "content-found"}
       ]
     },
     {
@@ -1542,6 +1547,33 @@
           "stage": "extract",
           "expect": "ANSWERED-12"
         }
+      ]
+    },
+    {
+      "id": "46-article-boundary",
+      "path": "46-article-boundary.html",
+      "gate": true,
+      "plan_section": "Article content boundaries",
+      "exercises": ["article-headline", "title suffix", "article boilerplate"],
+      "why": "A branded title should resolve to the story rather than the news masthead or its discussion.",
+      "assertions": [
+        {"stage": "extract", "path": "main_content.article_only", "expect": "true"},
+        {"stage": "extract", "path": "main_content.blocks[0].text", "expect": "A new ferry service"},
+        {"stage": "markdown", "expect": "bicycles are carried free of charge"},
+        {"stage": "markdown", "expect_absent": ["RELATED-OUTSIDE-ARTICLE", "DISCUSSION-OUTSIDE-ARTICLE"]}
+      ]
+    },
+    {
+      "id": "47-incomplete-content",
+      "path": "47-incomplete-content.html",
+      "gate": true,
+      "plan_section": "Extraction diagnostics",
+      "exercises": ["loading shell", "incomplete content"],
+      "why": "A successful HTTP response containing a loading shell should carry an incomplete-content diagnostic.",
+      "assertions": [
+        {"stage": "extract", "path": "diagnostics.content_status", "expect": "incomplete"},
+        {"stage": "extract", "path": "diagnostics.content_reason", "expect": "still reports that content is loading"},
+        {"stage": "markdown", "expect": "Main content may be incomplete."}
       ]
     }
   ],

@@ -33,3 +33,16 @@
   probe.textContent = ok ? 'DOM-API-OK' : 'DOM-API-FAIL';
   root.appendChild(probe);
 </script>
+
+<section id="writes">
+  <script>
+    document.write('<blockquote id="written">');
+    document.writeln('WRITE-ORDER-', 'OK</blockquote>');
+  </script>
+  <script>
+    const written = document.getElementById('written');
+    if (written && written.parentElement.id === 'writes') {
+      written.append(' WRITE-PLACEMENT-OK');
+    }
+  </script>
+</section>

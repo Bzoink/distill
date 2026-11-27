@@ -1221,6 +1221,7 @@ typedef struct {
     char *selector;   /* the selector that matched, when there was one */
     char *title;      /* the item's own headline */
     char *profile;    /* the profile that supplied the locator, when any */
+    bool article_only;
 } MainContent;
 
 typedef struct {
@@ -1527,7 +1528,8 @@ static bool main_content_profile_load(Engine *engine, const char *url,
 }
 
 static bool main_content_candidate_matches(lxb_dom_node_t *root, lxb_dom_node_t *candidate,
-                                            const char *wanted, const StringVec *headings)
+                                            const char *wanted, const StringVec *headings,
+                                            bool allow_title_suffix)
 {
     if (hidden_node(root, candidate)) return false;
     const char *defaults[] = {"h1", "h2", "h3"};
@@ -1538,6 +1540,11 @@ static bool main_content_candidate_matches(lxb_dom_node_t *root, lxb_dom_node_t 
         for (size_t i = 0; i < found.length; ++i) {
             char *text = compact_text(found.items[i]);
             bool match = *text && d_eq(text, wanted);
+            if (!match && allow_title_suffix && *text && d_starts(wanted, text)) {
+                const char *suffix = wanted + strlen(text);
+                match = d_starts(suffix, " - ") || d_starts(suffix, " – ") ||
+                        d_starts(suffix, " — ") || d_starts(suffix, " | ");
+            }
             free(text);
             if (match) { free(found.items); return true; }
         }
@@ -1548,7 +1555,7 @@ static bool main_content_candidate_matches(lxb_dom_node_t *root, lxb_dom_node_t 
 
 static bool main_content_try_headline(lxb_dom_node_t *root, const StringVec *profile_containers,
                                        const char *const *generic_containers,
-                                       size_t generic_count, bool require_multiple,
+                                       size_t generic_count, bool match_page_title,
                                        const char *wanted, const StringVec *headings,
                                        MainContent *item, const char *source,
                                        const char *profile_name)
@@ -1557,22 +1564,27 @@ static bool main_content_try_headline(lxb_dom_node_t *root, const StringVec *pro
     for (size_t s = 0; s < count; ++s) {
         const char *selector = profile_containers ? profile_containers->items[s] : generic_containers[s];
         NodeVec candidates = find_selector(root, selector);
-        if (require_multiple && candidates.length < 2) {
-            free(candidates.items);
-            continue;
-        }
         for (size_t i = 0; i < candidates.length; ++i)
-            if (main_content_candidate_matches(root, candidates.items[i], wanted, headings))
+            if (main_content_candidate_matches(root, candidates.items[i], wanted, headings,
+                                               match_page_title))
                 node_vec_push(&item->nodes, candidates.items[i]);
         free(candidates.items);
         if (item->nodes.length) {
             item->source = d_strdup(source);
             item->profile = profile_name ? d_strdup(profile_name) : d_strdup("");
+            char *h1[] = {"h1"};
+            const StringVec article_headings = {.items = h1, .length = 1};
+            item->article_only = match_page_title && item->nodes.length == 1 &&
+                (d_eq(selector, "article") || d_eq(selector, "*[role=\"article\"]")) &&
+                main_content_candidate_matches(root, item->nodes.items[0], wanted,
+                                               &article_headings, true);
             return true;
         }
     }
     return false;
 }
+
+static char *document_title(lxb_dom_node_t *root);
 
 /* The page still says what it is about even when it provides no usable
    selector. og:title or the document h1 names the requested item, and a
@@ -1603,17 +1615,22 @@ static MainContent main_content_by_headline(lxb_dom_node_t *root,
        candidates. A matching visible headline is strong evidence there, so
        these generic candidates do not need the old multiple-candidate guard. */
     const char *generic_containers[] = {
-        "article", "*[role=\"article\"]", "main", "*[role=\"main\"]",
-        "section", "*[itemprop=\"articleBody\"]",
-        "*[data-selector=\"content-wrapper\"]"
+        "article", "*[role=\"article\"]", "*[itemprop=\"articleBody\"]",
+        "main", "*[role=\"main\"]", "*[data-selector=\"content-wrapper\"]", "section"
     };
-    const char *title_sources[] = {"og:title", "document-h1"};
+    size_t generic_count = sizeof(generic_containers) / sizeof(generic_containers[0]);
+    NodeVec mains = find_selector(root, "main");
+    /* A section outside the main region is often an introduction or banner. */
+    if (mains.length) --generic_count;
+    free(mains.items);
+    const char *title_sources[] = {"og:title", "document-title", "document-h1"};
     for (size_t t = 0; t < sizeof(title_sources) / sizeof(title_sources[0]); ++t) {
-        char *wanted = profile_title_value(root, title_sources[t]);
+        bool match_page_title = t < 2;
+        char *wanted = t == 1 ? document_title(root) : profile_title_value(root, title_sources[t]);
         if (!*wanted) { free(wanted); continue; }
         main_content_try_headline(root, NULL, generic_containers,
-                                  sizeof(generic_containers) / sizeof(generic_containers[0]),
-                                  false, wanted, NULL, &item, "article-headline", NULL);
+                                  generic_count, match_page_title, wanted, NULL, &item,
+                                  "article-headline", NULL);
         if (item.nodes.length) {
             item.selector = d_strdup("");
             item.title = wanted;
@@ -1696,6 +1713,20 @@ static bool main_content_holds(const MainContent *item, lxb_dom_node_t *node)
         for (size_t i = 0; i < item->nodes.length; ++i)
             if (item->nodes.items[i] == up) return true;
     return false;
+}
+
+static void remove_article_extras(lxb_dom_node_t *article)
+{
+    const char *selectors[] = {
+        "nav", "footer", "#comments", ".comments", ".comments-area",
+        "#related-posts", ".related-posts", ".related-articles"
+    };
+    for (size_t i = 0; i < sizeof(selectors) / sizeof(selectors[0]); ++i) {
+        NodeVec extras = find_selector(article, selectors[i]);
+        for (size_t j = 0; j < extras.length; ++j)
+            if (extras.items[j] != article) lxb_dom_node_remove(extras.items[j]);
+        free(extras.items);
+    }
 }
 
 /* The page-level block list is grouped by tag, which is harmless for a stream
@@ -2358,16 +2389,18 @@ static char *run_extraction(Engine *engine, const char *serialized, bool include
         }
     }
     free(all_elements.items);
-    lexbor_str_t filtered = {0};
-    if (include_readability) lxb_html_serialize_tree_str(root, &filtered);
-    const char *readability_input = filtered.data ? (const char *)filtered.data : serialized;
     ExtractShape shape = shape_for(root); ReadabilityFields readability = {0}; size_t rejected = 0;
-    if (include_readability) readability = run_readability(engine, readability_input);
     MainContentProfile profile = {0};
     main_content_profile_load(engine, engine->source_url, &profile);
     /* Locate the requested item before anything renders, so the block list can
        say which of its entries have already been shown at the top. */
     MainContent item = find_main_content(engine, root, &profile);
+    if (item.article_only) remove_article_extras(item.nodes.items[0]);
+    if (include_readability) {
+        lexbor_str_t filtered = {0};
+        lxb_html_serialize_tree_str(root, &filtered);
+        readability = run_readability(engine, filtered.data ? (const char *)filtered.data : serialized);
+    }
     DBuffer main_blocks; dbuf_init(&main_blocks); dbuf_puts(&main_blocks, "[");
     bool main_first = true; size_t main_chars = 0;
     if (item.nodes.length)
@@ -2390,7 +2423,16 @@ static char *run_extraction(Engine *engine, const char *serialized, bool include
                       ((profile_selected || headline_selected) ? main_chars > 0 :
                        main_chars >= DISTILL_MAIN_CONTENT_FLOOR &&
                        main_content_is_a_minority(root, &item));
-    char *content = sanitize_content(readability.content); char *tables = table_json(root); char *search = search_json(engine, root, &rejected); char *forms = forms_json(engine, root, &rejected); char *videos = videos_json(engine, root, &rejected); char *audio = audio_json(engine, root, &rejected); char *media = media_json(engine, root, &rejected); char *links = links_json(engine, root, &rejected); char *structured = structured_data_json(engine, root);
+    lxb_dom_node_t *content_root = main_found && item.article_only ? item.nodes.items[0] : root;
+    char *content = sanitize_content(readability.content);
+    char *tables = table_json(content_root);
+    char *search = search_json(engine, content_root, &rejected);
+    char *forms = forms_json(engine, content_root, &rejected);
+    char *videos = videos_json(engine, content_root, &rejected);
+    char *audio = audio_json(engine, content_root, &rejected);
+    char *media = media_json(engine, content_root, &rejected);
+    char *links = links_json(engine, root, &rejected);
+    char *structured = structured_data_json(engine, root);
     EmbeddedCandidate embedded = embedded_candidate(engine, root, &rejected);
     char *embedded_sources = embedded_survey_json(engine, root, embedded.matched_locator);
     char *embedded_blocks = embedded_array_take(&embedded.blocks);
@@ -2417,8 +2459,9 @@ static char *run_extraction(Engine *engine, const char *serialized, bool include
     char *qselector = json_quote(main_found ? item.selector : "");
     char *qmain_title = json_quote(main_found ? item.title : "");
     char *qprofile = json_quote(main_found ? item.profile : "");
-    dbuf_printf(&out, ",\"main_content\":{\"found\":%s,\"source\":%s,\"profile\":%s,\"selector\":%s,\"title\":%s,\"matches\":%zu,\"blocks\":%s}",
+    dbuf_printf(&out, ",\"main_content\":{\"found\":%s,\"source\":%s,\"profile\":%s,\"selector\":%s,\"title\":%s,\"article_only\":%s,\"matches\":%zu,\"blocks\":%s}",
                 main_found ? "true" : "false", qsource, qprofile, qselector, qmain_title,
+                main_found && item.article_only ? "true" : "false",
                 main_found ? item.nodes.length : (size_t)0, main_found ? main_blocks_json : "[]");
     free(qsource); free(qprofile); free(qselector); free(qmain_title);
     char *qembedded_adapter = json_quote(embedded.adapter);

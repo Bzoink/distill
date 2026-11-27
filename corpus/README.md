@@ -56,6 +56,10 @@ and rejected URI counts. Its stable field checks live in
 [`golden/`](golden/); the combined saved-page bundle under `local/bundles/` is
 recorded for breadth and is never a gate.
 
+`diagnostics.content_status` reports `content-found`, `incomplete`, or
+`challenge`. An incomplete result includes a `content_reason`. The reader
+and Markdown export show a warning when the main content may be incomplete.
+
 `--render DIR` sends the same settled extraction result through the reader
 template, `reader_layout`, and the FreeType/HarfBuzz software painter. It
 writes one PNG per corpus page and gates only that the renderer creates a
