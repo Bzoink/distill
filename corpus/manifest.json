@@ -588,6 +588,7 @@
         {"stage": "extract", "path": "media", "expect": "content"},
         {"stage": "extract", "path": "media", "expect": "decorative"}
 ,
+        {"stage": "extract", "path": "media[0].caption", "expect": "Harbour at dawn"},
         {
           "stage": "template",
           "expect": "distill-media:http://127.0.0.1"
@@ -604,11 +605,12 @@
           "stage": "template",
           "expect": "images/harbour.jpg"
         },
+        {"stage": "template", "expect": "<figcaption>Harbour at dawn"},
         {
           "stage": "template",
           "expect_absent": [
             "media-placeholder",
-            "figcaption",
+            "images/share.svg",
             "class=\"media-url\""
           ]
         }
@@ -1574,6 +1576,44 @@
         {"stage": "extract", "path": "diagnostics.content_status", "expect": "incomplete"},
         {"stage": "extract", "path": "diagnostics.content_reason", "expect": "still reports that content is loading"},
         {"stage": "markdown", "expect": "Main content may be incomplete."}
+      ]
+    },
+    {
+      "id": "48-image-retrieval",
+      "path": "48-image-retrieval.html",
+      "gate": true,
+      "plan_section": "Image retrieval and placement",
+      "exercises": ["lazy images", "responsive sources", "captions", "figure order", "duplicate URLs"],
+      "why": "Use the supported responsive image and keep its caption at the figure location even if the URL first occurred on a decorative image.",
+      "assertions": [
+        {"stage": "extract", "path": "media[1].alt", "expect": "The pier at dawn"},
+        {"stage": "extract", "path": "media[1].caption", "expect": "Looking east across the harbour at low tide."},
+        {"stage": "extract", "path": "media[1].inline", "expect": "true"},
+        {"stage": "extract", "path": "media[2].url", "expect": "images/boat.jpg"},
+        {"stage": "extract", "path": "media[3].url", "expect": "images/shore.png"},
+        {"stage": "extract", "path": "media[4].url", "expect": "images/working.jpg"},
+        {"stage": "extract", "path": "media[5].url", "expect": "images/net.webp?crop=1,2"},
+        {"stage": "extract", "path": "media[6].url", "expect": "images/rigging.webp"},
+        {"stage": "template", "expect": "distill-section:images"},
+        {"stage": "markdown", "expect": "images/pier-1200w.jpg)\n\nLooking east across the harbour at low tide.\n\nAfter the photograph"},
+        {"stage": "markdown", "expect": "[The ferry approaches the pier.]"},
+        {"stage": "markdown", "expect_absent": ["avatar.png", "pier.avif", "pier-mobile.webp", "pier-fallback.jpg", "stale.jpg", "## Images"]}
+      ]
+    },
+    {
+      "id": "49-readability-images",
+      "path": "49-readability-images.html",
+      "gate": true,
+      "plan_section": "Images in Readability articles",
+      "exercises": ["lazy images", "viewer links", "figure captions"],
+      "why": "Figures in Readability output should open the selected image in the viewer and preserve caption placement.",
+      "assertions": [
+        {"stage": "extract", "path": "extractor", "expect": "readability"},
+        {"stage": "extract", "path": "main_content.found", "expect": "false"},
+        {"stage": "template", "expect": "href=\"distill-media:http://127.0.0.1"},
+        {"stage": "template", "expect": "distill-section:images"},
+        {"stage": "markdown", "expect": "images/shore.png)\n\nA flock gathering at high tide."},
+        {"stage": "markdown", "expect_absent": ["[](", "/catalog"]}
       ]
     }
   ],

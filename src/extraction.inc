@@ -39,8 +39,23 @@ typedef struct { char *title; char *url; char *snippet; } ExtractSearch;
 typedef struct { char *label; char *name; char *type; char *value; } ExtractField;
 typedef struct { char *action; char *method; char *enctype; ExtractField *fields; size_t field_count; size_t field_capacity; } ExtractForm;
 typedef struct { char *kind; char *url; char *poster; char *title; } ExtractVideo;
-typedef struct { char *kind; char *url; char *alt; } ExtractMedia;
 typedef struct { char *text; char *url; } ExtractLink;
+
+typedef struct {
+    lxb_dom_node_t *node;
+    char *url;
+    char *alt;
+    char *caption;
+    bool decorative;
+    bool in_main;
+    bool placed;
+} ImageReference;
+
+typedef struct {
+    ImageReference *items;
+    size_t length;
+    size_t capacity;
+} ImageReferences;
 
 typedef struct {
     char *kind;
@@ -528,7 +543,7 @@ static void embedded_add_media(Engine *engine, EmbeddedCandidate *candidate,
     char *url = safe_uri(engine, raw_url, rejected);
     char *description = embedded_plain_text(alt);
     if (!*url) { free(url); free(description); return; }
-    char *key = d_cat4(url, "\x1f", description, "");
+    char *key = d_strdup(url);
     if (embedded_has_key(&candidate->media_keys, key)) {
         free(key); free(url); free(description); return;
     }
@@ -1018,23 +1033,28 @@ static char *merge_json_arrays(Engine *engine, const char *primary, const char *
     JSValue result = JS_NewArray(engine->context);
     StringVec keys = {0};
     int64_t out_index = 0;
+    bool media = d_eq(kind, "media");
+    const char *first_name = d_eq(kind, "blocks") ? "text" : "url";
+    const char *second_name = d_eq(kind, "blocks") ? "href" : "text";
     JSValue arrays[] = {left, right};
     for (size_t a = 0; a < 2; ++a) {
         int64_t length = json_array_length_for_context(engine->context, arrays[a]);
         for (int64_t i = 0; i < length; ++i) {
             JSValue item = JS_GetPropertyUint32(engine->context, arrays[a], (uint32_t)i);
-            const char *fields = d_eq(kind, "blocks") ? "text" : d_eq(kind, "media") ? "url" : "url";
-            char *first = embedded_property_string(engine, item, &fields, 1);
-            const char *second_name = d_eq(kind, "blocks") ? "href" : d_eq(kind, "media") ? "alt" : "text";
-            JSValue second_value = embedded_property(engine, item, second_name);
-            char *second = js_string(engine->context, second_value);
-            JS_FreeValue(engine->context, second_value);
-            char *key = d_cat4(first, "\x1f", second, "");
+            char *key = embedded_property_string(engine, item, &first_name, 1);
+            if (!media) {
+                JSValue value = embedded_property(engine, item, second_name);
+                char *second = js_string(engine->context, value);
+                JS_FreeValue(engine->context, value);
+                char *combined = d_cat4(key, "\x1f", second, "");
+                free(key); free(second);
+                key = combined;
+            }
             if (!embedded_has_key(&keys, key)) {
                 string_vec_push(&keys, key);
                 JS_SetPropertyUint32(engine->context, result, (uint32_t)out_index++, JS_DupValue(engine->context, item));
             } else free(key);
-            free(first); free(second); JS_FreeValue(engine->context, item);
+            JS_FreeValue(engine->context, item);
         }
     }
     JSValue serialized = JS_JSONStringify(engine->context, result, JS_UNDEFINED, JS_UNDEFINED);
@@ -1729,24 +1749,56 @@ static void remove_article_extras(lxb_dom_node_t *article)
     }
 }
 
+static bool node_within(lxb_dom_node_t *node, lxb_dom_node_t *ancestor)
+{
+    for (; node; node = node->parent)
+        if (node == ancestor) return true;
+    return false;
+}
+
+static void append_image_block(DBuffer *out, ImageReferences *images, lxb_dom_node_t *node,
+                               bool *first)
+{
+    for (size_t i = 0; i < images->length; ++i) {
+        ImageReference *image = &images->items[i];
+        if (image->node != node || image->decorative) continue;
+        if (!*first) dbuf_puts(out, ",");
+        *first = false;
+        char *url = json_quote(image->url);
+        char *alt = json_quote(image->alt);
+        char *caption = json_quote(image->caption);
+        dbuf_printf(out, "{\"type\":\"image\",\"href\":%s,\"alt\":%s,\"caption\":%s}",
+                    url, alt, caption);
+        free(url); free(alt); free(caption);
+        image->placed = true;
+        return;
+    }
+}
+
 /* The page-level block list is grouped by tag, which is harmless for a stream
    of headlines but would separate this item's headline from its paragraphs.
    Walk the subtree in document order instead, and stop at the first block
    element on each branch so that a list item containing a paragraph is one
    block rather than the same words twice. Returns the characters emitted. */
 static size_t append_main_blocks(Engine *engine, DBuffer *out, lxb_dom_node_t *root,
-                                 lxb_dom_node_t *node, size_t *rejected, bool *first,
-                                 bool at_item_root)
+                                 lxb_dom_node_t *node, ImageReferences *images,
+                                 size_t *rejected, bool *first, bool at_item_root,
+                                 bool images_only)
 {
     if (!node) return 0;
     if (is_element(node)) {
         if (hidden_node(root, node)) return 0;
+        if (node->local_name == LXB_TAG_IMG) {
+            append_image_block(out, images, node, first);
+            return 0;
+        }
+        if (node->local_name == LXB_TAG_FIGCAPTION) return 0;
         char *tag = node_tag(node);
         /* An entry wrapper can itself be a <li>. Do not collapse that wrapper
            into one reader-list-item; its heading and paragraphs are the
            readable blocks the promoted item is meant to preserve. */
         bool entry_list_wrapper = at_item_root && d_eq(tag, "li");
-        if (block_tag(tag) && !entry_list_wrapper) {
+        if (!images_only && block_tag(tag) && !entry_list_wrapper) {
             size_t chars = 0;
             char *text = compact_text(node);
             if (*text) {
@@ -1759,13 +1811,17 @@ static size_t append_main_blocks(Engine *engine, DBuffer *out, lxb_dom_node_t *r
                 chars = strlen(text);
             }
             free(text); free(tag);
+            if (images->length)
+                for (lxb_dom_node_t *child = node->first_child; child; child = child->next)
+                    append_main_blocks(engine, out, root, child, images, rejected, first, false, true);
             return chars;
         }
         free(tag);
     }
     size_t chars = 0;
     for (lxb_dom_node_t *child = node->first_child; child; child = child->next)
-        chars += append_main_blocks(engine, out, root, child, rejected, first, false);
+        chars += append_main_blocks(engine, out, root, child, images, rejected, first, false,
+                                    images_only);
     return chars;
 }
 
@@ -2288,11 +2344,286 @@ static char *audio_json(Engine *engine, lxb_dom_node_t *root, size_t *rejected)
     return dbuf_take(&sink.out);
 }
 
-static char *media_json(Engine *engine, lxb_dom_node_t *root, size_t *rejected)
+/* The extractor has no CSS viewport. Use a stable target for both extraction
+   and the fit-to-width viewer, so media indices survive a resize. */
+#define DISTILL_IMAGE_TARGET_WIDTH 1024
+
+static char *image_http_url(Engine *engine, const char *raw, size_t *rejected)
 {
-    DBuffer out; dbuf_init(&out); dbuf_puts(&out, "["); bool first = true; NodeVec images = find_selector(root, "img");
-    for (size_t i = 0; i < images.length; ++i) { if (hidden_node(root, images.items[i])) continue; lxb_dom_element_t *element = lxb_dom_interface_element(images.items[i]); char *raw = attr_value(element, "src"); if (!*raw) { free(raw); raw = attr_value(element, "data-src"); } char *url = safe_uri(engine, raw, rejected); free(raw); if (!*url) { free(url); continue; } char *alt = attr_value(element, "alt"); char *classes_raw = attr_value(element, "class"); char *classes = d_lower(classes_raw); free(classes_raw); bool decorative = !*alt || d_contains(classes, "icon") || d_contains(classes, "spacer"); free(classes); if (!first) dbuf_puts(&out, ","); first = false; char *qk = json_quote(decorative ? "decorative" : "content"), *qu = json_quote(url), *qa = json_quote(alt); dbuf_printf(&out, "{\"kind\":%s,\"url\":%s,\"alt\":%s}", qk, qu, qa); free(qk); free(qu); free(qa); free(url); free(alt); }
-    free(images.items); dbuf_puts(&out, "]"); return dbuf_take(&out);
+    char *url = safe_uri(engine, raw, rejected);
+    if (is_http_url(url)) return url;
+    free(url);
+    return NULL;
+}
+
+static char *image_srcset(Engine *engine, const char *list, size_t *rejected)
+{
+    char *best = NULL;
+    double best_scale = 0;
+    const char *at = list;
+    while (*at) {
+        while (d_isspace(*at) || *at == ',') ++at;
+        const char *url = at;
+        /* Commas can be part of the URL. Trailing commas end a candidate
+           without a descriptor, and commas after descriptors delimit lists. */
+        while (*at && !d_isspace(*at)) ++at;
+        const char *url_end = at;
+        while (url_end > url && url_end[-1] == ',') --url_end;
+        if (url == url_end) continue;
+        double scale = 1;
+        if (url_end == at) {
+            const char *descriptor = at;
+            while (*at && *at != ',') ++at;
+            while (d_isspace(*descriptor)) ++descriptor;
+            if (descriptor < at) {
+                char *end;
+                scale = d_strtod(descriptor, &end);
+                if (scale <= 0 || scale > 10000000 || (end == descriptor) ||
+                    (*end != 'w' && *end != 'x'))
+                    continue;
+                if (*end == 'w') {
+                    const char *digits = descriptor;
+                    while (*digits >= '0' && *digits <= '9') ++digits;
+                    if (digits != end) continue;
+                    scale /= DISTILL_IMAGE_TARGET_WIDTH;
+                }
+                ++end;
+                while (d_isspace(*end)) ++end;
+                if (end != at) continue;
+            }
+        }
+        char *raw = d_strndup(url, (size_t)(url_end - url));
+        char *candidate = image_http_url(engine, raw, rejected);
+        free(raw);
+        if (!candidate) continue;
+        /* Smallest source at or above the target, or the largest below it. */
+        if (!best || (best_scale < 1 ? scale > best_scale : scale >= 1 && scale < best_scale)) {
+            free(best);
+            best = candidate;
+            best_scale = scale;
+        } else {
+            free(candidate);
+        }
+    }
+    return best;
+}
+
+static bool picture_media_matches(const char *condition)
+{
+    if (!*condition || d_ieq(condition, "all") || d_ieq(condition, "screen")) return true;
+    if (d_starts(condition, "screen and ")) condition += strlen("screen and ");
+    if (*condition != '(') return false;
+    ++condition;
+    while (d_isspace(*condition)) ++condition;
+    bool minimum = d_starts(condition, "min-width");
+    if (!minimum && !d_starts(condition, "max-width")) return false;
+    condition += strlen("min-width");
+    while (d_isspace(*condition)) ++condition;
+    if (*condition != ':') return false;
+    ++condition;
+    char *end;
+    double width = d_strtod(condition, &end);
+    if (end == condition || !d_starts(end, "px")) return false;
+    end += 2;
+    while (d_isspace(*end)) ++end;
+    if (!d_eq(end, ")") || width < 0) return false;
+    return minimum ? width <= DISTILL_IMAGE_TARGET_WIDTH : width >= DISTILL_IMAGE_TARGET_WIDTH;
+}
+
+static char *image_sources(Engine *engine, lxb_dom_element_t *element, size_t *rejected)
+{
+    char *list = attr_value(element, "srcset");
+    char *url = image_srcset(engine, list, rejected);
+    free(list);
+    if (url) return url;
+    list = attr_value(element, "data-srcset");
+    url = image_srcset(engine, list, rejected);
+    free(list);
+    return url;
+}
+
+static char *picture_source(Engine *engine, lxb_dom_node_t *image, size_t *rejected)
+{
+    lxb_dom_node_t *picture = image->parent;
+    if (!picture || picture->local_name != LXB_TAG_PICTURE) return NULL;
+    for (lxb_dom_node_t *node = picture->first_child; node && node != image; node = node->next) {
+        if (!is_element(node) || node->local_name != LXB_TAG_SOURCE) continue;
+        lxb_dom_element_t *source = lxb_dom_interface_element(node);
+        char *type = attr_value(source, "type");
+        char *raw_media = attr_value(source, "media");
+        char *trimmed_media = d_trim(raw_media);
+        char *media = d_lower(trimmed_media);
+        bool usable = (!*type || d_ieq(type, "image/png") || d_ieq(type, "image/jpeg") ||
+                       d_ieq(type, "image/webp")) && picture_media_matches(media);
+        free(type); free(raw_media); free(trimmed_media); free(media);
+        if (!usable) continue;
+        char *url = image_sources(engine, source, rejected);
+        if (url) return url;
+    }
+    return NULL;
+}
+
+static bool image_placeholder(lxb_dom_element_t *element, const char *url)
+{
+    char *width = attr_value(element, "width");
+    char *height = attr_value(element, "height");
+    bool tiny = (d_eq(width, "1") || d_eq(width, "2")) &&
+                (d_eq(height, "1") || d_eq(height, "2"));
+    free(width); free(height);
+    if (tiny) return true;
+    const char *end = url + strcspn(url, "?#");
+    const char *tail = end;
+    while (tail > url && tail[-1] != '/') --tail;
+    char *name = d_strndup(tail, (size_t)(end - tail));
+    char *lower = d_lower(name);
+    bool placeholder = d_contains(lower, "placeholder") || d_starts(lower, "spacer.") ||
+                       d_starts(lower, "blank.") || d_starts(lower, "transparent.") ||
+                       d_starts(lower, "pixel.");
+    free(lower); free(name);
+    return placeholder;
+}
+
+static char *image_source(Engine *engine, lxb_dom_node_t *node, size_t *rejected)
+{
+    char *url = picture_source(engine, node, rejected);
+    if (url) return url;
+    lxb_dom_element_t *element = lxb_dom_interface_element(node);
+    url = image_sources(engine, element, rejected);
+    if (url) return url;
+
+    char *raw = attr_value(element, "src");
+    char *fallback = image_http_url(engine, raw, rejected);
+    free(raw);
+    if (fallback && !image_placeholder(element, fallback)) return fallback;
+    const char *lazy_attrs[] = {"data-src", "data-lazy-src", "data-original"};
+    for (size_t i = 0; i < sizeof(lazy_attrs) / sizeof(lazy_attrs[0]); ++i) {
+        raw = attr_value(element, lazy_attrs[i]);
+        url = image_http_url(engine, raw, rejected);
+        free(raw);
+        if (url) {
+            free(fallback);
+            return url;
+        }
+    }
+    return fallback;
+}
+
+static lxb_dom_node_t *image_figure(lxb_dom_node_t *node)
+{
+    for (node = node->parent; node; node = node->parent)
+        if (is_element(node) && node->local_name == LXB_TAG_FIGURE) return node;
+    return NULL;
+}
+
+static char *image_caption(lxb_dom_node_t *root, lxb_dom_node_t *figure)
+{
+    for (lxb_dom_node_t *child = figure ? figure->first_child : NULL; child; child = child->next)
+        if (child->local_name == LXB_TAG_FIGCAPTION && !hidden_node(root, child))
+            return compact_text(child);
+    return d_strdup("");
+}
+
+static bool image_decorative(lxb_dom_element_t *element, bool figure, const char *alt,
+                             const char *caption)
+{
+    if (*caption) return false;
+    char *role = attr_value(element, "role");
+    bool decorative = d_ieq(role, "presentation") || d_ieq(role, "none");
+    free(role);
+    if (decorative || class_contains(element, "avatar")) return true;
+    return !figure && (class_has(element, "icon") || class_has(element, "spacer") ||
+                       (!*alt && has_attr(element, "alt")));
+}
+
+static void free_image_reference(ImageReference *image)
+{
+    free(image->url); free(image->alt); free(image->caption);
+}
+
+static void add_image_reference(ImageReferences *images, ImageReference image)
+{
+    for (size_t i = 0; i < images->length; ++i) {
+        ImageReference *existing = &images->items[i];
+        if (!d_eq(existing->url, image.url)) continue;
+        /* Keep an occurrence in the article when the same URL also appears
+           elsewhere. Within that scope, prefer an image with a caption. */
+        if ((existing->decorative && !image.decorative) ||
+            (existing->decorative == image.decorative &&
+             (image.in_main != existing->in_main ? image.in_main :
+              *image.caption && !*existing->caption))) {
+            ImageReference previous = *existing;
+            *existing = image;
+            image = previous;
+        }
+        if (existing->in_main == image.in_main && !*existing->alt && *image.alt) {
+            char *previous = existing->alt;
+            existing->alt = image.alt;
+            image.alt = previous;
+        }
+        free_image_reference(&image);
+        return;
+    }
+    d_vec_reserve((void **)&images->items, &images->capacity, images->length,
+                  sizeof(*images->items), images->length + 1);
+    images->items[images->length++] = image;
+}
+
+static ImageReferences collect_images(Engine *engine, lxb_dom_node_t *root,
+                                      lxb_dom_node_t *main, bool normalize, size_t *rejected)
+{
+    ImageReferences images = {0};
+    NodeVec nodes = find_selector(root, "img");
+    for (size_t i = 0; i < nodes.length; ++i) {
+        lxb_dom_node_t *node = nodes.items[i];
+        if (hidden_node(root, node)) continue;
+        char *url = image_source(engine, node, rejected);
+        if (!url) continue;
+        lxb_dom_element_t *element = lxb_dom_interface_element(node);
+        lxb_dom_node_t *figure = image_figure(node);
+        char *alt = attr_value(element, "alt");
+        char *caption = image_caption(root, figure);
+        bool decorative = image_decorative(element, figure != NULL, alt, caption);
+        if (normalize) {
+            lxb_dom_element_set_attribute(element, (const lxb_char_t *)"src", 3,
+                                          (const lxb_char_t *)url, strlen(url));
+            /* Keep Readability's own lazy-image pass from reselecting a URL. */
+            const char *responsive_attrs[] = {"srcset", "data-srcset"};
+            for (size_t a = 0; a < sizeof(responsive_attrs) / sizeof(responsive_attrs[0]); ++a)
+                lxb_dom_element_remove_attribute(element, (const lxb_char_t *)responsive_attrs[a],
+                                                 strlen(responsive_attrs[a]));
+        }
+        add_image_reference(&images, (ImageReference){
+            .node = node, .url = url, .alt = alt, .caption = caption,
+            .decorative = decorative, .in_main = node_within(node, main)
+        });
+    }
+    free(nodes.items);
+    return images;
+}
+
+static char *media_json(ImageReferences *images, bool article_only, bool main_found)
+{
+    DBuffer out;
+    dbuf_init(&out);
+    dbuf_puts(&out, "[");
+    bool first = true;
+    for (size_t i = 0; i < images->length; ++i) {
+        const ImageReference *image = &images->items[i];
+        if (article_only && !image->in_main) continue;
+        if (!first) dbuf_puts(&out, ",");
+        first = false;
+        char *url = json_quote(image->url);
+        char *alt = json_quote(image->alt);
+        char *caption = json_quote(image->caption);
+        dbuf_printf(&out, "{\"kind\":\"%s\",\"url\":%s,\"alt\":%s,\"caption\":%s,\"inline\":%s}",
+                    image->decorative ? "decorative" : "content", url, alt, caption,
+                    main_found && image->placed ? "true" : "false");
+        free(url); free(alt); free(caption);
+    }
+    dbuf_puts(&out, "]");
+    for (size_t i = 0; i < images->length; ++i) free_image_reference(&images->items[i]);
+    free(images->items);
+    return dbuf_take(&out);
 }
 
 static char *links_json(Engine *engine, lxb_dom_node_t *root, size_t *rejected)
@@ -2396,6 +2727,8 @@ static char *run_extraction(Engine *engine, const char *serialized, bool include
        say which of its entries have already been shown at the top. */
     MainContent item = find_main_content(engine, root, &profile);
     if (item.article_only) remove_article_extras(item.nodes.items[0]);
+    lxb_dom_node_t *primary = item.nodes.length ? item.nodes.items[0] : NULL;
+    ImageReferences images = collect_images(engine, root, primary, include_readability, &rejected);
     if (include_readability) {
         lexbor_str_t filtered = {0};
         lxb_html_serialize_tree_str(root, &filtered);
@@ -2403,8 +2736,9 @@ static char *run_extraction(Engine *engine, const char *serialized, bool include
     }
     DBuffer main_blocks; dbuf_init(&main_blocks); dbuf_puts(&main_blocks, "[");
     bool main_first = true; size_t main_chars = 0;
-    if (item.nodes.length)
-        main_chars = append_main_blocks(engine, &main_blocks, root, item.nodes.items[0], &rejected, &main_first, true);
+    if (primary)
+        main_chars = append_main_blocks(engine, &main_blocks, root, primary, &images, &rejected,
+                                       &main_first, true, false);
     dbuf_puts(&main_blocks, "]");
     char *main_blocks_json = dbuf_take(&main_blocks);
     /* An explicit profile authorises promotion of the named region, including
@@ -2414,11 +2748,10 @@ static char *run_extraction(Engine *engine, const char *serialized, bool include
     bool profile_selected = profile.name && *profile.name && item.source && d_eq(item.source, "profile-headline");
     /* A profile or matching visible headline may identify a short video or
        paywalled article whose text is below the normal prose floor. */
-    /* Image-heavy pages often have a perfectly valid <main><h1>, but their
-       media registry is the content the reader must render. Do not let the
-       headline promotion hide that shape-specific output. */
+    /* An image-heavy page with only a <main> heading needs its gallery.
+       An identified article can place its figures in the story itself. */
     bool headline_selected = item.source && d_eq(item.source, "article-headline") &&
-                             !d_eq(shape.kind, "image-heavy");
+                             (item.article_only || !d_eq(shape.kind, "image-heavy"));
     bool main_found = item.nodes.length &&
                       ((profile_selected || headline_selected) ? main_chars > 0 :
                        main_chars >= DISTILL_MAIN_CONTENT_FLOOR &&
@@ -2430,7 +2763,7 @@ static char *run_extraction(Engine *engine, const char *serialized, bool include
     char *forms = forms_json(engine, content_root, &rejected);
     char *videos = videos_json(engine, content_root, &rejected);
     char *audio = audio_json(engine, content_root, &rejected);
-    char *media = media_json(engine, content_root, &rejected);
+    char *media = media_json(&images, main_found && item.article_only, main_found);
     char *links = links_json(engine, root, &rejected);
     char *structured = structured_data_json(engine, root);
     EmbeddedCandidate embedded = embedded_candidate(engine, root, &rejected);

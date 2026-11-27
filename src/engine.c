@@ -2623,10 +2623,35 @@ static bool json_block_is_main(Engine *engine, JSValueConst block)
 /* skip_main leaves out the blocks the reader has already shown at the top of
    the page. The extraction list stays complete on purpose, so the decision not
    to repeat them belongs here rather than in the engine. */
-static void append_json_blocks(Engine *engine, JSValueConst blocks, DBuffer *output,
+static void append_section_marker(DBuffer *output, const char *id);
+
+static void append_image_figure(DBuffer *output, const char *url, const char *alt,
+                                 const char *caption)
+{
+    const char *label = *alt ? alt : *caption ? caption : "Open image";
+    dbuf_puts(output, "<figure class=\"media-item\"><p>");
+    bool openable = is_http_url(url);
+    if (openable) {
+        dbuf_puts(output, "<a class=\"media-open\" href=\"distill-media:");
+        append_html_escaped(output, url);
+        dbuf_puts(output, "\">");
+    }
+    append_html_escaped(output, label);
+    if (openable) dbuf_puts(output, "</a>");
+    dbuf_puts(output, "</p>");
+    if (*caption && !d_eq(caption, label)) {
+        dbuf_puts(output, "<figcaption>");
+        append_html_escaped(output, caption);
+        dbuf_puts(output, "</figcaption>");
+    }
+    dbuf_puts(output, "</figure>");
+}
+
+static bool append_json_blocks(Engine *engine, JSValueConst blocks, DBuffer *output,
                                bool skip_main)
 {
     int64_t length = json_array_length(engine, blocks);
+    bool have_images = false;
     for (int64_t i = 0; i < length; ++i) {
         JSValue block = JS_GetPropertyUint32(engine->context, blocks, (uint32_t)i);
         if (skip_main && json_block_is_main(engine, block)) {
@@ -2636,7 +2661,16 @@ static void append_json_blocks(Engine *engine, JSValueConst blocks, DBuffer *out
         char *type = json_property_string(engine, block, "type");
         char *text = json_property_string(engine, block, "text");
         char *href = json_property_string(engine, block, "href");
-        if (d_eq(type, "h1")) {
+        if (d_eq(type, "image")) {
+            if (!have_images) {
+                append_section_marker(output, "images");
+                have_images = true;
+            }
+            char *alt = json_property_string(engine, block, "alt");
+            char *caption = json_property_string(engine, block, "caption");
+            append_image_figure(output, href, alt, caption);
+            free(alt); free(caption);
+        } else if (d_eq(type, "h1")) {
             /* The reader title is already displayed above the block stream. */
         } else if (d_eq(type, "h2") || d_eq(type, "h3")) {
             dbuf_printf(output, "<%s>", type);
@@ -2681,6 +2715,7 @@ static void append_json_blocks(Engine *engine, JSValueConst blocks, DBuffer *out
         free(href);
         JS_FreeValue(engine->context, block);
     }
+    return have_images;
 }
 
 /* A front page is a block stream whose links are the content. Treating its
@@ -3179,34 +3214,141 @@ static void append_json_videos(Engine *engine, JSValueConst videos, DBuffer *out
     }
 }
 
-static void append_json_media(Engine *engine, JSValueConst media, DBuffer *output)
+static void append_json_media(Engine *engine, JSValueConst media, DBuffer *output,
+                              bool mark_section)
 {
     int64_t count = json_array_length(engine, media);
-    if (!count) return;
-    append_section_marker(output, "images");
-    dbuf_puts(output, "<section id=\"images\" class=\"media-gallery\"><h2>Images</h2>");
+    bool opened = false;
     for (int64_t i = 0; i < count; ++i) {
         JSValue item = JS_GetPropertyUint32(engine->context, media, (uint32_t)i);
-        char *url = json_property_string(engine, item, "url");
-        char *alt = json_property_string(engine, item, "alt");
-        dbuf_puts(output, "<p class=\"media-item\">");
-        /* Keep the media activation target as one ordinary inline link. The
-           desktop shell still recognizes distill-media: and fetches lazily,
-           but the reader does not repeat the alt text in a placeholder and a
-           caption. */
-        bool openable = is_http_url(url);
-        if (openable) {
-            dbuf_puts(output, "<a class=\"media-open\" href=\"distill-media:");
-            append_html_escaped(output, url);
-            dbuf_puts(output, "\">");
+        char *kind = json_property_string(engine, item, "kind");
+        if (!d_eq(kind, "decorative") && !json_property_bool(engine, item, "inline")) {
+            if (!opened) {
+                if (mark_section) append_section_marker(output, "images");
+                dbuf_puts(output, "<section id=\"images\" class=\"media-gallery\"><h2>Images</h2>");
+                opened = true;
+            }
+            char *url = json_property_string(engine, item, "url");
+            char *alt = json_property_string(engine, item, "alt");
+            char *caption = json_property_string(engine, item, "caption");
+            append_image_figure(output, url, alt, caption);
+            free(url); free(alt); free(caption);
         }
-        append_html_escaped(output, *alt ? alt : "Decorative image");
-        if (openable) dbuf_puts(output, "</a>");
-        dbuf_puts(output, "</p>");
-        free(url); free(alt);
+        free(kind);
         JS_FreeValue(engine->context, item);
     }
-    dbuf_puts(output, "</section>");
+    if (opened) dbuf_puts(output, "</section>");
+}
+
+static void remove_readable_image(lxb_dom_node_t *image, lxb_dom_node_t *position)
+{
+    lxb_dom_node_remove(image);
+    if (position == image) return;
+    char *text = compact_text(position);
+    NodeVec remaining = find_selector(position, "img");
+    if (!*text && !remaining.length) lxb_dom_node_remove(position);
+    free(text); free(remaining.items);
+}
+
+static lxb_dom_node_t *readable_link(lxb_html_document_t *document, const char *href,
+                                     const char *classes)
+{
+    lxb_dom_element_t *link =
+        lxb_dom_document_create_element(&document->dom_document, (const lxb_char_t *)"a", 1, NULL);
+    if (!link) return NULL;
+    lxb_dom_element_set_attribute(link, (const lxb_char_t *)"href", 4,
+                                  (const lxb_char_t *)href, strlen(href));
+    lxb_dom_element_set_attribute(link, (const lxb_char_t *)"class", 5,
+                                  (const lxb_char_t *)classes, strlen(classes));
+    return lxb_dom_interface_node(link);
+}
+
+/* Readability can keep figures in its cleaned article. Convert the known
+   image URLs to viewer links while leaving the article's markup around them. */
+static void append_readable_content(Engine *engine, const char *content, JSValueConst media,
+                                    DBuffer *output)
+{
+    int64_t count = json_array_length(engine, media);
+    if (!count || !strstr(content, "<img")) {
+        dbuf_puts(output, content);
+        return;
+    }
+    lxb_html_document_t *document = lxb_html_document_create();
+    if (!document || lxb_html_document_parse(document, (const lxb_char_t *)content,
+                                             strlen(content)) != LXB_STATUS_OK) {
+        if (document) lxb_html_document_destroy(document);
+        dbuf_puts(output, content);
+        return;
+    }
+    lxb_dom_node_t *body = lxb_dom_interface_node(lxb_html_document_body_element(document));
+    if (!body) {
+        lxb_html_document_destroy(document);
+        dbuf_puts(output, content);
+        return;
+    }
+    JSContext *ctx = engine->context;
+    JSValue by_url = JS_NewObject(ctx);
+    for (int64_t i = 0; i < count; ++i) {
+        JSValue item = JS_GetPropertyUint32(ctx, media, (uint32_t)i);
+        char *url = json_property_string(engine, item, "url");
+        JS_SetPropertyStr(ctx, by_url, url, item);
+        free(url);
+    }
+    NodeVec nodes = find_selector(body, "img");
+    StringVec seen = {0};
+    for (size_t i = 0; i < nodes.length; ++i) {
+        lxb_dom_node_t *image = nodes.items[i];
+        char *url = attr_value(lxb_dom_interface_element(image), "src");
+        JSValue item = JS_GetPropertyStr(ctx, by_url, url);
+        if (is_http_url(url) && JS_IsObject(item)) {
+            lxb_dom_node_t *position = image;
+            for (lxb_dom_node_t *up = image->parent; up && up != body; up = up->parent)
+                if (up->local_name == LXB_TAG_A) { position = up; break; }
+            char *kind = json_property_string(engine, item, "kind");
+            if (d_eq(kind, "decorative") || embedded_has_key(&seen, url)) {
+                remove_readable_image(image, position);
+            } else {
+                char *target = d_cat3("distill-media:", url, "");
+                lxb_dom_node_t *link = readable_link(document, target, "media-open");
+                free(target);
+                if (link) {
+                    char *alt = json_property_string(engine, item, "alt");
+                    char *caption = json_property_string(engine, item, "caption");
+                    const char *label = *alt ? alt : *caption ? caption : "Open image";
+                    lxb_dom_node_text_content_set(link, (const lxb_char_t *)label, strlen(label));
+                    if (!seen.length) {
+                        lxb_dom_node_t *marker = readable_link(document, "distill-section:images",
+                                                                "section-anchor");
+                        if (marker) lxb_dom_node_insert_before(position, marker);
+                    }
+                    lxb_dom_node_t *rendered = link;
+                    if (position->parent && position->parent->local_name == LXB_TAG_FIGURE) {
+                        lxb_dom_element_t *paragraph = lxb_dom_document_create_element(
+                            &document->dom_document, (const lxb_char_t *)"p", 1, NULL);
+                        if (paragraph) {
+                            rendered = lxb_dom_interface_node(paragraph);
+                            lxb_dom_node_insert_child(rendered, link);
+                        }
+                    }
+                    lxb_dom_node_insert_before(position, rendered);
+                    remove_readable_image(image, position);
+                    string_vec_push(&seen, d_strdup(url));
+                    free(alt); free(caption);
+                }
+            }
+            free(kind);
+        }
+        JS_FreeValue(ctx, item);
+        free(url);
+    }
+    free(nodes.items);
+    string_vec_free(&seen);
+    JS_FreeValue(ctx, by_url);
+    lexbor_str_t rendered = {0};
+    lxb_status_t status = lxb_html_serialize_deep_str(body, &rendered);
+    dbuf_puts(output, status == LXB_STATUS_OK && rendered.data ?
+                     (const char *)rendered.data : content);
+    lxb_html_document_destroy(document);
 }
 
 static void append_json_links(Engine *engine, JSValueConst links, DBuffer *output)
@@ -3545,7 +3687,7 @@ static char *reader_template(Engine *engine, const char *json, const char *theme
     JS_FreeValue(engine->context, diagnostics);
     if (main_found) {
         dbuf_puts(&output, "<section class=\"main-content\">");
-        append_json_blocks(engine, main_blocks, &output, false);
+        bool inline_images = append_json_blocks(engine, main_blocks, &output, false);
         dbuf_puts(&output, "</section>");
         if (!article_only && json_blocks_outside_main(engine, blocks) > 0) {
             dbuf_puts(&output, "<p class=\"eyebrow main-rest\">Rest of the page</p>");
@@ -3561,12 +3703,12 @@ static char *reader_template(Engine *engine, const char *json, const char *theme
         append_json_table(engine, tables, &output);
         append_json_results(engine, results, &output);
         append_json_videos(engine, videos, &output);
-        append_json_media(engine, media, &output);
+        append_json_media(engine, media, &output, !inline_images);
         /* Forms are separate interactive content, not text blocks. Keep them
            available even when the reader selected the whole page as main. */
         append_json_forms(engine, forms, &output);
     } else if (d_eq(shape_kind, "article") && *content) {
-        dbuf_puts(&output, content);
+        append_readable_content(engine, content, media, &output);
         if (embedded_mapped && json_array_length(engine, embedded_blocks) > 0) {
             dbuf_puts(&output, "<section class=\"embedded-content\">");
             append_json_blocks(engine, embedded_blocks, &output, false);
@@ -3585,7 +3727,7 @@ static char *reader_template(Engine *engine, const char *json, const char *theme
         append_json_videos(engine, videos, &output);
         append_json_links(engine, links, &output);
     } else if (d_eq(shape_kind, "image-heavy")) {
-        append_json_media(engine, media, &output);
+        append_json_media(engine, media, &output, true);
         append_json_links(engine, links, &output);
     } else {
         append_json_blocks(engine, blocks, &output, main_found);
@@ -3593,7 +3735,7 @@ static char *reader_template(Engine *engine, const char *json, const char *theme
         append_json_results(engine, results, &output);
         append_json_forms(engine, forms, &output);
         append_json_videos(engine, videos, &output);
-        append_json_media(engine, media, &output);
+        append_json_media(engine, media, &output, true);
     }
     /* Audio is the one medium the reader plays itself, and no shape decision
        should be able to swallow it: a podcast page is an article, a station
@@ -3653,6 +3795,8 @@ static char *viewer_template(Engine *engine, const char *json, int media_index,
     char *kind = json_property_string(engine, item, "kind");
     char *url = json_property_string(engine, item, "url");
     char *alt = json_property_string(engine, item, "alt");
+    char *caption = json_property_string(engine, item, "caption");
+    const char *label = *alt ? alt : *caption ? caption : "Image reference";
     DBuffer output;
     dbuf_init(&output);
     dbuf_puts(&output,
@@ -3694,12 +3838,18 @@ static char *viewer_template(Engine *engine, const char *json, int media_index,
     } else {
         dbuf_puts(&output, "<div class=\"placeholder\">");
         if (local_path && *local_path) append_html_escaped(&output, d_image_last_error());
-        else append_html_escaped(&output, *alt ? alt : "Image reference");
+        else append_html_escaped(&output, label);
         dbuf_puts(&output, "</div>");
     }
     dbuf_puts(&output, "</div><div class=\"caption\"><strong>");
-    append_html_escaped(&output, *alt ? alt : "Image reference");
-    dbuf_puts(&output, "</strong><div class=\"url\">");
+    append_html_escaped(&output, label);
+    dbuf_puts(&output, "</strong>");
+    if (*caption && !d_eq(caption, label)) {
+        dbuf_puts(&output, "<p>");
+        append_html_escaped(&output, caption);
+        dbuf_puts(&output, "</p>");
+    }
+    dbuf_puts(&output, "<div class=\"url\">");
     append_display_url(&output, url);
     dbuf_puts(&output, "</div><div class=\"nav\">");
     if (media_index > 0) dbuf_puts(&output, "<a href=\"#previous\">Previous</a> · ");
@@ -3707,7 +3857,7 @@ static char *viewer_template(Engine *engine, const char *json, int media_index,
     if (media_index + 1 < count) dbuf_puts(&output, "<a href=\"#next\">Next</a>");
     else dbuf_puts(&output, "Next");
     dbuf_puts(&output, "</div></body></html>");
-    free(kind); free(url); free(alt);
+    free(kind); free(url); free(alt); free(caption);
     JS_FreeValue(engine->context, item);
     JS_FreeValue(engine->context, media);
     JS_FreeValue(engine->context, parsed);

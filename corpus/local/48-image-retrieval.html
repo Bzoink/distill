@@ -1,0 +1,30 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>Photographs from the pier</title>
+<main>
+  <article>
+    <h1>Photographs from the pier</h1>
+    <p>The photographer recorded the boats before the ferry returned.</p>
+    <figure><img src="images/avatar.png" class="author-avatar" alt="Author photo"></figure>
+    <img src="images/pier-1200w.jpg" alt="">
+    <figure>
+      <picture>
+        <source type="image/avif" srcset="images/pier.avif 1200w">
+        <source type="image/webp" media="(max-width: 600px)" srcset="images/pier-mobile.webp 500w">
+        <source type="image/jpeg" media="screen and ( min-width: 800px )"
+                srcset="images/pier-800w.jpg 800w, images/pier-1200w.jpg 1200w, images/pier-1600w.jpg 1600w">
+        <img src="images/pier-fallback.jpg" alt="The pier at dawn">
+      </picture>
+      <figcaption>Looking east across the harbour at low tide.</figcaption>
+    </figure>
+    <p>After the photograph, the tide rose over the quay.</p>
+    <figure>
+      <img src="data:image/gif;base64,R0lGODlhAQABAAAAACw=" data-src="images/boat.jpg" alt="">
+      <figcaption>The ferry approaches the pier.</figcaption>
+    </figure>
+    <img src="images/placeholder.png" data-src="images/shore.png" alt="At the shore">
+    <img src="images/working.jpg" data-src="images/stale.jpg" alt="The working boats">
+    <img data-srcset="data:image/png;base64,AAAA 2x, images/net.webp?crop=1,2 1x">
+    <img srcset="images/small.webp 400w, images/rigging.webp 1024w" alt="Boat rigging">
+  </article>
+</main>

@@ -233,7 +233,8 @@ static void walk_node(Walk *walk, lxb_dom_node_t *node)
     } else if (d_eq(tag, "form")) {
         walk_form(walk, node);
     } else if (d_eq(tag, "p") || d_eq(tag, "section") || d_eq(tag, "div") ||
-               d_eq(tag, "main") || d_eq(tag, "article")) {
+               d_eq(tag, "main") || d_eq(tag, "article") || d_eq(tag, "figure") ||
+               d_eq(tag, "figcaption")) {
         walk_block(walk, node, (ReaderBlock){.kind = READER_BLOCK_GENERIC, .tag = tag});
     } else if (d_eq(tag, "br")) {
         EMIT0(walk, line_break);

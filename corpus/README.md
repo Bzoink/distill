@@ -327,6 +327,12 @@ fallback, and the same proportion guard applies to it.
 
 ## Media references and viewer mode
 
+Image records contain the selected URL, alt text and any figure caption.
+Distill picks responsive sources for a nominal 1024-pixel-wide viewer and
+tries lazy-image attributes when the standard source is missing or a
+placeholder. Ordered article image blocks keep figures beside their text.
+Decorative references remain available in the extraction JSON.
+
 `corpus/local/images/` holds real image files, not names. Three formats with
 three decoders behind them -- JPEG, PNG with an alpha channel, and an SVG that
 deliberately has no decoder at all -- because until they existed `15-gallery`
